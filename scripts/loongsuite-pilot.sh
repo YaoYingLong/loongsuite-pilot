@@ -1,14 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Runtime layout
+# --------------
+# DATA_DIR is the mutable application data root used by the collector itself.
+# CACHE_DIR intentionally stays at ~/.loongsuite-pilot because updater-managed
+# versions, bootstrap scripts, and the global CLI shim must be stable even when
+# LOONGSUITE_PILOT_DATA_DIR points collector state somewhere else.
 DATA_DIR="${LOONGSUITE_PILOT_DATA_DIR:-$HOME/.loongsuite-pilot}"
 CACHE_DIR="$HOME/.loongsuite-pilot"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Version-management files.  `current` and `previous` contain directory names
+# under versions/, not absolute paths.  This keeps the install tree relocatable
+# and lets rollback swap versions with atomic temp-file + mv writes.
 VERSIONS_DIR="$CACHE_DIR/versions"
 CURRENT_FILE="$CACHE_DIR/current"
 PREVIOUS_FILE="$CACHE_DIR/previous"
+
+# Bootstrap scripts are copied out of the active version into a stable bin/
+# directory.  Service managers keep invoking this stable path, while the updater
+# can atomically replace the bootstrap files during version switches.
 BOOTSTRAP_DIR="$CACHE_DIR/bin"
 PACKAGE_DIR="$CACHE_DIR/package"
+
+# PID and log files live under DATA_DIR so multiple test runs or custom
+# deployments can isolate runtime state by overriding LOONGSUITE_PILOT_DATA_DIR.
 PID_FILE="$DATA_DIR/loongsuite-pilot.pid"
 UPDATER_PID_FILE="$DATA_DIR/loongsuite-pilot-updater.pid"
 LOG_DIR="$DATA_DIR/logs"
@@ -21,6 +38,9 @@ MONITOR_PID_FILE="$DATA_DIR/loongsuite-pilot-monitor.pid"
 DASHBOARD_PID_FILE="$DATA_DIR/loongsuite-pilot-dashboard.pid"
 MONITOR_DATA_DIR="$LOG_DIR/process-monitor"
 
+# Service-manager identifiers and generated-unit locations.  macOS uses
+# launchd plist files in the current user's LaunchAgents directory; Linux uses
+# either user-level systemd units, system-level systemd units, or init.d scripts.
 SERVICE_LABEL="com.loongsuite-pilot"
 UPDATER_LABEL="com.loongsuite-pilot.updater"
 LAUNCHD_PLIST="$HOME/Library/LaunchAgents/${SERVICE_LABEL}.plist"
@@ -33,6 +53,9 @@ validate_current_user() {
     whoami
 }
 
+# Return success when sudo can be used non-interactively or after prompting.
+# Linux system-level service registration needs sudo; when unavailable, callers
+# fall back to user-level systemd instead of failing the whole start command.
 check_sudo_access() {
     [ "$(id -u)" -eq 0 ] && return 0
     if sudo -n true 2>/dev/null; then
@@ -46,6 +69,9 @@ check_sudo_access() {
     fi
 }
 
+# Resolve a user's home directory in a way that works on both GNU/Linux and
+# macOS.  systemd system units need absolute HOME, binary, config, and workdir
+# paths for the target user because those units do not inherit the caller shell.
 resolve_user_home() {
     local user="$1"
     if command -v getent &>/dev/null; then
@@ -55,11 +81,16 @@ resolve_user_home() {
     fi
 }
 
+# Create only the directories required by this wrapper itself.  The Node
+# collector creates its own deeper state as needed.
 ensure_dirs() {
     mkdir -p "$LOG_DIR"
     mkdir -p "$BOOTSTRAP_DIR"
 }
 
+# Refresh stable bootstrap daemon scripts from the active version.  This is used
+# before foreground service-manager execution and before nohup fallback startup
+# so a service restart picks up the version selected by CURRENT_FILE.
 sync_bootstrap_scripts() {
     local version_dir
     version_dir=$(resolve_current_version 2>/dev/null) || true
@@ -71,6 +102,9 @@ sync_bootstrap_scripts() {
     cp -f "$src_dir/updater-daemon.js"   "$BOOTSTRAP_DIR/" 2>/dev/null || true
 }
 
+# Copy service entry scripts from a specific version into their stable installed
+# locations.  The updater and rollback path use temp-file + mv writes so service
+# managers never observe a half-written collector, updater, or CLI wrapper.
 sync_installed_scripts_from_version() {
     local version_dir="$1"
     local src_dir="$version_dir/scripts"
@@ -90,6 +124,8 @@ sync_installed_scripts_from_version() {
     mv -f "$LOONGSUITE_PILOT_BIN.tmp" "$LOONGSUITE_PILOT_BIN"
 }
 
+# Check the main collector PID file and delete it when it points to a dead
+# process.  This makes repeated start/status calls self-heal after crashes.
 is_running() {
     if [ -f "$PID_FILE" ]; then
         local pid
@@ -102,6 +138,8 @@ is_running() {
     return 1
 }
 
+# Generic PID-file liveness helper for sidecar processes such as updater,
+# process monitor, and dashboard.  Stale PID files are removed for the caller.
 is_pid_file_running() {
     local pid_file="$1"
     if [ -f "$pid_file" ]; then
@@ -115,6 +153,9 @@ is_pid_file_running() {
     return 1
 }
 
+# Stop a PID-file tracked process with a graceful TERM window before a final
+# KILL.  The helper is intentionally generic because sidecars share the same
+# lifecycle shape but use different PID files and log files.
 stop_pid_file() {
     local pid_file="$1"
     if is_pid_file_running "$pid_file"; then
@@ -133,6 +174,11 @@ stop_pid_file() {
     rm -f "$pid_file"
 }
 
+# Validate a Node binary before using it for long-lived services.
+# Requirements:
+# - file is executable
+# - binary is not inside an application bundle
+# - major version is 18 or newer
 _node_is_suitable() {
     local bin="$1"
     [ -x "$bin" ] || return 1
@@ -145,10 +191,15 @@ _node_is_suitable() {
     return 0
 }
 
+# Resolve symlinks when possible.  Some minimal systems lack realpath or
+# readlink -f, so the original path is returned as a best-effort fallback.
 _resolve_realpath() {
     realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || echo "$1"
 }
 
+# Reject app-bundled Node runtimes, for example Electron/IDE helper Node
+# binaries under *.app/Contents.  Those runtimes can be missing APIs or have a
+# lifecycle tied to the app, so services should prefer user-managed Node installs.
 _node_is_app_bundle() {
     local resolved
     resolved=$(_resolve_realpath "$1")
@@ -162,6 +213,12 @@ _node_is_app_bundle() {
 
 NODE_PIN_FILE="$CACHE_DIR/node-bin"
 
+# Resolve the Node runtime used by all daemon entrypoints.
+#
+# The pinned path wins when still valid, which keeps service restarts stable
+# even if PATH changes.  If it is missing or stale, search common user-managed
+# locations first and PATH last, then write the resolved path back to node-bin as
+# an auto-healing pin for future service-manager launches.
 resolve_node() {
     # 1. Pinned file
     if [ -f "$NODE_PIN_FILE" ]; then
@@ -211,6 +268,12 @@ resolve_node() {
     return 1
 }
 
+# Pick the init system for start/stop/autostart operations.
+#
+# If init-type already exists, preserve that choice so `stop`, `status`, and
+# restart commands talk to the same service manager used by `start`.  Otherwise
+# detect platform capabilities and degrade from system-level service to user-level
+# systemd or nohup where needed.
 detect_init_system() {
     local system_service="${1:-false}"
 
@@ -249,6 +312,8 @@ detect_init_system() {
     esac
 }
 
+# Enable systemd linger for user services so the collector can survive logout.
+# This is best-effort because some machines require polkit/root policy changes.
 enable_linger() {
     local user
     user="$(whoami)"
@@ -263,6 +328,8 @@ enable_linger() {
     fi
 }
 
+# Service-manager probes used by start/status to decide whether an autostart
+# registration exists and is enabled for the current user.
 is_managed_by_launchd() {
     [ -f "$LAUNCHD_PLIST" ] && launchctl list "$SERVICE_LABEL" &>/dev/null
 }
@@ -285,7 +352,9 @@ is_managed_by_initd() {
 }
 
 
-
+# Resolve the active version directory.  Prefer updater-managed versions/current;
+# fall back to package/ for legacy or unpacked installs that do not have the
+# multi-version layout yet.
 resolve_current_version() {
     if [ -f "$CURRENT_FILE" ]; then
         local dir
@@ -302,6 +371,9 @@ resolve_current_version() {
     return 1
 }
 
+# Resolve the rollback target selected by the updater.  The file contains a
+# directory name under versions/ and is only considered valid if the directory
+# still exists.
 resolve_previous_version() {
     if [ -f "$PREVIOUS_FILE" ]; then
         local dir
@@ -314,6 +386,9 @@ resolve_previous_version() {
     return 1
 }
 
+# Find a helper script from the active version, package fallback, or source tree.
+# This keeps monitor/dashboard commands working both after installation and when
+# the script is executed directly from a checkout during development.
 resolve_script() {
     local script_name="$1"
     local version_dir
@@ -329,6 +404,9 @@ resolve_script() {
 
 # ---- Internal: run in foreground (used by launchd / systemd) ----
 
+# Foreground collector entrypoint for service managers.  Do not background here:
+# launchd/systemd/init.d need this process to remain attached so they can track
+# lifecycle and restart policy correctly.
 cmd_run() {
     ensure_dirs
     sync_bootstrap_scripts
@@ -349,6 +427,9 @@ cmd_run() {
     exec "$node_bin" "$BOOTSTRAP_DIR/collector-daemon.js"
 }
 
+# Foreground updater entrypoint for service managers.  Missing updater bootstrap
+# is treated as a clean no-op because some package/version layouts may not ship
+# auto-update support.
 cmd_run_updater() {
     ensure_dirs
     sync_bootstrap_scripts
@@ -370,6 +451,9 @@ cmd_run_updater() {
 
 # ---- User-facing commands ----
 
+# Start the collector.  The preferred path is to register with the host service
+# manager for boot persistence; if that is unavailable, fall back to a nohup
+# process and record that choice in init-type for later status output.
 cmd_start() {
     local system_service="false"
     for arg in "$@"; do
@@ -433,6 +517,9 @@ cmd_start() {
     fi
 }
 
+# Stop collector, updater, dashboard, and monitor processes.  Service-manager
+# removal is attempted first, then PID-file and process-name cleanup handle nohup
+# fallback or orphaned processes left behind by older installs.
 cmd_stop() {
     cmd_monitor_stop >/dev/null 2>&1 || true
     autostart_remove 2>/dev/null || true
@@ -493,6 +580,9 @@ cmd_stop() {
     echo "✅ loongsuite-pilot stopped"
 }
 
+# Start the lightweight process sampler used by the local monitor dashboard.
+# The sampler is intentionally separate from the collector so diagnostics can be
+# started and stopped without changing data collection.
 cmd_process_monitor_start() {
     if is_pid_file_running "$MONITOR_PID_FILE"; then
         echo "✅ loongsuite-pilot process monitor is already running (PID $(cat "$MONITOR_PID_FILE"))"
@@ -511,12 +601,16 @@ cmd_process_monitor_start() {
     echo "✅ loongsuite-pilot process monitor started (PID $!)"
 }
 
+# Stop the process sampler and clean up stale processes from older launches.
 cmd_process_monitor_stop() {
     stop_pid_file "$MONITOR_PID_FILE"
     pkill -f "monitor-loongsuite-pilot\.sh" 2>/dev/null || true
     echo "✅ loongsuite-pilot process monitor stopped"
 }
 
+# Start the local dashboard server that reads process-monitor output.  It uses
+# the same Node resolver as the collector to avoid PATH differences between
+# shells, service managers, and IDE-launched terminals.
 cmd_dashboard_start() {
     if is_pid_file_running "$DASHBOARD_PID_FILE"; then
         echo "✅ loongsuite-pilot dashboard is already running (PID $(cat "$DASHBOARD_PID_FILE"))"
@@ -540,12 +634,14 @@ cmd_dashboard_start() {
     echo "   open http://127.0.0.1:${LOONGSUITE_PILOT_MONITOR_PORT:-8765}/"
 }
 
+# Stop the dashboard server and remove stale PID state.
 cmd_dashboard_stop() {
     stop_pid_file "$DASHBOARD_PID_FILE"
     pkill -f "serve-loongsuite-pilot-monitor\.mjs" 2>/dev/null || true
     echo "✅ loongsuite-pilot dashboard stopped"
 }
 
+# Composite monitor command: sampler plus dashboard.
 cmd_monitor_start() {
     cmd_process_monitor_start
     cmd_dashboard_start
@@ -560,6 +656,9 @@ cmd_monitor_stop() {
 }
 
 # Restart only the collector (used by updater after deploying a new version)
+# The updater must remain alive while the collector is cycled, otherwise a
+# version deployment could stop midway after installing files but before the new
+# collector starts.
 cmd_restart_collector() {
     local target_user
     target_user=$(whoami)
@@ -665,6 +764,8 @@ cmd_restart_collector() {
 
     # Schedule updater restart in a NEW process group so that
     # "launchctl stop / systemctl stop" of the updater won't kill this subprocess.
+    # This delayed self-call lets the updater replace its own on-disk code first,
+    # then restart from the stable CLI shim after the collector is back.
     local _restart_bin="$LOONGSUITE_PILOT_BIN"
     local _restart_log="$UPDATER_LOG_FILE"
     if command -v setsid &>/dev/null; then
@@ -674,6 +775,9 @@ cmd_restart_collector() {
     fi
 }
 
+# Restart only the updater sidecar.  Service-manager restart is preferred, but
+# the command verifies that an updater process actually appears and falls back to
+# nohup if the manager reported success without launching the daemon.
 cmd_restart_updater() {
     local target_user
     target_user=$(whoami)
@@ -772,12 +876,16 @@ cmd_restart_updater() {
     fi
 }
 
+# Full user-facing restart: stop everything this wrapper manages, then start
+# again using the same service-manager preference as cmd_start.
 cmd_restart() {
     cmd_stop
     sleep 1
     cmd_start
 }
 
+# Print collector, updater, monitor, autostart, and active-version status.
+# Status checks also prune stale PID files via is_running/is_pid_file_running.
 cmd_status() {
     local ver_info=""
     local version_dir
@@ -814,6 +922,8 @@ cmd_status() {
     autostart_status
 }
 
+# Dump version metadata, runtime paths, Node resolution, and the raw config file.
+# This is intended for diagnostics, so it avoids redacting local config values.
 cmd_info() {
     local version_dir
     version_dir=$(resolve_current_version) || true
@@ -856,6 +966,9 @@ cmd_info() {
     fi
 }
 
+# Swap current and previous version pointers, sync the stable installed scripts
+# from the rollback target, and restart the service.  If script sync fails, the
+# pointer swap is reverted so the installation does not point at a broken CLI.
 cmd_rollback() {
     if [ ! -f "$PREVIOUS_FILE" ]; then
         echo "❌ No previous version to roll back to"
@@ -900,6 +1013,9 @@ cmd_rollback() {
 
 # ---- Autostart management (internal) ----
 
+# Generate the macOS launchd plist for the main collector.  The plist calls the
+# stable CLI shim with `run`, and launchd redirects both stdout/stderr to the
+# collector service log.
 _write_launchd_plist() {
     mkdir -p "$(dirname "$LAUNCHD_PLIST")"
     ensure_dirs
@@ -940,6 +1056,8 @@ PLISTEOF
 
 SYSTEMD_USER_UNIT_DIR="$HOME/.config/systemd/user"
 
+# Generate the user-level systemd unit for the main collector.  User units avoid
+# sudo but may require linger for the process to survive logout.
 _write_systemd_user_unit() {
     mkdir -p "$SYSTEMD_USER_UNIT_DIR"
     cat > "$SYSTEMD_USER_UNIT_DIR/loongsuite-pilot.service" << UNITEOF
@@ -961,6 +1079,9 @@ WantedBy=default.target
 UNITEOF
 }
 
+# Generate the user-level systemd unit for the updater.  KillMode=process keeps
+# systemd from killing child processes that are deliberately detached during
+# updater self-restart scheduling.
 _write_systemd_user_updater_unit() {
     mkdir -p "$SYSTEMD_USER_UNIT_DIR"
     cat > "$SYSTEMD_USER_UNIT_DIR/loongsuite-pilot-updater.service" << UNITEOF
@@ -983,6 +1104,9 @@ WantedBy=default.target
 UNITEOF
 }
 
+# Generate a system-level systemd unit that runs as the invoking user.  This path
+# requires sudo but gives boot persistence even when user-level systemd is not
+# available or linger cannot be enabled.
 _write_systemd_system_unit() {
     local target_user="$1"
     local target_home
@@ -1017,6 +1141,7 @@ WantedBy=multi-user.target
 UNITEOF
 }
 
+# Generate the macOS launchd plist for the updater sidecar.
 _write_launchd_updater_plist() {
     mkdir -p "$(dirname "$UPDATER_PLIST")"
     ensure_dirs
@@ -1057,6 +1182,8 @@ _write_launchd_updater_plist() {
 PLISTEOF
 }
 
+# Generate a system-level systemd unit for the updater sidecar.  It mirrors the
+# collector unit but runs `run-updater` and uses a slower restart interval.
 _write_systemd_system_updater_unit() {
     local target_user="$1"
     local target_home
@@ -1092,6 +1219,9 @@ WantedBy=multi-user.target
 UNITEOF
 }
 
+# Generate an init.d script for older Linux hosts without systemd.  The template
+# is written with placeholders first, then patched with sed so path expansion
+# happens in this installer rather than inside the generated script at runtime.
 _write_initd_script() {
     local target_user="$1"
     local target_home
@@ -1219,6 +1349,7 @@ INITEOF
     rm -f "$tmp_script"
 }
 
+# Generate the init.d companion script for the updater sidecar.
 _write_initd_updater_script() {
     local target_user="$1"
     local target_home
@@ -1346,6 +1477,9 @@ INITEOF
     rm -f "$tmp_script"
 }
 
+# Register an init.d script for boot on distributions that expose chkconfig or
+# update-rc.d.  Missing tools are not fatal; the service can still be controlled
+# manually through the generated init.d script.
 _register_initd_boot() {
     local name="$1"
     if command -v chkconfig &>/dev/null; then
@@ -1357,6 +1491,7 @@ _register_initd_boot() {
     fi
 }
 
+# Remove an init.d script from boot registration when the platform supports it.
 _unregister_initd_boot() {
     local name="$1"
     if command -v chkconfig &>/dev/null; then
@@ -1366,6 +1501,9 @@ _unregister_initd_boot() {
     fi
 }
 
+# Install and start autostart entries for the detected service manager.  The
+# updater is registered only when its bootstrap script exists, which allows
+# package variants without auto-update support to share the same wrapper.
 autostart_install() {
     local system_service="${1:-false}"
 
@@ -1433,6 +1571,8 @@ autostart_install() {
     esac
 }
 
+# Remove service-manager registrations created by autostart_install.  This is
+# used by `stop` before PID cleanup so future boots do not resurrect the service.
 autostart_remove() {
     local init_system
     init_system=$(detect_init_system)
@@ -1474,6 +1614,9 @@ autostart_remove() {
     rm -f "$INIT_TYPE_FILE"
 }
 
+# Print autostart state using the same persisted init-type selection used by
+# start/stop.  systemd-system checks use sudo -n so status does not unexpectedly
+# prompt for a password.
 autostart_status() {
     local init_system
     init_system=$(detect_init_system)
@@ -1523,6 +1666,8 @@ autostart_status() {
     esac
 }
 
+# Keep help text limited to user-facing commands.  Internal service-manager
+# entrypoints such as run/run-updater/restart-collector are intentionally hidden.
 cmd_help() {
     echo "Usage: loongsuite-pilot <command> [options]"
     echo ""
@@ -1541,6 +1686,8 @@ cmd_help() {
     echo "  --system-service  Use system-level service registration (requires sudo)"
 }
 
+# Dispatch monitor subcommands separately so the top-level command table remains
+# simple while still supporting `loongsuite-pilot monitor start|stop`.
 cmd_monitor() {
     case "${1:-}" in
         start) cmd_monitor_start ;;
@@ -1554,6 +1701,8 @@ cmd_monitor() {
 
 # ---- Dispatch ----
 
+# Default to status when no command is provided.  The run/run-updater commands
+# are internal foreground entrypoints used by generated service-manager units.
 case "${1:-status}" in
     start)       shift; cmd_start "$@" ;;
     stop)        cmd_stop ;;

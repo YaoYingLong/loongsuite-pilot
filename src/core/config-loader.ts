@@ -155,12 +155,25 @@ function env(key: string): string | undefined {
   return process.env[key];
 }
 
+/**
+ * Resolve boolean env vars used by this loader.
+ *
+ * Only the explicit strings "false" and "0" disable a flag; every other
+ * defined value is treated as true. This keeps flags such as "1", "true",
+ * and arbitrary non-empty deployment values compatible with shell usage.
+ */
 function envBool(key: string, fallback: boolean): boolean {
   const v = env(key);
   if (v === undefined) return fallback;
   return v !== 'false' && v !== '0';
 }
 
+/**
+ * Resolve numeric env vars without throwing on bad input.
+ *
+ * Invalid numbers silently keep the fallback so a malformed env var does not
+ * prevent the collector from starting.
+ */
 function envInt(key: string, fallback: number): number {
   const v = env(key);
   if (v === undefined) return fallback;
@@ -188,9 +201,13 @@ export async function loadConfig(): Promise<AnalyticsConfig> {
 
   const dataDir = env('LOONGSUITE_PILOT_DATA_DIR') ?? file?.dataDir ?? '~/.loongsuite-pilot';
 
+  // The inner config is resolved after dataDir because group/internal builds
+  // may place built-in destinations under the effective data directory.
   const innerDataConfigPath = resolveHome(`${dataDir}/configs/inner/data_config.json`);
   const innerDataConfig = await readJsonFile<InnerDataConfig>(innerDataConfigPath);
 
+  // user.id is a legacy config key kept for old installations. The normalized
+  // AnalyticsConfig always exposes the camelCase userId field.
   const userId = env('LOONGSUITE_PILOT_USER_ID') ?? file?.userId ?? file?.['user.id'] ?? os.hostname();
 
   const serviceNamePrefix = env('LOONGSUITE_PILOT_SERVICE_NAME_PREFIX') ?? file?.serviceNamePrefix ?? 'loongsuite-pilot';
@@ -218,10 +235,18 @@ export async function loadConfig(): Promise<AnalyticsConfig> {
 }
 
 function buildOtlpTraceRawConfig(file: ConfigFile | null): OtlpTraceRawConfig | undefined {
+  // Keep this as a raw copy. buildOtlpTraceConfig() later applies runtime env
+  // overrides and chooses between the generic OTLP path and legacy CMS fallback.
   if (!file?.otlpTrace) return undefined;
   return { ...file.otlpTrace };
 }
 
+/**
+ * Strict optional boolean parser for config values that may be strings.
+ *
+ * Unlike envBool(), this intentionally accepts only true/false and returns
+ * undefined for values such as "0" or "yes". Callers then decide the default.
+ */
 function parseOptionalBool(value: unknown): boolean | undefined {
   if (typeof value === 'boolean') return value;
   if (typeof value !== 'string') return undefined;
@@ -236,6 +261,8 @@ function buildCmsConfig(file: ConfigFile | null): CmsConfig {
   const endpoint = env('LOONGSUITE_PILOT_CMS_ENDPOINT') ?? file?.cms?.endpoint ?? '';
   const workspace = env('LOONGSUITE_PILOT_CMS_WORKSPACE') ?? file?.cms?.workspace ?? '';
   return {
+    // CMS is considered configured only when a license key exists. An endpoint
+    // alone is not enough for the legacy ARMS OTLP exporter path.
     enabled: !!licenseKey,
     licenseKey,
     endpoint,
@@ -252,6 +279,8 @@ function buildAgentsConfig(file: ConfigFile | null): AgentsConfig {
     if (!agentType || !policy || typeof policy !== 'object') continue;
     result[agentType] = {
       enabled: policy.enabled,
+      // Default to capturing content unless an agent explicitly disables it.
+      // This preserves backward compatibility for old agent policy entries.
       captureMessageContent: parseOptionalBool(policy.captureMessageContent) ?? true,
     };
   }
@@ -269,6 +298,8 @@ const SUPPORTED_MASK_TYPES: readonly MaskType[] = [
 const SUPPORTED_MASK_TYPE_SET = new Set<string>(SUPPORTED_MASK_TYPES);
 
 function parseMaskTypes(value: string | string[] | undefined): MaskType[] {
+  // Env uses comma-separated text; config.json uses an array. Both are
+  // normalized into the same allow-list and unsupported values are dropped.
   const rawTypes = Array.isArray(value)
     ? value
     : typeof value === 'string'
@@ -282,10 +313,13 @@ function parseMaskTypes(value: string | string[] | undefined): MaskType[] {
 function buildMaskConfig(file: ConfigFile | null): MaskConfig {
   const mode = env('LOONGSUITE_PILOT_MASK_MODE') ?? file?.mask?.mode;
   if (mode !== 'all' && mode !== 'custom' && mode !== 'none') {
+    // Unknown modes fail closed to "none" rather than guessing a mask policy.
     return { mode: 'none', types: [] };
   }
 
   if (mode === 'all' || mode === 'none') {
+    // all/none do not need an explicit type list; custom is the only mode that
+    // consults LOONGSUITE_PILOT_MASK_TYPES or config.mask.types.
     return { mode, types: [] };
   }
 
@@ -297,6 +331,9 @@ function buildMaskConfig(file: ConfigFile | null): MaskConfig {
 function buildListenersConfig(
   file: ConfigFile | null,
 ): Record<string, { enabled: boolean; pollInterval: number }> {
+  // Listener defaults are intentionally declared in one place so discovery and
+  // input registration can rely on a complete map even when config.json is
+  // absent. Unknown listener keys from config.json are still carried through.
   const defaults: Record<string, { enabled: boolean; pollInterval: number }> = {
     qoder: { enabled: true, pollInterval: 30_000 },
     'qoder-sqlite': { enabled: true, pollInterval: 30_000 },
@@ -312,7 +349,8 @@ function buildListenersConfig(
 
   const result = { ...defaults };
 
-  // Merge file-level listener overrides
+  // Merge file-level listener overrides. For unknown listener keys, missing
+  // fields fall back to the standard enabled/poll interval defaults.
   if (file?.listeners) {
     for (const [key, val] of Object.entries(file.listeners)) {
       result[key] = {
@@ -322,7 +360,8 @@ function buildListenersConfig(
     }
   }
 
-  // Env overrides for specific poll intervals
+  // Historical Qoder env override applies only to the Qoder-related pollers
+  // listed below; it does not globally rewrite all listeners.
   const envPoll = envInt('QODER_ANALYTICS_POLL_INTERVAL', 0);
   if (envPoll > 0) result.qoder.pollInterval = envPoll;
   if (envPoll > 0) result['qoder-sqlite'].pollInterval = envPoll;
@@ -334,6 +373,8 @@ function buildListenersConfig(
 function buildRetentionConfig(file: ConfigFile | null): LogRetentionConfig {
   const unifiedDays = envInt('LOONGSUITE_PILOT_LOG_RETENTION_DAYS', 0);
 
+  // Per-category config.json values are the most specific retention settings.
+  // The unified env var only fills categories not explicitly configured.
   const resolve = (fileVal: number | undefined, fallback: number): number => {
     if (fileVal !== undefined) return fileVal;
     if (unifiedDays > 0) return unifiedDays;
@@ -394,6 +435,8 @@ function buildFlushersConfig(
   serviceNamePrefix: string,
   innerDataConfig: InnerDataConfig | null,
 ): FlusherConfig {
+  // Each flusher builder owns its own compatibility rules. SLS is the only one
+  // that also consumes the inner data_config.json destinations.
   return {
     sls: buildSlsConfig(file, serviceNamePrefix, innerDataConfig),
     jsonl: buildJsonlConfig(file, dataDir),
@@ -411,6 +454,8 @@ function buildFlushersConfig(
 export function buildOtlpTraceConfig(config: AnalyticsConfig): OtlpTraceFlusherConfig | undefined {
   if (!config.collectTrace) return undefined;
 
+  // The explicit OTLP endpoint, whether from env or config.otlpTrace, always
+  // wins over legacy CMS/ARMS settings.
   const otlpEndpoint = env('LOONGSUITE_PILOT_OTLP_ENDPOINT') ?? config.otlpTrace?.endpoint;
   if (otlpEndpoint) {
     return buildOtlpTraceConfigNew(otlpEndpoint, config);
@@ -428,6 +473,8 @@ function buildOtlpTraceConfigNew(
   let headers: Record<string, string> | undefined;
   const envHeaders = env('LOONGSUITE_PILOT_OTLP_HEADERS');
   if (envHeaders) {
+    // Header values are deployment-provided JSON. Invalid JSON should disable
+    // only the env override, not the whole trace exporter.
     try { headers = JSON.parse(envHeaders); } catch { logger.warn('LOONGSUITE_PILOT_OTLP_HEADERS is not valid JSON, ignoring', { raw: envHeaders }); }
   } else {
     headers = otlp?.headers;
@@ -453,6 +500,8 @@ function buildOtlpTraceConfigLegacy(config: AnalyticsConfig): OtlpTraceFlusherCo
   const { cms, serviceNamePrefix } = config;
   if (!cms.enabled || !cms.endpoint) return undefined;
 
+  // Legacy CMS mode targets ARMS. Required ARMS headers are derived from the
+  // CMS block so old configs can produce an OTLP exporter without otlpTrace.
   const armsProject = extractArmsProject(cms.endpoint);
   const headers: Record<string, string> = {};
   if (cms.licenseKey) headers['x-arms-license-key'] = cms.licenseKey;
@@ -487,10 +536,14 @@ function extractArmsProject(endpoint: string): string {
 function resolveCaptureMessageContent(agents: AgentsConfig): boolean {
   const values = Object.values(agents);
   if (values.length === 0) return true;
+  // Any agent-level opt-out disables message content capture for trace export.
+  // The trace flusher is global, so it uses the strictest configured policy.
   return values.every(a => a.captureMessageContent !== false);
 }
 
 function parseSlsEndpointEntry(ep: SlsEndpointEntry, index: number): SlsEndpoint {
+  // Multi-endpoint config already describes complete endpoints. Infer AK mode
+  // from credentials when mode is omitted; otherwise default to webtracking.
   const mode: SlsMode = ep.mode ?? (ep.accessKeyId && ep.accessKeySecret ? 'ak' : 'webtracking');
   const rawEndpoint = ep.endpoint ?? '';
   const endpoint = rawEndpoint
@@ -524,8 +577,12 @@ function buildSlsConfig(file: ConfigFile | null, serviceNamePrefix: string, inne
   let endpoints: SlsEndpoint[];
 
   if (isArray) {
+    // New shape: config.sls is an array and each item is a destination. Env
+    // LOONGSUITE_SLS_* overrides are intentionally not applied to this shape.
     endpoints = (rawSls as SlsEndpointEntry[]).map((ep, i) => parseSlsEndpointEntry(ep, i));
   } else if (single) {
+    // Legacy/single shape: config.sls describes the user destination and env
+    // LOONGSUITE_SLS_* may override each destination field.
     const userMode = readUserSlsMode(single);
     const userAk = env('LOONGSUITE_SLS_ACCESS_KEY_ID') ?? single.accessKeyId;
     const userSk = env('LOONGSUITE_SLS_ACCESS_KEY_SECRET') ?? single.accessKeySecret;
@@ -533,6 +590,9 @@ function buildSlsConfig(file: ConfigFile | null, serviceNamePrefix: string, inne
     const userProject = env('LOONGSUITE_SLS_PROJECT') ?? single.project;
     const userLogstore = env('LOONGSUITE_SLS_LOGSTORE') ?? single.logstore;
 
+    // A user destination is created only after project and logstore are known.
+    // endpoint may still be empty; the later enabled derivation will then
+    // disable SLS while preserving the parsed endpoint for diagnostics.
     const hasUserDestination = !!(userProject && userLogstore);
 
     if (hasUserDestination) {
@@ -553,6 +613,8 @@ function buildSlsConfig(file: ConfigFile | null, serviceNamePrefix: string, inne
   }
 
   if (innerDataConfig?.sls && Array.isArray(innerDataConfig.sls)) {
+    // Inner endpoints are appended after user config so de-duplication keeps the
+    // user's entry when both sources describe the same endpoint/project/logstore.
     const innerEndpoints = innerDataConfig.sls
       .filter(ep => ep.endpoint && ep.logstore)
       .map((ep, i) => parseSlsEndpointEntry(ep, i));
@@ -561,6 +623,8 @@ function buildSlsConfig(file: ConfigFile | null, serviceNamePrefix: string, inne
 
   endpoints = dedupSlsEndpoints(endpoints);
 
+  // Top-level SlsFlusherConfig fields mirror the first endpoint for legacy
+  // consumers. New code should prefer the per-endpoint endpoints array.
   const primary = endpoints[0] as SlsEndpoint | undefined;
   const topLevelMode = primary?.mode ?? 'webtracking';
   const topLevelEndpoint = primary?.endpoint ?? '';
@@ -570,6 +634,8 @@ function buildSlsConfig(file: ConfigFile | null, serviceNamePrefix: string, inne
   const enabled = single?.enabled !== undefined
     ? single.enabled
     : endpoints.length > 0 && endpoints.every(ep => {
+        // webtracking accepts an empty project, but every mode requires endpoint
+        // and logstore. AK additionally requires project and both credentials.
         if (!ep.endpoint || !ep.logstore) return false;
         if (ep.mode === 'ak') return !!(ep.project && ep.accessKeyId && ep.accessKeySecret);
         return true;
@@ -602,6 +668,8 @@ function buildUserSlsEndpoint(args: {
   accessKeyId: string | undefined;
   accessKeySecret: string | undefined;
 }): SlsEndpoint {
+  // For the single-user destination, missing mode is inferred from the presence
+  // of both credentials; otherwise the safer anonymous webtracking path is used.
   const mode: SlsMode = args.mode ?? (args.accessKeyId && args.accessKeySecret ? 'ak' : 'webtracking');
 
   const rawEndpoint = args.rawEndpoint ?? '';
@@ -646,6 +714,8 @@ function dedupSlsEndpoints(endpoints: SlsEndpoint[]): SlsEndpoint[] {
   const result: SlsEndpoint[] = [];
   for (const ep of endpoints) {
     const key = `${normalizeEndpointUrl(ep.endpoint)}|${ep.project}|${ep.logstore}`;
+    // Keep the first endpoint for each normalized destination. Because buildSlsConfig
+    // appends inner destinations after config.json, user config wins conflicts.
     if (seen.has(key)) continue;
     seen.add(key);
     result.push(ep);
@@ -655,6 +725,7 @@ function dedupSlsEndpoints(endpoints: SlsEndpoint[]): SlsEndpoint[] {
 
 function buildJsonlConfig(file: ConfigFile | null, dataDir: string) {
   return {
+    // JSONL is the local fallback output and is enabled by default.
     enabled: envBool('JSONL_ENABLED', file?.jsonl?.enabled ?? true),
     outputDir: resolveHome(
       env('JSONL_OUTPUT_DIR') ?? file?.jsonl?.outputDir ?? `${dataDir}/logs/output`,
@@ -669,12 +740,16 @@ function buildHttpConfig(file: ConfigFile | null) {
   let headers: Record<string, string> | undefined;
   const envHeaders = env('HTTP_REPORT_HEADERS');
   if (envHeaders) {
+    // Malformed HTTP_REPORT_HEADERS should not block startup; the request is
+    // sent without headers instead.
     try { headers = JSON.parse(envHeaders); } catch { /* ignore */ }
   } else {
     headers = file?.http?.headers;
   }
 
   const enabled = env('HTTP_REPORT_URL') !== undefined
+    // When the env URL is present it becomes the source of truth: empty disables
+    // HTTP, non-empty enables HTTP regardless of config.http.enabled.
     ? !!url
     : file?.http?.enabled ?? !!url;
 
@@ -701,6 +776,8 @@ export function buildAutoUpdateConfig(
 
   let manifestUrl = env('LOONGSUITE_PILOT_MANIFEST_URL') ?? file?.autoUpdate?.manifestUrl;
   if (!manifestUrl && packageUrl) {
+    // If only a package URL is provided, the updater expects latest.json next to
+    // the package. Explicit manifestUrl still takes precedence.
     const lastSlash = packageUrl.lastIndexOf('/');
     manifestUrl = lastSlash >= 0
       ? packageUrl.substring(0, lastSlash + 1) + 'latest.json'
@@ -710,6 +787,7 @@ export function buildAutoUpdateConfig(
   const hasPackageConfig = !!packageUrl;
 
   return {
+    // Auto update cannot be enabled without a package URL, even if the flag is true.
     enabled: hasPackageConfig && envBool('LOONGSUITE_PILOT_AUTO_UPDATE_ENABLED', file?.autoUpdate?.enabled ?? true),
     checkIntervalMs: envInt(
       'LOONGSUITE_PILOT_AUTO_UPDATE_INTERVAL_MS',

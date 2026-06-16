@@ -55,17 +55,29 @@ const logger = createLogger('Orchestrator');
 const DEFAULT_DATA_DIR = '~/.loongsuite-pilot';
 
 /**
- * Central orchestrator — the entry point that wires all sub-systems together.
+ * Central orchestrator - the runtime entry point that wires all subsystems together.
  *
- * Startup sequence:
- *   1. Load configuration & state
- *   2. Build flushers (SLS + JSONL + HTTP)
- *   3. Install hooks into agent config files
- *   4. Register all inputs
- *   5. Start AgentDiscoveryService (fs.watch + polling)
- *   6. Emit 'started'
+ * This class intentionally stays at the coordination layer:
+ * - It does not parse raw agent data. Concrete inputs own that.
+ * - It does not normalize or mask entries. InputManager delegates to those modules.
+ * - It does not know how a hook/plugin is installed. DeploymentManager owns that.
+ *
+ * High-level startup sequence:
+ *   1. Prepare runtime directories and persisted state.
+ *   2. Build output flushers and connect them to InputManager.
+ *   3. Deploy collection capabilities declared in agents.d.
+ *   4. Register built-in inputs and convert them to discovery entries.
+ *   5. Start discovery, retention, watchdog, file collection, metrics, and status bar services.
+ *   6. Mark the process as running and emit lifecycle events.
  */
 export class Orchestrator extends EventEmitter {
+  /**
+   * Listener ids are more fine-grained than agent ids.
+   *
+   * Example: qoder has sqlite, trace, hook, and session listeners, but config.agents
+   * gates them through the single "qoder" agent id. Keep this map updated whenever
+   * a new listener is added, otherwise agent-level enable/disable may not apply.
+   */
   private static readonly LISTENER_AGENT_MAP: Record<string, string> = {
     'qoder-sqlite': 'qoder',
     'qoder-trace': 'qoder',
@@ -112,6 +124,14 @@ export class Orchestrator extends EventEmitter {
     this.dataDir = resolveHome(config.dataDir || DEFAULT_DATA_DIR);
   }
 
+  /**
+   * Start the whole data-collection runtime.
+   *
+   * The order matters: state and output must exist before inputs can emit entries;
+   * deployment should run before discovery so newly installed hooks/plugins can be
+   * observed on the first refresh; metrics/status services start after the dataflow
+   * pieces exist so their snapshots are meaningful.
+   */
   async start(): Promise<void> {
     if (this.isRunning) {
       logger.warn('already running');
@@ -134,10 +154,12 @@ export class Orchestrator extends EventEmitter {
     );
     await this.agentControlManager.load();
 
-    // 3. Build flushers
+    // 3. Build flushers. The builder always returns at least one flusher by using
+    //    JSONL fallback when all configured outputs are disabled or unavailable.
     this.flusher = await this.buildFlusher();
 
-    // 4. Build InputManager & AlarmManager
+    // 4. Build InputManager & AlarmManager. InputManager is the single routing
+    //    point from BaseInput "entries" events to the selected flusher(s).
     const version = readInstalledVersion(this.dataDir);
     this.alarmManager = new AlarmManager({ ip: resolveLocalIp(), version });
 
@@ -148,7 +170,9 @@ export class Orchestrator extends EventEmitter {
     this.inputManager.setAlarmManager(this.alarmManager);
     this.inputManager.setMaskConfig(this.config.mask ?? { mode: 'none', types: [] });
 
-    // 5. Deploy agent collection capabilities (hooks + plugins, best-effort)
+    // 5. Deploy agent collection capabilities (hooks + plugins, best-effort).
+    //    Definitions come from the installed package plus dataDir/agents.d.local.
+    //    A failed deploy for one agent should not prevent other agents from running.
     const pilotDir = this.resolvePilotDir();
     this.deploymentManager = new DeploymentManager({
       dataDir: this.dataDir,
@@ -156,13 +180,17 @@ export class Orchestrator extends EventEmitter {
     });
     await this.deploymentManager.deployAll();
 
-    // 6. Register inputs & build detection entries
+    // 6. Register inputs & build detection entries. Registration only wires event
+    //    handlers; AgentDiscoveryService below decides when each input starts.
     const detectionEntries = await this.registerAllInputs();
 
-    // 7. Build deployment detection entries for dynamic discovery
+    // 7. Build deployment detection entries for dynamic discovery. These entries
+    //    do not collect data; they redeploy capabilities when a new agent appears
+    //    after the orchestrator has already started.
     const deployDetectionEntries = this.buildDeployDetectionEntries();
 
-    // 8. Start AgentDiscoveryService (input entries + deploy detection entries)
+    // 8. Start AgentDiscoveryService (input entries + deploy detection entries).
+    //    It uses fs.watch where possible and falls back to polling per entry.
     this.agentDiscoveryService = new AgentDiscoveryService([...detectionEntries, ...deployDetectionEntries]);
     this.agentDiscoveryService.on('agent:started', (id: string) => {
       logger.info('agent detected and started', { id });
@@ -181,7 +209,8 @@ export class Orchestrator extends EventEmitter {
     this.logRetentionService = new LogRetentionService(this.dataDir, this.config.retention);
     this.logRetentionService.start();
 
-    // 10. Start hook watchdog (periodically restores hooks overwritten by other tools)
+    // 10. Start hook watchdog (periodically restores hooks overwritten by other tools).
+    //     Watchdog targets combine legacy defaults and hook targets declared in agents.d.
     const hookWatchdogTargets = [
       ...HookWatchdog.defaultTargets(),
       ...this.buildHookWatchdogTargets(),
@@ -201,7 +230,9 @@ export class Orchestrator extends EventEmitter {
       logger.info('file collection disabled, skipping');
     }
 
-    // 12. Start metrics writer (L1 + L2 every 10min, alarms every 30s → local JSONL + remote via sender.ts)
+    // 12. Start metrics writer (L1 + L2 every 10min, alarms every 30s -> local JSONL + remote via sender.ts).
+    //     SLS-specific counters are surfaced through getSlsFlusher(); other flushers
+    //     still receive data but are not expanded into endpoint-level metrics here.
     const slsFlusher = this.getSlsFlusher();
     if (slsFlusher) slsFlusher.setAlarmManager(this.alarmManager);
     this.metricsWriter = new MetricsWriter({
@@ -213,7 +244,9 @@ export class Orchestrator extends EventEmitter {
     });
     await this.metricsWriter.start();
 
-    // 12. Start status bar support (runtime.json + metrics summary + native app)
+    // 13. Start status bar support (runtime.json + metrics summary + native app).
+    //     The native app is macOS-only and best-effort; failing to start it should
+    //     not stop data collection.
     if (this.config.statusBar.enabled) {
       const packageVersion = this.readPackageVersion();
 
@@ -238,6 +271,13 @@ export class Orchestrator extends EventEmitter {
     });
   }
 
+  /**
+   * Stop runtime services in the reverse direction of data flow.
+   *
+   * Peripheral/background services stop first, then discovery and inputs, then the
+   * output flusher, and finally StateStore is saved so the next run can resume from
+   * the latest persisted offsets.
+   */
   async stop(): Promise<void> {
     if (!this.isRunning) return;
     logger.info('stopping orchestrator');
@@ -283,8 +323,16 @@ export class Orchestrator extends EventEmitter {
   }
 
   /**
-   * Build detection entries for agent definitions that haven't been deployed yet.
-   * When a new agent is discovered at runtime, triggers deploySingle().
+   * Build detection entries for declarative agent definitions.
+   *
+   * These entries are separate from input entries:
+   * - input entries start/stop concrete collectors;
+   * - deploy entries only call deploySingle() when an agent installation becomes
+   *   visible after startup.
+   *
+   * This keeps runtime discovery from depending on a restart: installing Cursor,
+   * Codex, Claude Code, etc. while the pilot is running can still cause hooks or
+   * plugins to be installed on the next watch/poll cycle.
    */
   private buildDeployDetectionEntries(): AgentDetectionEntry[] {
     const defs = this.deploymentManager.getDefinitions();
@@ -315,6 +363,13 @@ export class Orchestrator extends EventEmitter {
     return entries;
   }
 
+  /**
+   * Convert hook-mode agent definitions into watchdog targets.
+   *
+   * HookWatchdog owns the periodic check, but DeploymentManager owns the repair.
+   * Returning deploySingle(def).success keeps the watchdog independent from the
+   * exact hook installation strategy.
+   */
   private buildHookWatchdogTargets(): PluginCheckTarget[] {
     const defs = this.deploymentManager.getDefinitions();
     const targets: PluginCheckTarget[] = [];
@@ -334,6 +389,14 @@ export class Orchestrator extends EventEmitter {
     return targets;
   }
 
+  /**
+   * Build the output side of the pipeline.
+   *
+   * Each configured flusher is attempted independently. Startup failures are logged
+   * as warnings because local collection should continue when one destination is
+   * temporarily unavailable. If no destination is configured, JSONL fallback keeps a
+   * replayable local record under dataDir/logs/output.
+   */
   private async buildFlusher(): Promise<BaseFlusher> {
     const flushers: BaseFlusher[] = [];
     const cfg = this.config.flushers;
@@ -383,7 +446,12 @@ export class Orchestrator extends EventEmitter {
   }
 
   /**
-   * Install hook scripts into agent configuration files.
+   * Legacy direct hook installation path.
+   *
+   * The main startup path now goes through DeploymentManager.deployAll(), which uses
+   * agents.d definitions and strategy objects. This method is kept for compatibility
+   * with older callers/tests and documents the previous hard-coded hook flow.
+   *
    * Only installs if the target agent is present on disk.
    */
   private async installHooks(): Promise<void> {
@@ -481,16 +549,29 @@ export class Orchestrator extends EventEmitter {
   }
 
   /**
-   * Register all built-in inputs. Returns detection entries for the
-   * AgentDiscoveryService.
+   * Register all built-in inputs and return their discovery entries.
    *
-   * To add a new agent: create a input class, add registration here.
+   * Registration is not activation: inputs are created and attached to InputManager,
+   * but only AgentDiscoveryService calls the returned entry.start()/stop() callbacks.
+   *
+   * Enablement uses two gates:
+   * - config.agents gates at the logical agent level, such as "qoder";
+   * - config.listeners + agent-control.json gate individual listeners, such as
+   *   "qoder-cli-session".
+   *
+   * Trace inputs merge multiple data sources and therefore suppress older listeners
+   * for the same agent family to avoid duplicate events.
+   *
+   * To add a new agent: create an input class, add LISTENER_AGENT_MAP if needed,
+   * register it here, and add listener defaults in config-loader.
    */
   private async registerAllInputs(): Promise<AgentDetectionEntry[]> {
     const entries: AgentDetectionEntry[] = [];
     const listenerCfg = this.config.listeners;
 
-    // Qoder trace input mutual exclusion closure (used by sqlite/hook/session guards below)
+    // qoder-trace is the preferred multi-source collector for Qoder. When enabled,
+    // sqlite, hook, and session listeners below must stay off to avoid reporting the
+    // same turn through multiple collection paths.
     const qoderTraceEnabled = () =>
       this.isAgentGatedEnabled(Orchestrator.LISTENER_AGENT_MAP['qoder-trace']) &&
       this.agentControlManager.resolveEnabled(
@@ -515,7 +596,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Qoder Work CN Trace (multi-source merge, supersedes hook/log/sqlite) ---
+    // --- Qoder Work Trace (multi-source merge, supersedes hook/log/sqlite) ---
     const qoderWorkTraceInput = new QoderWorkTraceInput({
       stateStore: this.stateStore,
       logDir: path.join(this.dataDir, 'logs', 'qoder-work', 'history'),
@@ -535,7 +616,8 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // QoderCN trace input mutual exclusion closure
+    // qoder-cn-trace has the same precedence model as qoder-trace: it is a merged
+    // collector and disables the older sqlite/IDE snapshot listeners when active.
     const qoderCnTraceEnabled = () =>
       this.isAgentGatedEnabled(Orchestrator.LISTENER_AGENT_MAP['qoder-cn-trace']) &&
       this.agentControlManager.resolveEnabled(
@@ -593,7 +675,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Qoder Work (Hook JSONL) — disabled when CN trace is active ---
+    // --- Qoder Work (Hook JSONL) — disabled when qoder-work-trace is active ---
     const qoderWorkLogDir = path.join(this.dataDir, 'logs', 'qoder-work', 'history');
     const qoderWorkInput = new QoderWorkInput({
       stateStore: this.stateStore,
@@ -614,7 +696,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Qoder Work (SDK Log tail) — disabled when CN trace is active ---
+    // --- Qoder Work (SDK Log tail) — disabled when qoder-work-trace is active ---
     const qoderWorkLogInput = new QoderWorkLogInput({ stateStore: this.stateStore });
     this.inputManager.registerInput(qoderWorkLogInput);
     entries.push(
@@ -631,7 +713,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Qoder Work (SQLite agents.db) — disabled when CN trace is active ---
+    // --- Qoder Work (SQLite agents.db) — disabled when qoder-work-trace is active ---
     const qoderWorkSqliteInput = new QoderWorkSqliteInput({ stateStore: this.stateStore });
     this.inputManager.registerInput(qoderWorkSqliteInput);
     entries.push(
@@ -675,7 +757,10 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Qoder Work CN (Hook JSONL) — disabled when CN trace is active ---
+    // qoder-work-cn-trace is disabled by default. When a deployment enables it, it
+    // takes precedence over the CN hook/log/sqlite listeners below.
+
+    // --- Qoder Work CN (Hook JSONL) — disabled when qoder-work-cn-trace is active ---
     const qoderWorkCNHookInput = new QoderWorkInput({
       stateStore: this.stateStore,
       agentType: ClientType.QoderWorkCN,
@@ -696,7 +781,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Qoder Work CN (SDK Log tail) — disabled when CN trace is active ---
+    // --- Qoder Work CN (SDK Log tail) — disabled when qoder-work-cn-trace is active ---
     const qoderWorkCNLogInput = new QoderWorkLogInput({
       stateStore: this.stateStore,
       agentType: ClientType.QoderWorkCN,
@@ -717,7 +802,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Qoder Work CN (SQLite agents.db) — disabled when CN trace is active ---
+    // --- Qoder Work CN (SQLite agents.db) — disabled when qoder-work-cn-trace is active ---
     const qoderWorkCNSqliteInput = new QoderWorkSqliteInput({
       stateStore: this.stateStore,
       agentType: ClientType.QoderWorkCN,
@@ -903,9 +988,14 @@ export class Orchestrator extends EventEmitter {
   }
 
   /**
-   * Check whether an agent is allowed to run based on config.agents gate.
-   * - No config.agents or empty: always true (backward compat)
-   * - Otherwise: only if config.agents[agentId].enabled !== false
+   * Check the coarse agent-level gate from config.agents.
+   *
+   * Listener-level settings are checked separately through AgentControlManager.
+   * Keeping the two checks separate lets one logical agent be disabled everywhere,
+   * while still allowing fine-grained listener control when the agent is enabled.
+   *
+   * - No config.agents or empty: always true (backward compatibility).
+   * - Otherwise: only false when config.agents[agentId].enabled === false.
    */
   private isAgentGatedEnabled(agentId: string): boolean {
     const agents = this.config.agents;
@@ -955,6 +1045,13 @@ export class Orchestrator extends EventEmitter {
     return this.dataDir;
   }
 
+  /**
+   * Build the point-in-time snapshot consumed by MetricsWriter.
+   *
+   * Input counters come from InputManager. Flusher counters are currently expanded
+   * only for SLS because it exposes endpoint-level telemetry; non-SLS flushers still
+   * receive data but do not contribute detailed endpoint rows here.
+   */
   private buildDataflowSnapshot(): DataflowSnapshot {
     const inputCounters = this.inputManager.getInputCounters();
     const activeIds = this.inputManager.getActiveInputIds();
@@ -1032,5 +1129,4 @@ export class Orchestrator extends EventEmitter {
     return this.alarmManager;
   }
 }
-
 

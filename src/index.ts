@@ -7,6 +7,7 @@ import { resolveHome } from './utils/fs-utils.js';
 const logger = createLogger('Main');
 
 async function main(): Promise<void> {
+  // 加载配置文件，默认文件为~/.loongsuite-pilot/config.json
   const config = await loadConfig();
 
   const logDir = path.join(resolveHome(config.dataDir), 'logs');

@@ -61,6 +61,7 @@ const RESERVED_RESOURCE_KEYS = new Set([
 
 function resolveEndpointUrl(raw: string): string {
   let url = raw.replace(/\/+$/, '');
+  // 如果不是/v1/traces结尾，添加/v1/traces
   if (!url.endsWith('/v1/traces')) {
     url += '/v1/traces';
   }

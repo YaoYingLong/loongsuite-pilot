@@ -60,6 +60,7 @@ PURGE=0
 SYSTEM_SERVICE=0
 
 # First arg is sub-command (or option -> default to install)
+# 兼容 `installer.sh --version ...` 这类旧用法：首参是 option 时仍按 install 处理。
 if [[ $# -gt 0 ]]; then
     case "$1" in
         install|upgrade|uninstall)
@@ -147,11 +148,13 @@ validate_install_user() {
             local current_user
             current_user=$(whoami)
             if [ "$(id -u)" -eq 0 ]; then
+                # root 安装默认走系统级服务，避免注册到 root 的 user systemd。
                 HAS_SUDO=1
                 SYSTEM_SERVICE=1
                 msg "   ✅ 以 root 身份安装（自动使用系统级服务）" \
                     "   ✅ Installing as root (auto system-level service)"
             elif [ "$SYSTEM_SERVICE" -eq 1 ]; then
+                # 非 root 只有在 sudo 可用时才保留系统级服务请求，否则降级为用户态服务。
                 if sudo -n true 2>/dev/null; then
                     HAS_SUDO=1
                     msg "   ✅ sudo 权限校验通过 (user: $current_user)" \
@@ -175,6 +178,7 @@ validate_install_user() {
 }
 
 # Resolve PACKAGE_URL from OSS if not explicitly set
+# 下载地址优先级：命令行/环境变量 > 指定版本 OSS 包 > latest OSS 包。
 if [ -z "$PACKAGE_URL" ]; then
     if [ -n "$INSTALL_VERSION" ]; then
         PACKAGE_URL="${_OSS_BASE_URL}/${INSTALL_VERSION}/${PACKAGE_NAME}.tar.gz"
@@ -222,6 +226,7 @@ _node_is_app_bundle() {
 _node_is_suitable() {
     local bin="$1"
     [ -x "$bin" ] || return 1
+    # macOS GUI app bundle 中的 node 可能不是稳定的 CLI runtime，安装器主动排除。
     _node_is_app_bundle "$bin" && return 1
     local ver
     ver="$("$bin" --version 2>/dev/null)" || return 1
@@ -234,6 +239,7 @@ _node_is_suitable() {
 resolve_node() {
     local _candidates=()
 
+    # nvm 版本目录按反向顺序加入候选，通常更接近“最新安装版本优先”。
     local _nvm_candidates=("$HOME/.nvm/versions/node"/*/bin/node)
     local i
     for (( i=${#_nvm_candidates[@]}-1; i>=0; i-- )); do
@@ -278,6 +284,7 @@ check_deps() {
     fi
 
     # Pin the node binary path
+    # hook/daemon 后续可复用同一个 Node，避免 PATH 变化导致运行时和安装时不一致。
     mkdir -p "$DATA_DIR" 2>/dev/null || true
     echo "$NODE_BIN" > "$DATA_DIR/node-bin"
 
@@ -335,12 +342,14 @@ download_and_extract() {
     echo ""
 
     msg "==> 解压安装包..." "==> Extracting..."
+    # GNU tar 支持 --warning；BSD tar 不支持时回退普通解压。
     if tar --warning=no-unknown-keyword -xzf "$TMP_DIR/package.tar.gz" -C "$TMP_DIR" 2>/dev/null; then
         :
     else
         tar -xzf "$TMP_DIR/package.tar.gz" -C "$TMP_DIR"
     fi
 
+    # 兼容三种包结构：顶层 loongsuite-pilot/、顶层 package.json、或两层内嵌 package.json。
     if [ -d "$TMP_DIR/$PACKAGE_NAME" ]; then
         INSTALL_SRC="$TMP_DIR/$PACKAGE_NAME"
     elif [ -f "$TMP_DIR/package.json" ]; then
@@ -364,6 +373,7 @@ PROBE_RESULT="[]"
 
 probe_agents() {
     msg "==> 探测 AI Agent..." "==> Probing AI Agents..."
+    # cli-probe 属于安装包产物；探测失败不阻断安装，只影响后续 agent 默认选择。
     PROBE_RESULT=$("$NODE_BIN" "$INSTALL_SRC/dist/cli-probe.cjs" 2>/dev/null) || {
         msg "    ⚠️  Agent 探测失败，将跳过选择" "    ⚠️  Agent probe failed, skipping selection"
         PROBE_RESULT="[]"
@@ -380,6 +390,7 @@ probe_agents() {
 # ============================================================
 select_agents() {
     if [ -n "$SELECTED_AGENTS" ]; then
+        # --agents 是显式选择，保持原样写入；最终只会应用到 probe 结果中出现的 agent。
         msg "    使用指定的 Agent: $SELECTED_AGENTS" "    Using specified agents: $SELECTED_AGENTS"
         echo ""
         return 0
@@ -392,6 +403,7 @@ select_agents() {
     fi
 
     # Non-interactive: auto-select all detected agents
+    # curl | bash 场景无法交互，默认只启用探测到的 agent，避免误写未安装工具配置。
     if [ ! -t 0 ]; then
         SELECTED_AGENTS=$("$NODE_BIN" -e "
 const r = JSON.parse(process.argv[1]);
@@ -432,6 +444,7 @@ if (lang === 'zh') {
     read -r select_input
 
     # Compute final selection: empty input = detected agents, otherwise use exact input
+    # 用户输入按编号去重和排序，非法编号直接忽略。
     SELECTED_AGENTS=$("$NODE_BIN" -e "
 const r = JSON.parse(process.argv[1]);
 const input = process.argv[2] || '';
@@ -463,6 +476,7 @@ prompt_user_id() {
     local existing_uid=""
     local config_file="$DATA_DIR/config.json"
     if [ -f "$config_file" ]; then
+        # 重新安装时默认保留既有 userId，避免静默改变数据归属。
         existing_uid=$("$NODE_BIN" -e "
 try { const c=JSON.parse(require('fs').readFileSync(process.argv[1],'utf-8')); process.stdout.write(c.userId||''); } catch {}
 " -- "$config_file" 2>/dev/null || true)
@@ -497,6 +511,7 @@ confirm_config_overwrite() {
     if [ ! -f "$config_file" ]; then return 0; fi
 
     local diffs
+    # 只提示“旧值和新值都非空且不同”的关键字段，避免首次安装或补充空值时打断流程。
     diffs=$("$NODE_BIN" -e "
 const fs = require('fs');
 let old = {};
@@ -559,6 +574,7 @@ deploy_bootstrap_scripts() {
     local src_dir="$PERMANENT_DIR/scripts"
     local boot_dir="$HOME/.loongsuite-pilot/bin"
     mkdir -p "$boot_dir"
+    # bootstrap 放在固定 bin 目录，服务脚本可以跨版本通过 current/previous 指针加载真正代码。
     cp -f "$src_dir/collector-daemon.js" "$boot_dir/"
     [ -f "$src_dir/updater-daemon.js" ] && cp -f "$src_dir/updater-daemon.js" "$boot_dir/" || true
 }
@@ -587,15 +603,18 @@ deploy_package() {
             local old_dir
             old_dir=$(cat "$current_file" 2>/dev/null | tr -d '[:space:]')
             if [ -n "$old_dir" ] && [ "$old_dir" != "$dir_name" ]; then
+                # previous 只在切换到不同版本目录时更新，用于 upgrade 失败后的 rollback。
                 echo "$old_dir" > "$previous_file"
             fi
         fi
 
         msg "==> 部署到 $target ..." "==> Deploying to $target ..."
         mkdir -p "$versions_dir"
+        # 同一 version+commit 重新安装时覆盖目标目录，确保本地残留不会混入新包。
         rm -rf "$target"
         cp -r "$src" "$target"
 
+        # current 用临时文件+mv 更新，避免服务读取到半写入指针。
         echo "$dir_name" > "$current_file.tmp"
         mv -f "$current_file.tmp" "$current_file"
 
@@ -637,6 +656,7 @@ migrate_legacy_layout() {
     local versions_dir="$cache_dir/versions"
 
     if [ -f "$current_file" ]; then
+        # 已经是版本化布局时不再迁移。
         return 0
     fi
     if [ ! -d "$legacy_dir" ] || [ ! -f "$legacy_dir/dist/index.js" ]; then
@@ -657,6 +677,7 @@ migrate_legacy_layout() {
     local target="$versions_dir/$dir_name"
 
     mkdir -p "$versions_dir"
+    # 迁移只复制旧目录并写 current，不删除 legacy package，降低老版本回退风险。
     cp -r "$legacy_dir" "$target"
     echo "$dir_name" > "$current_file"
 
@@ -681,12 +702,14 @@ const path = '$config_file';
 let existing = {};
 try { existing = JSON.parse(fs.readFileSync(path, 'utf-8')); } catch {}
 
+// Merge on top of existing config so reinstall/upgrade preserves fields not controlled by installer flags.
 const config = {
   ...existing,
   enabled: true,
   dataDir: '$DATA_DIR',
 };
 delete config.internal;
+// Normalize historical user.id field into the canonical userId key.
 if (config.userId === undefined && config['user.id'] !== undefined) {
   config.userId = config['user.id'];
 }
@@ -700,6 +723,7 @@ const slsAkSecret = '${SLS_AK_SECRET}';
 const logLevel    = '${LOG_LEVEL}';
 const userId      = '${USER_ID}';
 
+// SLS is only touched when destination fields are provided. AK-only flags do not create sls config.
 if (slsEndpoint || slsProject || slsLogstore) {
   config.sls = config.sls || {};
   delete config.sls.destinationOverride;
@@ -766,6 +790,7 @@ if (selectedAgents) {
   config.agents = config.agents || {};
   const selected = selectedAgents.split(',').map(s => s.trim()).filter(Boolean);
   const allAgents = JSON.parse(process.argv[1] || '[]');
+  // Only agent ids returned by cli-probe are written; unknown --agents values are ignored here.
   for (const agent of allAgents) {
     config.agents[agent.id] = config.agents[agent.id] || {};
     config.agents[agent.id].enabled = selected.includes(agent.id);
@@ -807,6 +832,7 @@ install_loongsuite_pilot_command() {
             fi
             if grep -q '\.local/bin' "$file" 2>/dev/null; then return 0; fi
             # Ensure file ends with a newline before appending
+            # 只追加 PATH block，不重排用户已有 shell 配置。
             [ -s "$file" ] && [ "$(tail -c1 "$file" | wc -l)" -eq 0 ] && echo "" >> "$file"
             cat >> "$file" << 'PATHBLOCK'
 
@@ -1151,14 +1177,15 @@ cmd_install() {
     msg "==> 开始安装 $PACKAGE_NAME ..." \
         "==> Installing $PACKAGE_NAME ..."
     echo ""
-
+    #  root 安装默认走系统级服务，非 root 只有在 sudo 可用时才保留系统级服务请求，否则降级为用户态服务
     validate_install_user
+    # 检查node安装版本
     check_deps
 
     # Migrate legacy layout if needed
     migrate_legacy_layout
 
-    # Check if already installed
+    # Check if already installed 当前安装版本
     local cur_ver; cur_ver=$(get_installed_version)
     if [ -n "$cur_ver" ]; then
         msg "⚠️  检测到已安装版本 v${cur_ver}，将执行重新安装" \
@@ -1167,6 +1194,7 @@ cmd_install() {
     fi
 
     # Stop running service before re-install
+    # install 路径只按 PID 文件做轻量停止；完整 service manager 清理由 uninstall/CLI stop 负责。
     local pid_file="$DATA_DIR/loongsuite-pilot.pid"
     if [ -f "$pid_file" ]; then
         local old_pid
@@ -1192,11 +1220,13 @@ cmd_install() {
     fi
 
     trap 'rm -rf "${TMP_DIR:-}"' EXIT
+    # 下载安装包，并解压
     download_and_extract
     probe_agents
     select_agents
     prompt_user_id
     confirm_config_overwrite
+    # 将解压的安装包内容拷贝到$HOME/.loongsuite-pilot目录中
     deploy_package "$INSTALL_SRC"
     write_config
     install_loongsuite_pilot_command
@@ -1206,6 +1236,8 @@ cmd_install() {
     if [ "$SYSTEM_SERVICE" -eq 1 ]; then
         _start_args="--system-service"
     fi
+    # install 启动失败只提示，不回滚；rollback 语义仅用于 upgrade。
+    # loongsuite-pilot是在install_loongsuite_pilot_command中被安装为系统服务
     if loongsuite-pilot start $_start_args; then
         sleep 2
         local _status_out
@@ -1258,6 +1290,7 @@ cmd_upgrade() {
     local new_commit; new_commit=$(get_commit_from_dir "$INSTALL_SRC")
     local old_commit; old_commit=$(get_commit_from_dir "$PERMANENT_DIR")
 
+    # version 和 commit 都相同时视为同一包，避免重复部署和重启。
     if [ -n "$new_ver" ] && [ "$new_ver" = "$old_ver" ] && [ "$new_commit" = "$old_commit" ]; then
         msg "✅ 已是最新版本 v${new_ver} (${new_commit})，无需升级" \
             "✅ Already at latest version v${new_ver} (${new_commit}), nothing to do"
@@ -1279,6 +1312,7 @@ cmd_upgrade() {
 
     # Deploy new version to versions/<ver>_<commit>/
     # Old version stays untouched; deploy_package writes current/previous pointers
+    # 指针切换发生在 deploy_package 内，失败回滚依赖 previous 指针。
     deploy_package "$INSTALL_SRC"
     install_loongsuite_pilot_command
 
@@ -1301,6 +1335,7 @@ cmd_upgrade() {
     fi
 
     # --- Rollback via version pointer ---
+    # 新版本部署成功但启动失败时，通过 CLI rollback 交换 current/previous。
     echo ""
     msg "⚠️  新版本启动失败，正在回滚..." \
         "⚠️  New version failed to start, rolling back..."
@@ -1338,6 +1373,7 @@ gc_old_versions() {
         keep_previous=$(cat "$previous_file" 2>/dev/null | tr -d '[:space:]')
     fi
 
+    # 只保留 current 和 previous，保证还能回滚一次，同时避免版本目录无限增长。
     for d in "$versions_dir"/*/; do
         [ -d "$d" ] || continue
         local name
@@ -1368,6 +1404,7 @@ remove_hook_configs() {
 
         local ok=0
         if command -v node &>/dev/null; then
+            # 同时兼容 flat hooks 和 nested hooks；只删除 command 中带安装目录 marker 的条目。
             node -e "
 const fs = require('fs');
 const cfg = process.argv[1];
@@ -1416,6 +1453,7 @@ cmd_uninstall() {
     echo ""
 
     # Stop service (also removes autostart)
+    # 优先委托 CLI stop；CLI 不存在时才手动清理 pid/service manager 配置。
     msg "==> 停止服务..." "==> Stopping service..."
     if command -v loongsuite-pilot &>/dev/null; then
         loongsuite-pilot stop 2>/dev/null || true
@@ -1486,6 +1524,7 @@ cmd_uninstall() {
     echo ""
 
     # Remove package directory
+    # 注意：默认 DATA_DIR 也在该目录下，因此默认卸载会连配置和日志一起删除。
     msg "==> 删除安装目录..." "==> Removing installation..."
     rm -rf "$HOME/.loongsuite-pilot"
     msg "    ✅ 已删除 $HOME/.loongsuite-pilot" \
@@ -1509,6 +1548,7 @@ cmd_uninstall() {
     echo ""
 
     # Data directory
+    # 只有自定义 DATA_DIR 且不在 ~/.loongsuite-pilot 下时，非 --purge 才会真正保留。
     if [ "$PURGE" -eq 1 ]; then
         msg "==> 删除数据目录 (--purge)..." "==> Removing data directory (--purge)..."
         rm -rf "$DATA_DIR"
