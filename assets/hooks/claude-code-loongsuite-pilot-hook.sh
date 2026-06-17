@@ -11,9 +11,12 @@ set -euo pipefail
 #
 # Fail-open 原则: 任何错误都输出 "{}" 并 exit 0,不阻塞宿主 agent。
 
+# 当前脚本文件所在的目录，即~/.loongsuite-pilot/hooks/
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# ~/.loongsuite-pilot/hooks/claude-code-hook-processor.mjs
 PROCESSOR="$SCRIPT_DIR/claude-code-hook-processor.mjs"
 EMPTY_RESULT='{}'
+# 传入的参数
 SUBCOMMAND="${1:-unknown}"
 
 # Only process registered subcommands; early-return for legacy/unregistered ones.

@@ -99,6 +99,9 @@ function requireSessionId(event, stage = 'cmd') {
 
 /**
  * ISO8601 字符串转为 time_unix_nano 字符串。
+ *
+ * 这里直接拼接 6 个 0 是因为 JavaScript Date 只能稳定解析到毫秒，
+ * schema 需要纳秒字符串，毫秒以下精度在 Claude transcript 中不可用。
  */
 function isoToUnixNanos(isoStr) {
   if (!isoStr) return '0';
@@ -124,6 +127,9 @@ function cmdSubagentStart() {
   if (!state.cwd && event.cwd && typeof event.cwd === 'string') {
     state.cwd = event.cwd;
   }
+
+  // 当前只把子 agent 生命周期写入主 session state，真正导出仍由 stop
+  // 时的 transcript 解析驱动，避免依赖 hook 事件顺序来还原对话。
   state.events = state.events || [];
   state.events.push({
     type: 'subagent_start',
@@ -152,6 +158,7 @@ function cmdSubagentStop() {
   const childSid = event.subagent_session_id || 'unknown';
   let childStateSnapshot = null;
   if (childSid && childSid !== 'unknown' && childSid !== sessionId) {
+    // 子 agent 有独立 session state；停止时搬运快照后删除，避免后续重复合并。
     childStateSnapshot = readAndDeleteChildState(childSid);
   }
 
@@ -190,6 +197,7 @@ async function cmdStop() {
   saveState(sessionId, state);
 
   try {
+    // stop 是唯一真正落盘 JSONL 的入口；其他 hook 只补充 state 元信息。
     await exportSession(state, event.stop_reason || 'end_turn');
     if (typeof state._next_transcript_offset === 'number') {
       state.transcript_offset = state._next_transcript_offset;
@@ -221,6 +229,7 @@ async function waitForTranscriptStable(transcriptPath, minSize = 0) {
       break;
     }
     if (size <= minSize) {
+      // Claude Code 可能先触发 stop hook，再把本轮 transcript 追加完成。
       await new Promise((r) => setTimeout(r, 150));
       continue;
     }
@@ -278,6 +287,8 @@ async function exportSession(state, stopReason) {
 
   if (!parseResult || parseResult.turns.length === 0) return;
 
+  // 先暂存下次读取位置，只有 exportSession 成功返回后 cmdStop 才会提交到
+  // transcript_offset；导出失败时保留旧 offset，下一次 stop 可以重试。
   state._next_transcript_offset = parseResult.nextOffset;
 
   const userId = resolveUserId({}, runtimeConfig);
@@ -333,6 +344,8 @@ function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, turnStop
   const entrySpanId = generateSpanId();
   const agentSpanId = generateSpanId();
 
+  // ENTRY/AGENT span 当前由下游 trace flusher 根据 turn 级字段补齐，
+  // 这里预留 ID 是为了保持本文件和旧版构造流程的语义一致。
   const baseFields = {
     trace_id: traceId,
     'gen_ai.session.id': sessionId,
@@ -373,7 +386,9 @@ function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, turnStop
       toolIdToStep.set(toolId, { stepId: currentStepId, stepSpanId: currentStepSpanId });
     }
 
-    // input messages delta/full hash
+    // input messages delta/full hash:
+    // Claude transcript 中有些调用只记录本轮增量，有些记录完整上下文。
+    // 对完整上下文按历史长度裁剪 delta，并在 hash 漂移时补写 full messages。
     const inputMsgs = convertInputMessages(ev.input_messages, ev.protocol || 'anthropic');
     let currentFullHash;
     let delta;
@@ -439,6 +454,8 @@ function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, turnStop
     };
     records.push(respRecord);
 
+    // 下一次 LLM request 的 delta/hash 计算依赖当前完整上下文 hash。
+    // 如果当前记录本身就是 delta，就不能把它当作完整历史缓存。
     runningHash = currentFullHash;
     prevInputMsgs = ev._input_is_delta ? [] : inputMsgs;
   }
@@ -459,6 +476,8 @@ function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, turnStop
       if (!toolBlock) continue;
 
       const toolName = toolBlock.name || 'unknown';
+      // Claude Code 的 Agent 工具代表子 agent 调度；子 agent 生命周期由
+      // subagent-start/subagent-stop 记录，避免在主 turn 内重复生成 tool span。
       if (toolName === 'Agent' || toolName === 'agent') continue;
 
       const toolSpanId = generateSpanId();
