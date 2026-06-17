@@ -1145,6 +1145,8 @@ do_start() {
             --background --make-pidfile --pidfile "$PID_FILE" \
             --exec "$DAEMON_BIN" -- run \
             >>"$LOG_FILE" 2>&1
+        chmod 666 "$LOG_FILE"
+        chmod 666 "$PID_FILE"
     else
         su - "$DAEMON_USER" -c "
             export AGENT_DATA_COLLECTION_CONFIG='$CONFIG_FILE'
@@ -1272,6 +1274,8 @@ do_start() {
             --background --make-pidfile --pidfile "$PID_FILE" \
             --exec "$DAEMON_BIN" -- run-updater \
             >>"$LOG_FILE" 2>&1
+        chmod 666 "$LOG_FILE"
+        chmod 666 "$PID_FILE"
     else
         su - "$DAEMON_USER" -c "
             export AGENT_DATA_COLLECTION_CONFIG='$CONFIG_FILE'
