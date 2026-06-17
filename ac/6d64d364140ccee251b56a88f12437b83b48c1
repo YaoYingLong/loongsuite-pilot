@@ -1,0 +1,19 @@
+assets/hooks/claude-code-hook-processor.mjs
+  s_ba61658bafb23b::t_9b5f88eb03e88f 102-104,130-132,161,200,232,290-291,347-348,389-391,457-458,479-480
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "ac6d64d364140ccee251b56a88f12437b83b48c1",
+  "prompts": {},
+  "sessions": {
+    "s_ba61658bafb23b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ed5c3-1ab7-70e0-b6aa-f0116b198815",
+        "model": "gpt-5.5"
+      },
+      "human_author": "yaoyinglong <yinglong.yao@ly.com>"
+    }
+  }
+}
