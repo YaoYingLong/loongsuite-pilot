@@ -571,6 +571,7 @@ for (const c of changed) {
 # Common: deploy bootstrap scripts from the current version
 # ============================================================
 deploy_bootstrap_scripts() {
+    # 默认为$HOME/.loongsuite-pilot/versions/<version>_<commit>/scripts
     local src_dir="$PERMANENT_DIR/scripts"
     local boot_dir="$HOME/.loongsuite-pilot/bin"
     mkdir -p "$boot_dir"
@@ -583,23 +584,35 @@ deploy_bootstrap_scripts() {
 # Common: deploy package to versions/ directory
 # ============================================================
 deploy_package() {
+    # 安装源目录。调用方通常先把远端包或本地包解压到临时目录，
+    # 这里负责把该目录复制到最终运行位置。
     local src="$1"
+    # ~/.loongsuite-pilot 下维护两类状态：
+    # 1. versions/ 保存每个已安装版本的完整包内容。
+    # 2. current/previous 是轻量指针文件，服务和回滚逻辑通过它们定位版本。
     local cache_dir="$HOME/.loongsuite-pilot"
     local versions_dir="$cache_dir/versions"
     local current_file="$cache_dir/current"
     local previous_file="$cache_dir/previous"
 
+    # VERSION 文件由 release 流程写入，至少需要 version 和 git_commit
+    # 才能组成稳定、唯一的版本目录名。读取失败时保持空值，后面走兼容分支。
     local ver="" commit=""
     if [ -f "$src/VERSION" ]; then
+        # 从$src/VERSION文件中获取以version=开头的配置行等号后面的内容
         ver=$(grep '^version=' "$src/VERSION" | cut -d= -f2)
         commit=$(grep '^git_commit=' "$src/VERSION" | cut -d= -f2)
     fi
 
     if [ -n "$ver" ] && [ -n "$commit" ]; then
+        # 新版布局：同一份构建产物落到 versions/<version>_<commit>。
+        # 这样升级时旧版本目录不会被覆盖，失败后可以通过 previous 指针回滚。
         local dir_name="${ver}_${commit}"
         local target="$versions_dir/$dir_name"
 
         if [ -f "$current_file" ]; then
+            # current 文件只保存目录名，不保存绝对路径，避免 HOME 变化或目录迁移时
+            # 指针内容和实际 versions_dir 产生耦合。
             local old_dir
             old_dir=$(cat "$current_file" 2>/dev/null | tr -d '[:space:]')
             if [ -n "$old_dir" ] && [ "$old_dir" != "$dir_name" ]; then
@@ -608,6 +621,7 @@ deploy_package() {
             fi
         fi
 
+        # 对应$HOME/.loongsuite-pilot/versions/<version>_<commit>。
         msg "==> 部署到 $target ..." "==> Deploying to $target ..."
         mkdir -p "$versions_dir"
         # 同一 version+commit 重新安装时覆盖目标目录，确保本地残留不会混入新包。
@@ -618,25 +632,39 @@ deploy_package() {
         echo "$dir_name" > "$current_file.tmp"
         mv -f "$current_file.tmp" "$current_file"
 
+        # 后续依赖安装、bootstrap 复制、服务脚本安装都依赖 PERMANENT_DIR。
+        # 因此一旦版本化部署成功，立即把运行目录切到新版本目录。
         PERMANENT_DIR="$target"
     else
+        # 兼容分支：开发包、旧包或手工制作的包可能没有完整 VERSION。
+        # 此时沿用历史单目录布局，避免因为缺少版本信息而阻断安装。
+        # 这里PERMANENT_DIR默认为$HOME/.loongsuite-pilot/package
         msg "==> 部署到 $PERMANENT_DIR ..." \
             "==> Deploying to $PERMANENT_DIR ..."
         mkdir -p "$(dirname "$PERMANENT_DIR")"
+        # 传统目录没有 current 指针隔离，重装时必须清空后复制，
+        # 否则删除过的文件可能继续残留在 package 目录里。
         rm -rf "$PERMANENT_DIR"
         cp -r "$src" "$PERMANENT_DIR"
     fi
     msg "    ✅ 部署完成" "    ✅ Deployed"
     echo ""
 
+    # bootstrap 脚本放在固定 bin 目录，而不是版本目录内。
+    # 这样 launchd/systemd/init 脚本无需随每次升级改路径，只需由 bootstrap
+    # 通过 current/previous 再加载实际版本代码。
     deploy_bootstrap_scripts
 
     msg "==> 安装依赖..." "==> Installing dependencies..."
+    # 依赖安装必须发生在最终运行目录内；tail -1 仅保留 npm 输出的最后一行，
+    # 避免安装器日志被 npm 的详细进度刷屏。
     (cd "$PERMANENT_DIR" && "$NPM_BIN" install --production --no-optional 2>&1 | tail -1)
     msg "    ✅ 依赖安装完成" "    ✅ Dependencies installed"
     echo ""
 
     msg "==> 部署 hook 脚本..." "==> Deploying hook scripts..."
+    # postinstall 负责把当前版本携带的 hook/plugin 等运行时资源部署到用户目录。
+    # 这里保留存在性判断，兼容不包含 postinstall 的最小包或调试包。
     if [ -f scripts/postinstall.js ]; then
         "$NODE_BIN" scripts/postinstall.js
     fi
@@ -1179,7 +1207,7 @@ cmd_install() {
     echo ""
     #  root 安装默认走系统级服务，非 root 只有在 sudo 可用时才保留系统级服务请求，否则降级为用户态服务
     validate_install_user
-    # 检查node安装版本
+    # 检查node安装版本，给NODE_BIN环境变量赋值
     check_deps
 
     # Migrate legacy layout if needed
