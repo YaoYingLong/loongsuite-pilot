@@ -1102,6 +1102,8 @@ _write_initd_script() {
     local log_file="$target_home/.loongsuite-pilot/logs/loongsuite-pilot-service.log"
     local config_file="$target_home/.loongsuite-pilot/config.json"
     local script_path="/etc/init.d/$daemon_name"
+    local daemon_group
+    daemon_group=$(id -gn "$target_user" 2>/dev/null || echo "$target_user")
 
     local tmp_script
     tmp_script=$(mktemp)
@@ -1119,6 +1121,7 @@ _write_initd_script() {
 # chkconfig: 2345 90 10
 
 DAEMON_USER="USER_PLACEHOLDER"
+DAEMON_GROUP="GROUP_PLACEHOLDER"
 DAEMON_HOME="HOME_PLACEHOLDER"
 DAEMON_BIN="BIN_PLACEHOLDER"
 DAEMON_NAME="DAEMON_NAME_PLACEHOLDER"
@@ -1145,8 +1148,7 @@ do_start() {
             --background --make-pidfile --pidfile "$PID_FILE" \
             --exec "$DAEMON_BIN" -- run \
             >>"$LOG_FILE" 2>&1
-        chmod 666 "$LOG_FILE"
-        chmod 666 "$PID_FILE"
+        chown "$DAEMON_USER:$DAEMON_GROUP" "$LOG_FILE" "$PID_FILE"
     else
         su - "$DAEMON_USER" -c "
             export AGENT_DATA_COLLECTION_CONFIG='$CONFIG_FILE'
@@ -1208,6 +1210,7 @@ INITEOF
 
     sed -i.bak \
         -e "s|USER_PLACEHOLDER|${target_user}|g" \
+        -e "s|GROUP_PLACEHOLDER|${daemon_group}|g" \
         -e "s|HOME_PLACEHOLDER|${target_home}|g" \
         -e "s|BIN_PLACEHOLDER|${daemon_bin}|g" \
         -e "s|DAEMON_NAME_PLACEHOLDER|${daemon_name}|g" \
@@ -1231,6 +1234,8 @@ _write_initd_updater_script() {
     local log_file="$target_home/.loongsuite-pilot/logs/loongsuite-pilot-updater.log"
     local config_file="$target_home/.loongsuite-pilot/config.json"
     local script_path="/etc/init.d/$daemon_name"
+    local daemon_group
+    daemon_group=$(id -gn "$target_user" 2>/dev/null || echo "$target_user")
 
     local tmp_script
     tmp_script=$(mktemp)
@@ -1248,6 +1253,7 @@ _write_initd_updater_script() {
 # chkconfig: 2345 91 9
 
 DAEMON_USER="USER_PLACEHOLDER"
+DAEMON_GROUP="GROUP_PLACEHOLDER"
 DAEMON_HOME="HOME_PLACEHOLDER"
 DAEMON_BIN="BIN_PLACEHOLDER"
 DAEMON_NAME="DAEMON_NAME_PLACEHOLDER"
@@ -1274,8 +1280,7 @@ do_start() {
             --background --make-pidfile --pidfile "$PID_FILE" \
             --exec "$DAEMON_BIN" -- run-updater \
             >>"$LOG_FILE" 2>&1
-        chmod 666 "$LOG_FILE"
-        chmod 666 "$PID_FILE"
+        chown "$DAEMON_USER:$DAEMON_GROUP" "$LOG_FILE" "$PID_FILE"
     else
         su - "$DAEMON_USER" -c "
             export AGENT_DATA_COLLECTION_CONFIG='$CONFIG_FILE'
@@ -1337,6 +1342,7 @@ INITEOF
 
     sed -i.bak \
         -e "s|USER_PLACEHOLDER|${target_user}|g" \
+        -e "s|GROUP_PLACEHOLDER|${daemon_group}|g" \
         -e "s|HOME_PLACEHOLDER|${target_home}|g" \
         -e "s|BIN_PLACEHOLDER|${daemon_bin}|g" \
         -e "s|DAEMON_NAME_PLACEHOLDER|${daemon_name}|g" \
