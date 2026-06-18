@@ -1,0 +1,19 @@
+deploy/installer-opensource.sh
+  s_69d3fcee2ed722::t_2531e5e3f7febb 587-588,590-592,598-599,602,608-609,614-615,624,635-636,639-641,645-646,653-655,659-660,666-667
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "4b4bb76af69c3cad53d7d0333984e520b898f008",
+  "prompts": {},
+  "sessions": {
+    "s_69d3fcee2ed722": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ed9e7-00f1-7552-9caa-def3a576dee2",
+        "model": "gpt-5.5"
+      },
+      "human_author": "yaoyinglong <yinglong.yao@ly.com>"
+    }
+  }
+}
