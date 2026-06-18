@@ -1,0 +1,19 @@
+scripts/loongsuite-pilot.sh
+  s_8b61efa0288d8b::t_4e2554f25bb603 1105-1106,1124,1151,1213,1237-1238,1256,1283,1345
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.8",
+  "base_commit_sha": "7138c81b77b59c1b21655e45ed0619a3260ed8db",
+  "prompts": {},
+  "sessions": {
+    "s_8b61efa0288d8b": {
+      "agent_id": {
+        "tool": "codex",
+        "id": "019ed61c-fa2b-7d41-be83-b9870519a778",
+        "model": "gpt-5.5"
+      },
+      "human_author": "yaoyinglong <yinglong.yao@ly.com>"
+    }
+  }
+}
