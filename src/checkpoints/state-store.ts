@@ -20,6 +20,7 @@ export class StateStore {
   private dirty = false;
 
   constructor(filePath: string) {
+    // 传入的是dataDir/logs/input-state.json
     this.filePath = filePath;
   }
 

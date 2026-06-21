@@ -104,6 +104,7 @@ export function readInstalledVersion(dataDir: string): string {
     const versionFile = nodePath.join(dataDir, 'versions', name, 'VERSION');
     const content = fs.readFileSync(versionFile, 'utf-8');
     const match = content.match(/^version=(.+)$/m);
+    // 读取dataDir/versions/{name}/VERSION文件中version=的内容并返回
     if (match) return match[1];
   } catch { /* ignore */ }
   try {

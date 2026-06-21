@@ -142,24 +142,31 @@ export class Orchestrator extends EventEmitter {
     this.emit('starting');
 
     // 1. Ensure data directories
+    // 如果dataDir目录不存在则创建一个目录
     await ensureDir(this.dataDir);
+    // 如果dataDir/logs目录不存在则创建一个目录
     await ensureDir(path.join(this.dataDir, 'logs'));
 
     // 2. Load state & agent-control config
+    // 加载dataDir/logs/input-state.json checkpoints文件内容到stateStore中
     this.stateStore = new StateStore(path.join(this.dataDir, 'logs', 'input-state.json'));
     await this.stateStore.load();
 
+    // 传入dataDir/agent-control.json
     this.agentControlManager = new AgentControlManager(
       path.join(this.dataDir, 'agent-control.json'),
     );
+    // 加载dataDir/agent-control.json文件内容
     await this.agentControlManager.load();
 
     // 3. Build flushers. The builder always returns at least one flusher by using
     //    JSONL fallback when all configured outputs are disabled or unavailable.
+    // 构造OtlpTraceFlusher
     this.flusher = await this.buildFlusher();
 
     // 4. Build InputManager & AlarmManager. InputManager is the single routing
     //    point from BaseInput "entries" events to the selected flusher(s).
+    // 读取dataDir/versions/{name}/VERSION文件中version=的内容并返回
     const version = readInstalledVersion(this.dataDir);
     this.alarmManager = new AlarmManager({ ip: resolveLocalIp(), version });
 

@@ -18,6 +18,7 @@ export class AgentControlManager {
   private readonly filePath: string;
 
   constructor(filePath?: string) {
+    // 传入dataDir/agent-control.json
     this.filePath = filePath ?? resolveHome(DEFAULT_AGENT_CONTROL_PATH);
   }
 
