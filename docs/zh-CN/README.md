@@ -11,6 +11,7 @@
 | [产品概览](overview.md) | 了解 Pilot 采集什么、输出到哪里，以及本地会创建哪些文件。 |
 | [安装指南](installation.md) | 安装 Pilot、传入安装参数、卸载或从源码运行。 |
 | [配置总览](configuration.md) | 了解配置加载顺序、全局开关和日志保留策略。 |
+| [源码深度阅读指南](source-code-deep-dive.md) | 沿源码理解安装、启动、模块入口和 Codex Trace 端到端链路。 |
 
 ## 配置输出
 
