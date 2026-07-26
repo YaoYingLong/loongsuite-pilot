@@ -9,6 +9,7 @@ import { handleWorkerCli } from './local-workers/worker-cli.js';
 
 const logger = createLogger('Main');
 
+// 源码入口
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
   if (await handleWorkerCli(argv)) {
