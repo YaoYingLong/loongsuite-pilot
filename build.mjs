@@ -47,8 +47,11 @@ await build({
   outfile: 'dist/cli-probe.cjs',
   platform: 'node',
   target: 'es2022',
+  // 探测器需要基于 __dirname 从 dist 回溯并定位安装包根目录下的 agents.d，
+  // 因此固定输出为 CommonJS 单文件。
   format: 'cjs',
   bundle: true,
+  // stdout 是安装器消费的纯 JSON 协议，构建产物启动时强制关闭依赖模块日志。
   banner: { js: "process.env.LOG_LEVEL = 'silent';" },
   minifySyntax: true,
   define: commonDefine,

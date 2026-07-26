@@ -9,10 +9,13 @@ export type MountType = 'wrapper' | 'rc-inject' | 'env-inject';
 export type HookFormat = 'flat' | 'nested';
 export type PluginSourceType = 'oss' | 'tar';
 
-// ─── Agent Definition (loaded from agents.d/*.json) ───
+// ─── Agent 声明（从 agents.d/*.json 加载） ───
 
+/** Agent 可用性探测条件；paths 与 commands 中的所有候选项均为“或”关系。 */
 export interface AgentDetectionConfig {
+  /** 文件或目录候选路径，允许使用 `*`、`?` 通配符。 */
   paths: string[];
+  /** 需要在当前进程 PATH 中查找的可执行命令名。 */
   commands: string[];
 }
 
@@ -148,7 +151,7 @@ export interface AgentDefinition {
   displayName: string;
   deployMode: DeployMode;
   detection: AgentDetectionConfig;
-  /** Runtime id used by local worker activation, e.g. "claude-code". */
+  /** Local Worker 激活时用于匹配模板的 Runtime 标识，例如 `claude-code`。 */
   localWorkerRuntime?: string;
   hook?: AgentHookConfig;
   pluginProbe?: PluginProbeConfig;

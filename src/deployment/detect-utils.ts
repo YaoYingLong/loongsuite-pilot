@@ -4,6 +4,12 @@ import * as path from 'node:path';
 import type { AgentDetectionConfig } from '../types/index.js';
 import { directoryExists, fileExists, resolveHome } from '../utils/fs-utils.js';
 
+/**
+ * 根据 Agent 声明执行可用性探测。
+ *
+ * paths 与 commands 是“或”关系：按声明顺序先检查路径，再检查 PATH 中的命令，
+ * 任一条件命中便立即返回 true。路径支持按目录层级出现的 `*` 和 `?` 通配符。
+ */
 export async function detectAgent(detection: AgentDetectionConfig): Promise<boolean> {
   if (detection.paths.length === 0 && detection.commands.length === 0) {
     return false;
@@ -29,9 +35,11 @@ export async function detectAgent(detection: AgentDetectionConfig): Promise<bool
   return false;
 }
 
+/** 使用系统自带的命令定位工具判断可执行文件是否存在于当前进程的 PATH 中。 */
 export function commandExists(command: string): Promise<boolean> {
   const bin = process.platform === 'win32' ? 'where.exe' : 'which';
   return new Promise(resolve => {
+    // 定位工具返回非零状态（包括工具自身无法启动）时统一视为命令不存在。
     execFile(bin, [command], err => {
       resolve(!err);
     });
@@ -43,11 +51,12 @@ function hasGlob(p: string): boolean {
 }
 
 /**
- * Returns whether the glob pattern matches at least one existing filesystem entry.
- * Supports `*` and `?` per path segment. Walks segment by segment; segments without
- * glob chars are joined as-is.
+ * 判断 glob 路径是否至少匹配一个现有文件系统条目。
+ * 每一层路径片段支持 `*` 和 `?`，无通配符的片段直接拼接，有通配符的片段才读取目录。
+ * 这种逐层遍历避免扫描与模式无关的子树。
  */
 async function globHasMatch(pattern: string): Promise<boolean> {
+  // 绝对路径从文件系统根开始；相对路径则以第一个片段作为递归起点。
   const segments = pattern.split(path.sep).filter((s, i) => i === 0 || s.length > 0);
   if (segments.length === 0) return false;
   const root = pattern.startsWith(path.sep) ? path.sep : segments[0];
@@ -57,6 +66,7 @@ async function globHasMatch(pattern: string): Promise<boolean> {
 
 async function walk(current: string, segments: string[], idx: number): Promise<boolean> {
   if (idx >= segments.length) {
+    // 所有片段均已消费后仍需 stat，确认最终条目真实存在。
     try {
       await fsp.stat(current);
       return true;
@@ -66,6 +76,7 @@ async function walk(current: string, segments: string[], idx: number): Promise<b
   }
   const seg = segments[idx];
   if (!hasGlob(seg)) {
+    // 普通片段无需读取父目录，直接进入下一层。
     return walk(path.join(current, seg), segments, idx + 1);
   }
   let entries: string[];
@@ -75,6 +86,7 @@ async function walk(current: string, segments: string[], idx: number): Promise<b
     return false;
   }
   const re = globToRegex(seg);
+  // 找到任意一条完整匹配链即可短路返回，不继续遍历剩余目录项。
   for (const entry of entries) {
     if (!re.test(entry)) continue;
     if (await walk(path.join(current, entry), segments, idx + 1)) return true;
@@ -83,6 +95,7 @@ async function walk(current: string, segments: string[], idx: number): Promise<b
 }
 
 function globToRegex(glob: string): RegExp {
+  // 仅赋予 * 和 ? 通配语义，其余正则特殊字符全部按字面量转义。
   let body = '';
   for (const ch of glob) {
     if (ch === '*') body += '.*';

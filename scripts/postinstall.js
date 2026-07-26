@@ -56,17 +56,20 @@ function main() {
   console.log('[loongsuite-pilot] Installing hook scripts...');
 
   // Check if source directory exists
+  // 判断assets/hooks目录是否存在
   if (!fs.existsSync(HOOKS_SOURCE_DIR)) {
     console.log('[loongsuite-pilot] No hook scripts found, skipping.');
     return;
   }
 
   // Create target directory
+  // 判断$HOME/.loongsuite-pilot/hooks目录是否存在，如果不存在就创建
   ensureDir(HOOKS_TARGET_DIR);
 
   // Recursively copy all hook scripts (including subdirectories: shared/, claude-code/, codex/)
   let copySuccess = false;
   try {
+    // 将项目中的assets/hooks目录的内容拷贝到$HOME/.loongsuite-pilot/hooks目录中
     fs.cpSync(HOOKS_SOURCE_DIR, HOOKS_TARGET_DIR, { recursive: true });
     copySuccess = true;
   } catch (error) {
@@ -100,14 +103,18 @@ function main() {
   // Ensure .sh files have execute permission (cpSync preserves mode on most OS, belt-and-suspenders)
   let installedCount = 0;
   function fixPermissions(dir) {
+    // 同步读取指定目录下所有文件、子目录，并且直接携带每个条目详细类型信息（文件 / 文件夹 / 软链接等），不用额外再调用 fs.stat 判断类型，提升代码效率
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const fullPath = path.join(dir, entry.name);
       if (entry.isDirectory()) {
+        // 如果是目录继续递归调用
         fixPermissions(fullPath);
       } else if (entry.name.endsWith('.sh') || entry.name.endsWith('.ps1')) {
+        // 如果是sh文件或是ps1文件，修改文件权限为755
         try { fs.chmodSync(fullPath, 0o755); } catch {}
         installedCount++;
       } else if (entry.name.endsWith('.mjs') || entry.name.endsWith('.py')) {
+        // 如果是mjs或者py文件，不做任何处理
         installedCount++;
       }
     }
@@ -118,6 +125,8 @@ function main() {
 
   if (fs.existsSync(SKILLS_SOURCE_DIR)) {
     try {
+      // 将项目的assets/skills中的内容拷贝到$HOME/.loongsuite-pilot/skills目录中
+      // recursive参数的作用是开启递归拷贝
       fs.cpSync(SKILLS_SOURCE_DIR, SKILLS_TARGET_DIR, { recursive: true });
       console.log(`[loongsuite-pilot] Installed skill docs to ${SKILLS_TARGET_DIR}`);
     } catch (error) {
@@ -127,13 +136,17 @@ function main() {
 
   if (fs.existsSync(PLUGINS_SOURCE_DIR)) {
     try {
+      // 将项目的assets/plugins中的内容拷贝到$HOME/.loongsuite-pilot/plugins目录中
       fs.cpSync(PLUGINS_SOURCE_DIR, PLUGINS_TARGET_DIR, { recursive: true });
       let pluginCount = 0;
       function countPlugins(dir) {
+        // 同步读取指定目录下所有文件、子目录，并且直接携带每个条目详细类型信息（文件 / 文件夹 / 软链接等），不用额外再调用 fs.stat 判断类型，提升代码效率
         for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
           if (entry.isDirectory()) {
+            // 如果是目录递归调用
             countPlugins(path.join(dir, entry.name));
           } else if (entry.name.endsWith('.mjs') || entry.name.endsWith('.js')) {
+            // 如果是mjs或者js文件只是pluginCount加一
             pluginCount++;
           }
         }
@@ -149,6 +162,10 @@ function main() {
   // Old otel-claude-hook versions injected NODE_OPTIONS="--require intercept.js" into shell profiles.
   // After upgrade the real file is removed, but already-open terminals still have NODE_OPTIONS set,
   // causing MODULE_NOT_FOUND errors. This stub prevents that.
+  // 在旧版文件路径放置一个空实现的占位文件 intercept.js
+  // 旧版本的 otel-claude-hook 工具会在系统 Shell 配置文件里注入环境变量：NODE_OPTIONS="--require intercept.js"
+  // 升级组件后，真正的 intercept.js 实体文件会被删除；但已经打开的终端窗口依然保留着旧的 NODE_OPTIONS 环境变量
+  // 会导致程序抛出「模块找不到（MODULE_NOT_FOUND）」的异常，这份占位文件就是用来规避该报错的
   const legacyIntercept = path.join(process.env.HOME || process.env.USERPROFILE || '', '.cache', 'opentelemetry.instrumentation.claude', 'intercept.js');
   if (!fs.existsSync(legacyIntercept)) {
     try {
@@ -171,6 +188,7 @@ try {
 
 // Run config migrations (if any exist in this package variant)
 const migrationScript = path.join(__dirname, 'migrate-internal-config.js');
+// 判断与postinstall.js脚本同级目录下是否存在migrate-internal-config.js脚本，如果存在就执行该脚本并传入.loongsuite-pilot/config.json配置文件
 if (fs.existsSync(migrationScript)) {
   try {
     const { migrate } = await import(pathToFileURL(migrationScript).href);

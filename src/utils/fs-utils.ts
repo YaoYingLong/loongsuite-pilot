@@ -4,7 +4,7 @@ import * as os from 'node:os';
 import * as nodePath from 'node:path';
 
 /**
- * Returns whether `path` exists and is a regular file.
+ * 判断路径是否存在且为普通文件。不存在、无权限或 stat 失败时统一返回 false。
  */
 export async function fileExists(path: string): Promise<boolean> {
   try {
@@ -16,7 +16,7 @@ export async function fileExists(path: string): Promise<boolean> {
 }
 
 /**
- * Returns whether `path` exists and is a directory.
+ * 判断路径是否存在且为目录。不存在、无权限或 stat 失败时统一返回 false。
  */
 export async function directoryExists(path: string): Promise<boolean> {
   try {
@@ -28,7 +28,8 @@ export async function directoryExists(path: string): Promise<boolean> {
 }
 
 /**
- * Reads and parses JSON from a file. Returns `null` on missing file or parse errors.
+ * 读取并解析 JSON 文件；文件不存在、无权读取或内容解析失败时统一返回 null。
+ * 适合读取允许缺失或损坏后降级的配置与状态快照。
  */
 export async function readJsonFile<T>(path: string): Promise<T | null> {
   try {
@@ -40,8 +41,8 @@ export async function readJsonFile<T>(path: string): Promise<T | null> {
 }
 
 /**
- * Writes pretty-printed JSON atomically (write-to-tmp + rename) and ensures
- * parent directories exist. Errors are propagated to the caller.
+ * 以“同目录临时文件 + rename”的方式原子写入格式化 JSON，并确保父目录存在。
+ * 最终失败会继续抛给调用方，避免上层误以为实例期望状态已经持久化成功。
  */
 export async function writeJsonFile(
   path: string,
@@ -56,8 +57,7 @@ export async function writeJsonFile(
     await fsp.rename(tmp, path);
   } catch (err: unknown) {
     const code = (err as NodeJS.ErrnoException).code;
-    // Directory may vanish between ensureDir and write/rename (e.g. concurrent cleanup).
-    // Retry once after re-creating the directory.
+    // 父目录可能在 ensureDir 与 write/rename 之间被并发清理；重新创建后重试一次。
     if (code === 'ENOENT') {
       await fsp.unlink(tmp).catch(() => {});
       await ensureDir(dir);
@@ -70,9 +70,8 @@ export async function writeJsonFile(
         throw retryErr;
       }
     } else if (code === 'EPERM' || code === 'EBUSY' || code === 'EACCES') {
-      // On Windows, rename can fail when the target is briefly locked by
-      // antivirus/indexer or concurrent I/O. Retry once after a short delay.
-      // If the error came from writeFile (tmp doesn't exist), skip the retry.
+      // Windows 上目标文件可能被杀毒软件、索引器或并发 I/O 短暂锁定。
+      // 临时文件已经成功写入时，短暂等待后重试 rename；否则直接保留原始错误。
       const tmpExists = await fsp.stat(tmp).then(() => true, () => false);
       if (!tmpExists) throw err;
       await new Promise(r => setTimeout(r, 50));
@@ -130,7 +129,7 @@ export async function appendLine(path: string, line: string): Promise<void> {
 }
 
 /**
- * Recursively creates a directory if it does not exist.
+ * 递归创建目录。空路径、当前目录和文件系统根目录无需创建；失败按尽力而为处理。
  */
 export async function ensureDir(path: string): Promise<void> {
   if (!path || path === '.' || path === nodePath.parse(path).root) {
@@ -142,7 +141,8 @@ export async function ensureDir(path: string): Promise<void> {
 }
 
 /**
- * Expands a leading `~` to the user home directory.
+ * 将独立的 `~` 或路径开头的 `~/` 展开为当前用户主目录；Windows 同时支持 `~\`。
+ * 出现在路径其他位置的 `~` 保持原样。
  */
 export function resolveHome(filepath: string): string {
   if (filepath === '~') {

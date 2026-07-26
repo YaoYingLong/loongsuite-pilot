@@ -157,14 +157,15 @@ export class Orchestrator extends EventEmitter {
     );
     await this.agentControlManager.load();
 
-    // 3. Build flushers
+    // 3. 构建输出通道。全局 Span 属性只交给 OTLP Trace，日志类输出不会注入这些字段。
     this.globalAttributesProvider = new GlobalAttributesProvider(
       this.config.globalSpanAttributes ?? {},
       path.join(this.dataDir, 'span-attributes.json'),
     );
     this.flusher = await this.buildFlusher();
 
-    // 4. Build InputManager & AlarmManager
+    // 4. 构建 InputManager 与告警模块。ConfigLoader 已把多来源配置整理完毕，
+    // InputManager 在所有 Agent 数据分发前统一执行 userId 注入、内容策略和敏感信息脱敏。
     const version = readInstalledVersion(this.dataDir);
     this.alarmManager = new AlarmManager({ ip: resolveLocalIp(), version, userId: this.config.userId });
 
@@ -175,8 +176,8 @@ export class Orchestrator extends EventEmitter {
     this.inputManager.setAlarmManager(this.alarmManager);
     this.inputManager.setMaskConfig(this.config.mask ?? { mode: 'none', types: [] });
 
-    // Upstream trace linking (opt-in): stamp trace_id/parent_span_id from the
-    // acp-correlate store so agent spans reparent under the upstream span.
+    // 可选的上游 Trace 关联：从 acp-correlate 读取 trace_id/parent_span_id，
+    // 让本项目采集的 Agent Span 能挂到调用方的上游 Span 下。
     if (this.config.upstreamLink?.enabled) {
       const correlateDir = path.join(this.dataDir, 'acp-correlate');
       await ensureDir(correlateDir);
@@ -185,9 +186,8 @@ export class Orchestrator extends EventEmitter {
       this.inputManager.setTraceLinker(traceLinker);
       this.acpCorrelateRetentionService = new AcpCorrelateRetentionService(this.dataDir, this.config.upstreamLink, traceLinker);
       this.acpCorrelateRetentionService.start();
-      // Adapters/env hooks must write records under this exact path; a custom
-      // config.json dataDir that diverges from where they write silently yields
-      // no linking, so surface the resolved dir for diagnosis.
+      // Adapter/环境 Hook 必须写入同一个目录。若自定义 dataDir 与写入端不一致，关联会
+      // 无报错地失效，因此日志中明确输出最终目录方便诊断。
       logger.info('upstream trace linking enabled', { correlateDir, ttlMs: this.config.upstreamLink.ttlMs });
     }
 
@@ -475,6 +475,8 @@ export class Orchestrator extends EventEmitter {
     const flushers: BaseFlusher[] = [];
     const cfg = this.config.flushers;
 
+    // collectLog 当前是 SLS 日志采集总开关；JSONL 和 HTTP 仍分别服从自身 enabled。
+    // 这样可以关闭远端日志上报，同时保留本地审计文件或自定义 HTTP 出口。
     if (cfg.sls?.enabled && this.config.collectLog !== false) {
       const r = new SlsFlusher(cfg.sls, this.dataDir);
       await r.start().catch(err => logger.warn('sls flusher start failed', { error: String(err) }));
@@ -494,6 +496,7 @@ export class Orchestrator extends EventEmitter {
     }
 
     try {
+      // Trace 与日志通道相互独立：collectTrace=false 只会让此构建函数返回 undefined。
       const otlpTraceCfg = buildOtlpTraceConfig(this.config);
       if (otlpTraceCfg?.enabled && otlpTraceCfg.endpoints.length > 0) {
         const { OtlpTraceFlusher } = await import('../flushers/otlp-trace-flusher.js');
@@ -504,11 +507,13 @@ export class Orchestrator extends EventEmitter {
         flushers.push(r);
       }
     } catch (err) {
-      // Never let a malformed trace config take down the other flushers.
+      // Trace 配置格式错误不能拖垮已经可用的 SLS/JSONL/HTTP 输出。
       logger.warn('OtlpTraceFlusher unavailable, skipping', { error: String(err) });
     }
 
     if (flushers.length === 0) {
+      // Collector 必须至少保留一个数据出口。用户关闭或漏配所有通道时，回退到默认 JSONL，
+      // 避免采集流程看似正常运行却把数据静默丢弃。
       logger.warn('no flushers enabled, using JSONL fallback');
       const fallback = new JsonlFlusher({
         enabled: true,
@@ -622,10 +627,11 @@ export class Orchestrator extends EventEmitter {
   }
 
   /**
-   * Register all built-in inputs. Returns detection entries for the
-   * AgentDiscoveryService.
+   * 注册所有内置 Input，并返回 AgentDiscoveryService 使用的发现条目。
    *
-   * To add a new agent: create a input class, add registration here.
+   * ConfigLoader 中的 listeners 控制具体采集实现；agents 控制产品级总门禁；
+   * agent-control.json 再提供 on/off/auto 运行时准入。三层共同决定 Input 是否启动。
+   * 接入新 Agent 时需要创建 Input 类并在这里注册。
    */
   private async registerAllInputs(): Promise<AgentDetectionEntry[]> {
     const entries: AgentDetectionEntry[] = [];
@@ -1150,9 +1156,11 @@ export class Orchestrator extends EventEmitter {
   }
 
   /**
-   * Check whether an agent is allowed to run based on config.agents gate.
-   * - No config.agents or empty: always true (backward compat)
-   * - Otherwise: only if config.agents[agentId].enabled !== false
+   * 检查 config.agents 产品级门禁。
+   * - 没有 agents 配置或对象为空：全部放行，兼容旧配置；
+   * - 存在配置：只有对应 Agent 明确写 enabled=false 时禁止。
+   *
+   * 这里不替代 listener 开关和 agent-control.json，它只是最外层产品级判断。
    */
   private isAgentGatedEnabled(agentId: string): boolean {
     const agents = this.config.agents;

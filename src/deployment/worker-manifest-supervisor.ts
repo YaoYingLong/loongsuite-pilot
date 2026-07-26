@@ -7,6 +7,7 @@ import { ensureDir, fileExists } from '../utils/fs-utils.js';
 
 const logger = createLogger('WorkerManifestSupervisor');
 
+/** Runtime 包内 worker.manifest.json 的进程启动契约。 */
 export interface WorkerManifest {
   name: string;
   runtime?: string;
@@ -37,11 +38,20 @@ interface WorkerRuntime {
 }
 
 export interface WorkerManifestOptions {
+  /** ActivationService 提供的可信实例字段，例如 token、stateDir 和 workDir。 */
   instance?: Record<string, string>;
+  /** `worker connect -- ...` 保存的用户可配置 Runtime 参数。 */
   runtimeOptions?: Record<string, string | boolean>;
 }
 
+/**
+ * worker.manifest.json 驱动的轻量进程监管器。
+ *
+ * 负责定位并校验 manifest、展开实例占位符、启动独立进程组、持久化 PID/状态、汇总日志，
+ * 以及按 manifest 的失败重启策略拉起进程。Local Worker 与普通 plugin-probe 共用该实现。
+ */
 export class WorkerManifestSupervisor {
+  /** 仅保存当前进程启动的 Worker 运行态；跨 Collector 重启的信息通过 PID 文件恢复。 */
   private readonly runtimes = new Map<string, WorkerRuntime>();
 
   async startIfPresent(
@@ -53,6 +63,7 @@ export class WorkerManifestSupervisor {
     const location = await this.findManifest(installDir);
     if (!location) return true;
 
+    // 启动前总是尝试停止旧进程，防止包更新或参数变化后出现两个 Worker 并行运行。
     await this.stopIfPresent(agentId, installDir, options);
 
     const manifest = await this.readManifest(location.manifestPath);
@@ -92,6 +103,7 @@ export class WorkerManifestSupervisor {
   }
 
   private async findManifest(installDir: string): Promise<ManifestLocation | undefined> {
+    // 同时兼容包内容直接落在 destDir，以及 tar 解压后额外包含一层顶级目录的结构。
     const direct = path.join(installDir, 'worker.manifest.json');
     if (await fileExists(direct)) {
       return { manifestPath: direct, bundleRoot: installDir };
@@ -120,6 +132,7 @@ export class WorkerManifestSupervisor {
     try {
       const raw = await fs.readFile(manifestPath, 'utf-8');
       const parsed = JSON.parse(raw) as WorkerManifest;
+      // name 和非空 command 是启动所需的最小契约，其余字段均有默认值或可选语义。
       if (!parsed.name || !Array.isArray(parsed.command) || parsed.command.length === 0) {
         logger.warn('invalid worker manifest', { manifestPath });
         return undefined;
@@ -139,11 +152,13 @@ export class WorkerManifestSupervisor {
     options: WorkerManifestOptions = {},
     runtime?: WorkerRuntime,
   ): Promise<boolean> {
+    // PID、状态和日志路径也支持实例占位符，Local Worker 因而可以统一写回自己的目录。
     const paths = this.resolvePaths(bundleRoot, manifest, options);
     await ensureDir(path.dirname(paths.pid));
     await ensureDir(path.dirname(paths.status));
     await ensureDir(path.dirname(paths.log));
 
+    // 在 spawn 前一次性展开命令、工作目录和环境变量，避免子进程依赖 Collector 内部状态。
     const command = manifest.command.map(part => this.expand(part, bundleRoot, env, options));
     const executable = this.resolveCommand(bundleRoot, command[0]);
     const args = command.slice(1);
@@ -163,6 +178,7 @@ export class WorkerManifestSupervisor {
     });
 
     try {
+      // detached=true 创建独立进程组，停止时可以连同 Worker 派生的子进程一起发送信号。
       const child = spawn(executable, args, {
         cwd,
         env: workerEnv,
@@ -171,6 +187,7 @@ export class WorkerManifestSupervisor {
       });
       let settled = false;
       let startPersisted = false;
+      // 子进程可能在 PID/状态落盘前退出，先暂存退出信息，待 running 状态写完后统一处理。
       let earlyExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
       const failStart = async (err: unknown): Promise<void> => {
         if (settled) return;
@@ -188,6 +205,7 @@ export class WorkerManifestSupervisor {
         logger.error('worker start failed', { agentId, error: String(err) });
       };
 
+      // stdout/stderr 汇入同一追加日志；任一流结束都不能提前关闭共享文件流。
       child.stdout?.pipe(log, { end: false });
       child.stderr?.pipe(log, { end: false });
       child.once('error', err => {
@@ -215,6 +233,7 @@ export class WorkerManifestSupervisor {
       child.unref();
       if (settled) return false;
 
+      // 重启沿用同一个 Runtime 计数器；首次启动则创建新的监管状态。
       const activeRuntime = runtime ?? { restarts: 0, stopping: false };
       this.runtimes.set(paths.pid, activeRuntime);
       await fs.writeFile(paths.pid, `${child.pid}\n`, 'utf-8');
@@ -292,9 +311,10 @@ export class WorkerManifestSupervisor {
 
     await this.waitForExit(pid, 5000);
     try {
+      // SIGTERM 后最多等待 5 秒，再防御性补发 SIGKILL；若进程组已退出则会被安全忽略。
       this.signalProcessGroup(pid, 'SIGKILL');
     } catch {
-      // Process group may have exited between checks.
+      // 两次检查之间进程组可能已经自行退出，此时无需视为停止失败。
     }
 
     await fs.rm(paths.pid, { force: true });
@@ -330,6 +350,7 @@ export class WorkerManifestSupervisor {
       && policy.type === 'on-failure'
       && runtime.restarts < (policy.maxRestarts ?? 0);
 
+    // 只有异常退出、策略为 on-failure、未主动停止且未超过次数上限时才自动重启。
     await this.writeStatus(paths.status, {
       state: shouldRestart ? 'restarting' : 'exited',
       name: manifest.name,
@@ -358,6 +379,8 @@ export class WorkerManifestSupervisor {
     manifest: WorkerManifest,
     options: WorkerManifestOptions = {},
   ): { pid: string; status: string; log: string } {
+    // 普通 Plugin Worker 默认写入包内 .agent-worker；Local Worker 的 manifest 通常使用
+    // `${instance:stateDir}` / `${instance:logDir}` 将文件重定向到实例隔离目录。
     const defaults = {
       pid: '.agent-worker/worker.pid',
       status: '.agent-worker/status.json',
@@ -389,15 +412,18 @@ export class WorkerManifestSupervisor {
     env: Record<string, string>,
     options: WorkerManifestOptions = {},
   ): string {
+    // destDir 指向实际包根目录；instance 占位符同时承载固定实例字段和 Runtime 参数。
     return value
       .replace(/\$\{destDir\}/g, bundleRoot)
       .replace(/\$\{instance:([^}]+)\}/g, (_match, name: string) => this.expandInstanceValue(name, options));
   }
 
   private expandInstanceValue(name: string, options: WorkerManifestOptions): string {
+    // 固定实例字段优先，防止用户通过同名 Runtime 参数覆盖 token 路径、状态目录等关键值。
     const fixedValue = options.instance?.[name];
     if (fixedValue !== undefined) return fixedValue;
 
+    // manifest 可使用 camelCase 名称，CLI 参数通常为 kebab-case；先精确匹配，再自动转换。
     const direct = options.runtimeOptions?.[name];
     if (direct !== undefined) return String(direct);
 
@@ -407,6 +433,7 @@ export class WorkerManifestSupervisor {
   }
 
   private resolveCommand(bundleRoot: string, command: string): string {
+    // 带路径语义的相对命令以包根目录为基准；裸命令名则交给操作系统 PATH 查找。
     if (path.isAbsolute(command)) return command;
     if (command.includes(path.sep) || command.startsWith('.')) {
       return path.join(bundleRoot, command);
@@ -444,7 +471,7 @@ export class WorkerManifestSupervisor {
 
   private signalProcessGroup(pgid: number, signal: NodeJS.Signals): boolean {
     try {
-      // start() uses detached=true, so the child becomes the process-group leader on Linux/macOS.
+      // start() 使用 detached=true，子进程在 Linux/macOS 上会成为进程组组长。
       process.kill(-pgid, signal);
       return true;
     } catch (err) {
@@ -462,6 +489,7 @@ export class WorkerManifestSupervisor {
   }
 }
 
+/** 将 manifest 中的 camelCase 占位符名称转换为 CLI 常用的 kebab-case 选项名。 */
 function camelToKebab(value: string): string {
   return value.replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase();
 }

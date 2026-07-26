@@ -20,7 +20,9 @@ const SCRIPT_TIMEOUT_MS = 120_000;
 const REMOTE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 4 hours
 
 export interface PluginProbeDeployOptions {
+  /** Local Worker 实例固定字段，供 worker.manifest.json 展开。 */
   instance?: Record<string, string>;
+  /** Worker CLI 保存的 Runtime 参数，供 worker.manifest.json 展开。 */
   runtimeOptions?: Record<string, string | boolean>;
 }
 
@@ -50,6 +52,7 @@ export class PluginProbeStrategy implements DeployStrategy {
       return true;
     }
 
+    // 带 localWorkerRuntime 的定义只是可复用模板，没有具体实例时不要求全局 Worker 常驻。
     const shouldStartWorker = !def.localWorkerRuntime;
     const hasWorkerManifest = await this.workerSupervisor.hasManifest(config.source.destDir);
     if (shouldStartWorker && hasWorkerManifest && !await this.workerSupervisor.isWorkerRunning(config.source.destDir)) {
@@ -110,6 +113,7 @@ export class PluginProbeStrategy implements DeployStrategy {
         logger.debug('no install script found, skipping', { agentId: def.id });
       }
 
+      // 普通 plugin-probe 直接启动 Worker；Local Worker 模板只有在传入具体实例上下文后启动。
       const shouldStartWorker = !def.localWorkerRuntime || !!options.instance;
       if (!shouldStartWorker) {
         logger.info('local worker runtime template installed; worker start skipped', {

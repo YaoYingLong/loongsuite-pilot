@@ -35,10 +35,13 @@ validate_current_user() {
 }
 
 has_sudo_interactive() {
+    # 等于0表示root用户直接退出返回true
     [ "$(id -u)" -eq 0 ] && return 0
     if sudo -n true 2>/dev/null; then
+        # 非交互模式检测：校验当前用户是否拥有免密 sudo 权限，返回true
         return 0
     elif sudo -v 2>/dev/null; then
+        # 刷新/延长当前已有的 sudo 密码凭证缓存，不执行任何程序，返回true
         return 0
     else
         return 1
@@ -79,19 +82,30 @@ resolve_user_home() {
     fi
 }
 
+# 如果$HOME/.loongsuite-pilot/logs目录不存在就创建目录, 如果$HOME/.loongsuite-pilot/bin目录不存在就创建目录
 ensure_dirs() {
+    # 如果$HOME/.loongsuite-pilot/logs目录不存在就创建目录
     mkdir -p "$LOG_DIR"
+    # 如果$HOME/.loongsuite-pilot/bin目录不存在就创建目录
     mkdir -p "$BOOTSTRAP_DIR"
 }
 
+# 将$HOME/.loongsuite-pilot/versions/1.0.0_d066770/scripts/collector-daemon.js脚本拷贝到$HOME/.loongsuite-pilot/bin目录
+# 将$HOME/.loongsuite-pilot/versions/1.0.0_d066770/scripts/updater-daemon.js脚本拷贝到$HOME/.loongsuite-pilot/bin目录
 sync_bootstrap_scripts() {
     local version_dir
+    # 判断$HOME/.loongsuite-pilot/versions/1.0.0_d066770目录是否存在，存在就是赋值给version_dir
     version_dir=$(resolve_current_version 2>/dev/null) || true
+    # 如果变量 version_dir 是空字符串 / 未定义，直接退出当前函数，不再执行函数后面所有代码
     if [ -z "$version_dir" ]; then return; fi
     local src_dir="$version_dir/scripts"
+    # 如果$HOME/.loongsuite-pilot/versions/1.0.0_d066770/scripts/collector-daemon.js脚本文件不存在直接退出当前函数，不再执行函数后面所有代码
     if [ ! -f "$src_dir/collector-daemon.js" ]; then return; fi
+    # 如果$HOME/.loongsuite-pilot/bin目录不存在就创建
     mkdir -p "$BOOTSTRAP_DIR"
+    # 将$HOME/.loongsuite-pilot/versions/1.0.0_d066770/scripts/collector-daemon.js脚本拷贝到$HOME/.loongsuite-pilot/bin目录
     cp -f "$src_dir/collector-daemon.js" "$BOOTSTRAP_DIR/"
+    # 将$HOME/.loongsuite-pilot/versions/1.0.0_d066770/scripts/updater-daemon.js脚本拷贝到$HOME/.loongsuite-pilot/bin目录
     cp -f "$src_dir/updater-daemon.js"   "$BOOTSTRAP_DIR/" 2>/dev/null || true
 }
 
@@ -115,12 +129,17 @@ sync_installed_scripts_from_version() {
 }
 
 is_running() {
+    # 如果$HOME/.loongsuite-pilot/loongsuite-pilot.pid文件存在
     if [ -f "$PID_FILE" ]; then
         local pid
+        # 读取$HOME/.loongsuite-pilot/loongsuite-pilot.pid文件内容
         pid=$(cat "$PID_FILE")
+        # 查看pid是否正在运行、进程存活，如果存在且在运行中直接退出
         if kill -0 "$pid" 2>/dev/null; then
+            # 命令退出码 = 0（true），退出码 ≠ 0（false）
             return 0
         fi
+        # 如果存在直接删除$HOME/.loongsuite-pilot/loongsuite-pilot.pid文件
         rm -f "$PID_FILE"
     fi
     return 1
@@ -177,6 +196,7 @@ updater_process_exists() {
 
 _node_is_suitable() {
     local bin="$1"
+    # 判断是否存在且可执行
     [ -x "$bin" ] || return 1
     _node_is_app_bundle "$bin" && return 1
     local ver
@@ -206,15 +226,19 @@ NODE_PIN_FILE="$CACHE_DIR/node-bin"
 
 resolve_node() {
     # 1. Pinned file
+    # 判断$HOME/.loongsuite-pilot/node-bin文件是否存在，在安装时将node路径写入到该文件中了
     if [ -f "$NODE_PIN_FILE" ]; then
         local pinned
+        # 读取$HOME/.loongsuite-pilot/node-bin文件文件中写入的node环境地址
         pinned=$(cat "$NODE_PIN_FILE" 2>/dev/null | tr -d '[:space:]')
         if [ -n "$pinned" ] && _node_is_suitable "$pinned"; then
+            # 输出node环境的绝对路径
             echo "$pinned"
             return 0
         fi
     fi
 
+    # 下面是又走了一遍installer-opensource.sh的check_deps的逻辑
     # 2. Fallback search: prefer user-managed Node over app-bundled PATH shims.
     local _candidates=()
 
@@ -263,12 +287,16 @@ _detect_system_level_init() {
     fi
 }
 
+# 确定当前环境应使用哪一种服务管理机制来注册、启动和管理 loongsuite-pilot 的 collector/updater
 detect_init_system() {
+    # 读取函数传入的第一个参数并赋值给interactive，如果没有传入第一个参数，或是第一个参数为空值，变量就自动取值为字符串true
     local interactive="${1:-true}"
-
+    # 判断$HOME/.loongsuite-pilot/init-type文件是否存在
     if [ -f "$INIT_TYPE_FILE" ]; then
         local saved
+        # 读取$HOME/.loongsuite-pilot/init-type文件内容并去除空白
         saved=$(cat "$INIT_TYPE_FILE" 2>/dev/null | tr -d '[:space:]')
+        # 如果是launchd|systemd-user|systemd-system|initd其中任何值就输出，并退出函数
         case "$saved" in
             launchd|systemd-user|systemd-system|initd)
                 echo "$saved"
@@ -276,17 +304,30 @@ detect_init_system() {
                 ;;
         esac
     fi
+    # 判断当前系统类型
     case "$(uname -s)" in
+        # 如果是macos直接输出launchd
         Darwin) echo "launchd" ;;
         Linux)
             if [ "$(id -u)" -eq 0 ]; then
+                # 如果是linux且是root用户,
+                #   如果存在/run/systemd/system且systemctl命令存在就返回systemd-system
+                #   如果/etc/init.d文件存在就返回initd，如果两个都不存在，就返回none
                 _detect_system_level_init
             else
+                # systemctl --user show-environment读取当前登录用户专属的 systemd 运行环境变量，无用户systemd进程时，该命令会报错退出
                 if command -v systemctl &>/dev/null && systemctl --user show-environment &>/dev/null 2>&1; then
+                    # 检测当前会话是否支持 systemctl --user 用户级 systemd 服务
                     echo "systemd-user"
                 elif [ "$interactive" = "true" ] && has_sudo_interactive; then
+                    # 如果是root用户，或者具有root权限
+                    #   如果存在/run/systemd/system且systemctl命令存在就返回systemd-system
+                    #   如果/etc/init.d文件存在就返回initd，如果两个都不存在，就返回none
                     _detect_system_level_init
                 elif [ "$interactive" = "false" ] && has_sudo_noninteractive; then
+                    # 如果是root用户，或者具有root权限
+                    #   如果存在/run/systemd/system且systemctl命令存在就返回systemd-system
+                    #   如果/etc/init.d文件存在就返回initd，如果两个都不存在，就返回none
                     _detect_system_level_init
                 else
                     echo "none"
@@ -300,6 +341,7 @@ detect_init_system() {
 enable_linger() {
     local user
     user="$(whoami)"
+    # 开启该用户的 ** lingering（滞留常驻）特性
     if loginctl enable-linger "$user" 2>/dev/null; then
         echo "✓ Linger enabled — service will persist after logout."
         return 0
@@ -335,14 +377,18 @@ is_managed_by_initd() {
 
 
 resolve_current_version() {
+    # 判断$HOME/.loongsuite-pilot/current文件是否存在
     if [ -f "$CURRENT_FILE" ]; then
         local dir
+        # 读取$HOME/.loongsuite-pilot/current文件内容
         dir=$(cat "$CURRENT_FILE" 2>/dev/null | tr -d '[:space:]')
+        # 判断$HOME/.loongsuite-pilot/versions/1.0.0_d066770目录是否存在, 存在就是输入日志
         if [ -n "$dir" ] && [ -d "$VERSIONS_DIR/$dir" ]; then
             echo "$VERSIONS_DIR/$dir"
             return 0
         fi
     fi
+    # 兼容老版本$HOME/.loongsuite-pilot/package的逻辑
     if [ -d "$PACKAGE_DIR" ] && [ -f "$PACKAGE_DIR/dist/index.js" ]; then
         echo "$PACKAGE_DIR"
         return 0
@@ -378,22 +424,30 @@ resolve_script() {
 # ---- Internal: run in foreground (used by launchd / systemd) ----
 
 cmd_run() {
+    # 如果$HOME/.loongsuite-pilot/logs目录不存在就创建目录, 如果$HOME/.loongsuite-pilot/bin目录不存在就创建目录
     ensure_dirs
+    # 将$HOME/.loongsuite-pilot/versions/1.0.0_d066770/scripts/collector-daemon.js脚本拷贝到$HOME/.loongsuite-pilot/bin目录
+    # 将$HOME/.loongsuite-pilot/versions/1.0.0_d066770/scripts/updater-daemon.js脚本拷贝到$HOME/.loongsuite-pilot/bin目录
     sync_bootstrap_scripts
 
+    # 判断$HOME/.loongsuite-pilot/bin/collector-daemon.js文件是否存在，不存在直接退出
     if [ ! -f "$BOOTSTRAP_DIR/collector-daemon.js" ]; then
         echo "❌ Bootstrap script missing" >&2
         exit 1
     fi
 
+    # 获取node环境
     local node_bin
     node_bin=$(resolve_node) || {
         echo "❌ node runtime not found" >&2
         exit 1
     }
 
+    # 将当前执行 loongsuite-pilot.sh 的 Shell 进程 PID覆盖写入$HOME/.loongsuite-pilot/loongsuite-pilot.pid文件
     echo "$$" > "$PID_FILE"
+    # 导出环境变量$HOME/.loongsuite-pilot/config.json
     export AGENT_DATA_COLLECTION_CONFIG="$CONFIG_FILE"
+    # 执行$HOME/.loongsuite-pilot/bin/collector-daemon.js脚本，即scripts/collector-daemon.js
     exec "$node_bin" "$BOOTSTRAP_DIR/collector-daemon.js"
 }
 
@@ -419,6 +473,7 @@ cmd_run_updater() {
 # ---- User-facing commands ----
 
 cmd_start() {
+    # 遍历传入的参数列表
     for arg in "$@"; do
         case "$arg" in
             --system-service)
@@ -427,19 +482,27 @@ cmd_start() {
         esac
     done
 
+    # 如果$HOME/.loongsuite-pilot/loongsuite-pilot.pid中的进程id在运行中，直接输出日志，返回true
     if is_running; then
         echo "✅ loongsuite-pilot is already running (PID $(cat "$PID_FILE"))"
+        # 命令退出码 = 0（true），退出码 ≠ 0（false）
         return 0
     fi
 
+    # 如果$HOME/.loongsuite-pilot/logs目录不存在就创建目录
+    # 如果$HOME/.loongsuite-pilot/bin目录不存在就创建目录
     ensure_dirs
+    # 将$HOME/.loongsuite-pilot/versions/1.0.0_d066770/scripts/collector-daemon.js脚本拷贝到$HOME/.loongsuite-pilot/bin目录
+    # 将$HOME/.loongsuite-pilot/versions/1.0.0_d066770/scripts/updater-daemon.js脚本拷贝到$HOME/.loongsuite-pilot/bin目录
     sync_bootstrap_scripts
-
+    # 执行autostart_install函数
+    # 这里的核心作用就是将loongsuite-pilot.sh run注册成系统服务，用户登录开机自启，程序崩溃会被自动重启，并启动执行loongsuite-pilot.sh run
     if autostart_install "true"; then
         sleep 2
         if is_running; then
             local init_type
             init_type=$(cat "$INIT_TYPE_FILE" 2>/dev/null | tr -d '[:space:]')
+            # 输出日志，并显示是哪一种服务管理机制来注册、启动和管理loongsuite-pilot的
             echo "✅ loongsuite-pilot started ($init_type)"
             return 0
         fi
@@ -1058,8 +1121,10 @@ cmd_rollback() {
 # ---- Autostart management (internal) ----
 
 _write_launchd_plist() {
+    # 如果$HOME/Library/LaunchAgents/com.loongsuite-pilot.plist目录不存在，则创建目录
     mkdir -p "$(dirname "$LAUNCHD_PLIST")"
     ensure_dirs
+    # 覆盖写$HOME/Library/LaunchAgents/com.loongsuite-pilot.plist文件
     cat > "$LAUNCHD_PLIST" << PLISTEOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1097,6 +1162,7 @@ PLISTEOF
 
 SYSTEMD_USER_UNIT_DIR="$HOME/.config/systemd/user"
 
+# 覆盖写入$HOME/.config/systemd/user/loongsuite-pilot.service文件内容
 _write_systemd_user_unit() {
     mkdir -p "$SYSTEMD_USER_UNIT_DIR"
     cat > "$SYSTEMD_USER_UNIT_DIR/loongsuite-pilot.service" << UNITEOF
@@ -1613,37 +1679,59 @@ autostart_install_updater_only() {
     esac
 }
 
+# 这里的核心作用就是将loongsuite-pilot.sh run注册成系统服务，用户登录开机自启，程序崩溃会被自动重启，并启动执行loongsuite-pilot.sh run
 autostart_install() {
+    # 读取函数传入的第一个参数并赋值给interactive，如果没有传入第一个参数，或是第一个参数为空值，变量就自动取值为字符串true
     local interactive="${1:-true}"
 
     local init_system
+    # 确定当前环境应使用哪一种服务管理机制来注册、启动和管理 loongsuite-pilot 的 collector/updater
     init_system=$(detect_init_system "$interactive")
     local target_user
+    # 获取当前正在执行脚本的系统用户名
     target_user=$(whoami)
 
     case "$init_system" in
         launchd)
+            # LAUNCHD_PLIST默认为"$HOME/Library/LaunchAgents/com.loongsuite-pilot.plist"
+            # 卸载指定 plist 守护进程配置文件，让对应后台程序停止运行、从当前会话移除
             launchctl unload -w "$LAUNCHD_PLIST" 2>/dev/null || true
+            # 覆盖写$HOME/Library/LaunchAgents/com.loongsuite-pilot.plist文件内容
             _write_launchd_plist
+            # 仅 macOS，用来加载 launchd 守护配置文件（plist），管理后台常驻程序开机自启
             launchctl load -w "$LAUNCHD_PLIST"
+            # 判断$HOME/.loongsuite-pilot/updater-daemon.js文件是否存在
             if [ -f "$BOOTSTRAP_DIR/updater-daemon.js" ]; then
+                # 存在就卸载指定 plist 守护进程配置文件，让对应后台程序停止运行、从当前会话移除
+                # $HOME/Library/LaunchAgents/com.loongsuite-pilot.updater.plist
                 launchctl unload -w "$UPDATER_PLIST" 2>/dev/null || true
+                # 覆盖写$HOME/Library/LaunchAgents/com.loongsuite-pilot.updater.plist文件内容
                 _write_launchd_updater_plist
+                # 仅 macOS，用来加载 launchd 守护配置文件（plist），管理后台常驻程序开机自启
                 launchctl load -w "$UPDATER_PLIST"
             fi
+            # 覆盖写$HOME/.loongsuite-pilot/init-type文件内容
             echo "launchd" > "$INIT_TYPE_FILE"
             ;;
         systemd-user)
+            # 覆盖写入$HOME/.config/systemd/user/loongsuite-pilot.service文件内容
+            # 启动时执行loongsuite-pilot run命令
             _write_systemd_user_unit
             if [ -f "$BOOTSTRAP_DIR/updater-daemon.js" ]; then
+                # 覆盖写入$HOME/.config/systemd/user/loongsuite-pilot-updater.service文件内容
+                # 启动时执行loongsuite-pilot run-updater命令
                 _write_systemd_user_updater_unit
             fi
+            # 重新加载用户级systemd，让systemd守护进程重读全部service、socket配置文件，更新内部数据库
             systemctl --user daemon-reload &>/dev/null
+            # 立刻运行loongsuite-pilot后台采集/拦截服务，永久配置为用户登录开机自启，程序崩溃会被自动重启、统一收集日志、方便用systemctl管控启停状态
             systemctl --user enable --now loongsuite-pilot.service &>/dev/null
             if [ -f "$BOOTSTRAP_DIR/updater-daemon.js" ]; then
+                # 立刻运行loongsuite-pilot跟新后台采集/拦截服务，永久配置为用户登录开机自启，程序崩溃会被自动重启、统一收集日志、方便用systemctl管控启停状态
                 systemctl --user enable --now loongsuite-pilot-updater.service &>/dev/null
             fi
             enable_linger || true
+            # 覆盖写$HOME/.loongsuite-pilot/init-type文件内容
             echo "systemd-user" > "$INIT_TYPE_FILE"
             ;;
         systemd-system)
@@ -1850,8 +1938,9 @@ cmd_monitor() {
 }
 
 # ---- Dispatch ----
-
+# ${1:-status}：读取脚本第一个入参 $1；如果没传任何参数，默认值填充为 status
 case "${1:-status}" in
+    # 丢弃已经匹配完毕的第一个参数 start，参数列表整体向前挪一位
     start)       shift; cmd_start "$@" ;;
     stop)        cmd_stop ;;
     restart)     cmd_restart ;;

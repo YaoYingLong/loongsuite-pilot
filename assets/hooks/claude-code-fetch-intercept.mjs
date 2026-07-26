@@ -27,7 +27,22 @@
 //   - NOTE: This file uses require() which is Bun-specific in .mjs context.
 //     It only runs under BUN_OPTIONS --preload inside a compiled Bun binary
 //     (Claude Code CLI).
-
+//
+// 捕获的三类数据：
+// 1.系统提示词（system_instructions） 从向外发送的 /v1/messages 请求请求体的 system 字段中解析提取，并且转换为 MessagePart[] 格式（该格式由
+//    loongsuite-pilot/specs/gen-ai-system_instructions.json 规范定义）；其中文本结构体使用字段名content，而非 Anthropic 接口标准的text字段。
+//    同时会过滤掉第一段作为 Claude Code 计费标识的头部内容块。
+// 2.响应 ID（response_id） 从第一条 SSE 推送的message_start事件里的message.id字段提取。该 ID
+//    与采集器已存入gen_ai.response.id字段的值完全一致，上层钩子处理器可依靠此字段实现一对一的数据关联匹配。
+// 3.首字符抵达耗时 ttft_ns 当首个content_block_delta事件（包含文本增量、思考过程增量、入参 JSON 增量三类）到达时，
+//    通过performance.now()计算时间差值（毫秒），最终转换为整型纳秒值保存。
+//
+// 设计说明
+// 1.SSE 数据流解析方式：将累积缓冲区按照\n\n事件分隔符做切割解析。项目早期曾尝试滑动窗口正则方案，但长前置报文场景下会出现静默数据损坏问题，禁止改回正则实现方案。
+// 2.一旦成功捕获到response_id与ttft_ns两项指标，即刻停止解析逻辑，后续的原始流式数据直接透传转发，以此控制内存占用不会持续上涨。
+// 3.全部解析逻辑包裹在try/catch异常捕获中：本钩子内部抛出任何异常，都绝对不能破坏 Claude Code 原生的网络请求流程。
+//
+// 重要备注：本文件为.mjs格式却使用require()导入模块，该写法仅 Bun 运行环境支持。此脚本只会由 Claude Code 编译后的 Bun 二进制程序，通过BUN_OPTIONS --preload预加载方式运行。
 const fs = require('node:fs');
 const path = require('node:path');
 
