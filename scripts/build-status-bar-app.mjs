@@ -1,12 +1,13 @@
 #!/usr/bin/env node
 /**
- * Build the macOS status bar app (Swift).
+ * macOS 菜单栏应用构建入口。`build.mjs` 在 macOS 主构建中调用它，它再执行 SwiftPM，
+ * 把可执行文件和 BuildInfo 放到打包目录。非 macOS 平台直接跳过。
  *
- * Usage:
+ * 用法：
  *   node scripts/build-status-bar-app.mjs [--arch arm64|x64|universal]
  *
- * Requires macOS with Xcode or matching Command Line Tools.
- * Best-effort: exits 0 even on build failure (logs warning).
+ * 依赖 Xcode 或匹配的 Command Line Tools。构建子进程通过 `execFileSync/execSync` 同步执行；
+ * 本步骤是 best-effort，失败只输出 warning 并保持退出码 0，不阻断 Node.js 主包构建。
  */
 import { execSync, execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync } from 'node:fs';
@@ -68,7 +69,7 @@ try {
     '-framework', 'Combine',
   ];
 
-  // swiftc doesn't support glob, list files manually
+  // swiftc 不支持 glob，因此需要手工列出源文件。
   const { readdirSync } = await import('node:fs');
   const swiftFiles = readdirSync(sourceDir)
     .filter(f => f.endsWith('.swift'))

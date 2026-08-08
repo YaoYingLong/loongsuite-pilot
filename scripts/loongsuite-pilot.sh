@@ -1,6 +1,17 @@
 #!/usr/bin/env bash
+# Linux/macOS 的稳定运维 CLI，也是 systemd、launchd 和 init.d 最终调用的服务入口。
+# 安装器把本文件复制到 `~/.local/bin/loongsuite-pilot`；start/stop/restart/status/info/rollback
+# 管理服务和版本指针，而 `run`/`run-updater` 在前台 `exec` 稳定 daemon 垫片。
+#
+# 完整启动链：`start -> autostart_install -> 服务管理器 -> run -> collector-daemon.js
+# -> versions/<current>/dist/index.js`。收到停止请求时先 SIGTERM 等待，再必要时 SIGKILL，
+# 并清理 PID、自启动配置和遗留进程；Updater 的 collector-only 重启会避免杀死更新进程自身。
+#
+# Shebang 通过 PATH 寻找 Bash；严格模式让失败命令、未定义变量和管道中任一失败立即终止，
+# 因此明确写出的 `|| true` 表示该步骤被设计为 best-effort，不应阻断整体清理/探测。
 set -euo pipefail
 
+# 数据目录保存运行状态，缓存目录固定保存版本与稳定脚本；两者可分别由环境变量覆盖。
 DATA_DIR="${LOONGSUITE_PILOT_DATA_DIR:-$HOME/.loongsuite-pilot}"
 CACHE_DIR="${LOONGSUITE_PILOT_CACHE_DIR:-$HOME/.loongsuite-pilot}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,10 +41,12 @@ SYSTEMD_SYSTEM_UNIT_DIR="/etc/systemd/system"
 LOONGSUITE_PILOT_BIN="$HOME/.local/bin/loongsuite-pilot"
 INIT_TYPE_FILE="$DATA_DIR/init-type"
 
+# 校验 CLI 未被错误地以 root/sudo 运行，避免操作其他用户的服务和目录。
 validate_current_user() {
     whoami
 }
 
+# 只读判断 has_sudo_interactive 对应条件，以 Shell 退出码 0/非 0 表示真/假。
 has_sudo_interactive() {
     # 等于0表示root用户直接退出返回true
     [ "$(id -u)" -eq 0 ] && return 0
@@ -48,14 +61,15 @@ has_sudo_interactive() {
     fi
 }
 
+# 只读判断 has_sudo_noninteractive 对应条件，以 Shell 退出码 0/非 0 表示真/假。
 has_sudo_noninteractive() {
     [ "$(id -u)" -eq 0 ] && return 0
     sudo -n true 2>/dev/null
 }
 
-# Run a privileged command, escalating only when needed.
-# As root: exec directly — sudo may be absent (e.g. container images) and is
-#   redundant anyway. As non-root: prefix with sudo (interactive escalation OK).
+# 执行需要特权的命令，仅在确有必要时提权。
+# 当前为 root 时直接执行，因为容器镜像可能没有 sudo，且 root 再 sudo 没有意义；非 root 时加
+# sudo 前缀，此入口允许交互式提权。
 maybe_sudo() {
     if [ "$(id -u)" -eq 0 ]; then
         "$@"
@@ -64,7 +78,7 @@ maybe_sudo() {
     fi
 }
 
-# Non-interactive variant for read-only checks that must never block on a prompt.
+# 只读检查使用的非交互变体，绝不能因密码提示阻塞。
 maybe_sudo_n() {
     if [ "$(id -u)" -eq 0 ]; then
         "$@"
@@ -73,6 +87,7 @@ maybe_sudo_n() {
     fi
 }
 
+# 按兼容顺序解析 resolve_user_home 所需路径或版本，失败时返回空值供调用方回退。
 resolve_user_home() {
     local user="$1"
     if command -v getent &>/dev/null; then
@@ -109,6 +124,7 @@ sync_bootstrap_scripts() {
     cp -f "$src_dir/updater-daemon.js"   "$BOOTSTRAP_DIR/" 2>/dev/null || true
 }
 
+# 确保 sync_installed_scripts_from_version 所需目录或稳定脚本与 current 版本一致。
 sync_installed_scripts_from_version() {
     local version_dir="$1"
     local src_dir="$version_dir/scripts"
@@ -128,6 +144,7 @@ sync_installed_scripts_from_version() {
     mv -f "$LOONGSUITE_PILOT_BIN.tmp" "$LOONGSUITE_PILOT_BIN"
 }
 
+# 只读判断 is_running 对应条件，以 Shell 退出码 0/非 0 表示真/假。
 is_running() {
     # 如果$HOME/.loongsuite-pilot/loongsuite-pilot.pid文件存在
     if [ -f "$PID_FILE" ]; then
@@ -145,6 +162,7 @@ is_running() {
     return 1
 }
 
+# 只读判断 is_pid_file_running 对应条件，以 Shell 退出码 0/非 0 表示真/假。
 is_pid_file_running() {
     local pid_file="$1"
     if [ -f "$pid_file" ]; then
@@ -158,6 +176,7 @@ is_pid_file_running() {
     return 1
 }
 
+# 读取 PID 文件发送 TERM，超时后 KILL，并只清理由该文件跟踪的进程。
 stop_pid_file() {
     local pid_file="$1"
     if is_pid_file_running "$pid_file"; then
@@ -176,6 +195,7 @@ stop_pid_file() {
     rm -f "$pid_file"
 }
 
+# 结合 Updater PID 文件和命令行匹配判断是否存在更新进程。
 updater_process_exists() {
     if [ -f "$UPDATER_PID_FILE" ]; then
         local pid
@@ -194,6 +214,7 @@ updater_process_exists() {
     pgrep -f "loongsuite-pilot/bin/updater-daemon" >/dev/null 2>&1
 }
 
+# 只读判断 _node_is_suitable 对应条件，以 Shell 退出码 0/非 0 表示真/假。
 _node_is_suitable() {
     local bin="$1"
     # 判断是否存在且可执行
@@ -207,10 +228,12 @@ _node_is_suitable() {
     return 0
 }
 
+# 按兼容顺序解析 _resolve_realpath 所需路径或版本，失败时返回空值供调用方回退。
 _resolve_realpath() {
     realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || echo "$1"
 }
 
+# 只读判断 _node_is_app_bundle 对应条件，以 Shell 退出码 0/非 0 表示真/假。
 _node_is_app_bundle() {
     local resolved
     resolved=$(_resolve_realpath "$1")
@@ -224,8 +247,9 @@ _node_is_app_bundle() {
 
 NODE_PIN_FILE="$CACHE_DIR/node-bin"
 
+# 按 pin、版本管理器、常见安装路径和 PATH 依次寻找 Node.js 18+，并返回绝对路径。
 resolve_node() {
-    # 1. Pinned file
+  # 1. 优先读取已经固定的 Node 路径文件。
     # 判断$HOME/.loongsuite-pilot/node-bin文件是否存在，在安装时将node路径写入到该文件中了
     if [ -f "$NODE_PIN_FILE" ]; then
         local pinned
@@ -239,10 +263,10 @@ resolve_node() {
     fi
 
     # 下面是又走了一遍installer-opensource.sh的check_deps的逻辑
-    # 2. Fallback search: prefer user-managed Node over app-bundled PATH shims.
+  # 2. 降级搜索：用户管理的 Node 优先于应用随附的 PATH shim。
     local _candidates=()
 
-    # nvm (descending — newest first)
+  # nvm 版本按降序搜索，优先使用最新版本。
     local _nvm_candidates=("$HOME/.nvm/versions/node"/*/bin/node)
     local i
     for (( i=${#_nvm_candidates[@]}-1; i>=0; i-- )); do
@@ -258,14 +282,14 @@ resolve_node() {
         "$HOME/.local/bin/node"
     )
 
-    # PATH is last because shells launched by apps may expose bundled Node runtimes.
+  # 最后才查 PATH，因为应用启动的 Shell 可能暴露应用内置而非用户期望的 Node runtime。
     if command -v node >/dev/null 2>&1; then
         _candidates+=("$(command -v node)")
     fi
 
     for candidate in "${_candidates[@]}"; do
         if _node_is_suitable "$candidate"; then
-            # Auto-heal: update pin file
+  # 自动修复：找到可用 Node 后更新固定路径文件。
             local resolved
             resolved=$(_resolve_realpath "$candidate")
             mkdir -p "$(dirname "$NODE_PIN_FILE")" 2>/dev/null || true
@@ -277,6 +301,7 @@ resolve_node() {
     return 1
 }
 
+# 在用户 systemd 不可用时检查可提权的 systemd-system 或传统 init.d。
 _detect_system_level_init() {
     if [ -d /run/systemd/system ] && command -v systemctl &>/dev/null; then
         echo "systemd-system"
@@ -338,6 +363,7 @@ detect_init_system() {
     esac
 }
 
+# best-effort 启用 systemd user linger，使用户注销后 Collector 仍能运行。
 enable_linger() {
     local user
     user="$(whoami)"
@@ -353,14 +379,17 @@ enable_linger() {
     fi
 }
 
+# 只读判断 is_managed_by_launchd 对应条件，以 Shell 退出码 0/非 0 表示真/假。
 is_managed_by_launchd() {
     [ -f "$LAUNCHD_PLIST" ] && launchctl list "$SERVICE_LABEL" &>/dev/null
 }
 
+# 只读判断 is_managed_by_systemd_user 对应条件，以 Shell 退出码 0/非 0 表示真/假。
 is_managed_by_systemd_user() {
     systemctl --user is-enabled loongsuite-pilot.service &>/dev/null
 }
 
+# 只读判断 is_managed_by_systemd_system 对应条件，以 Shell 退出码 0/非 0 表示真/假。
 is_managed_by_systemd_system() {
     local user
     user=$(whoami)
@@ -368,6 +397,7 @@ is_managed_by_systemd_system() {
     [ -f "/etc/systemd/system/$unit_name" ] && maybe_sudo_n systemctl is-enabled "$unit_name" &>/dev/null
 }
 
+# 只读判断 is_managed_by_initd 对应条件，以 Shell 退出码 0/非 0 表示真/假。
 is_managed_by_initd() {
     local user
     user=$(whoami)
@@ -376,6 +406,7 @@ is_managed_by_initd() {
 
 
 
+# 按兼容顺序解析 resolve_current_version 所需路径或版本，失败时返回空值供调用方回退。
 resolve_current_version() {
     # 判断$HOME/.loongsuite-pilot/current文件是否存在
     if [ -f "$CURRENT_FILE" ]; then
@@ -396,6 +427,7 @@ resolve_current_version() {
     return 1
 }
 
+# 按兼容顺序解析 resolve_previous_version 所需路径或版本，失败时返回空值供调用方回退。
 resolve_previous_version() {
     if [ -f "$PREVIOUS_FILE" ]; then
         local dir
@@ -408,6 +440,7 @@ resolve_previous_version() {
     return 1
 }
 
+# 按兼容顺序解析 resolve_script 所需路径或版本，失败时返回空值供调用方回退。
 resolve_script() {
     local script_name="$1"
     local version_dir
@@ -421,8 +454,9 @@ resolve_script() {
     return 1
 }
 
-# ---- Internal: run in foreground (used by launchd / systemd) ----
+# ---- 内部入口：以前台方式运行，供 launchd/systemd 管理。 ----
 
+# 设置配置路径和 PID 后以前台 exec 方式启动稳定 Collector daemon，供服务管理器调用。
 cmd_run() {
     # 如果$HOME/.loongsuite-pilot/logs目录不存在就创建目录, 如果$HOME/.loongsuite-pilot/bin目录不存在就创建目录
     ensure_dirs
@@ -451,6 +485,7 @@ cmd_run() {
     exec "$node_bin" "$BOOTSTRAP_DIR/collector-daemon.js"
 }
 
+# 以前台 exec 方式启动稳定 Updater daemon，供独立服务单元调用。
 cmd_run_updater() {
     ensure_dirs
     sync_bootstrap_scripts
@@ -470,8 +505,9 @@ cmd_run_updater() {
     exec "$node_bin" "$BOOTSTRAP_DIR/updater-daemon.js"
 }
 
-# ---- User-facing commands ----
+# ---- 面向用户的命令实现。 ----
 
+# 同步稳定脚本、注册合适的自启动机制并启动 Collector/可选 Updater。
 cmd_start() {
     # 遍历传入的参数列表
     for arg in "$@"; do
@@ -527,6 +563,7 @@ cmd_start() {
     exit 1
 }
 
+# 移除自启动、发送 TERM 等待退出，必要时 KILL，并清理 PID 与遗留进程。
 cmd_stop() {
     cmd_monitor_stop >/dev/null 2>&1 || true
     autostart_remove 2>/dev/null || true
@@ -561,7 +598,7 @@ cmd_stop() {
             ;;
     esac
 
-    # Stop PID-file tracked process
+  # 先停止 PID 文件明确记录的进程。
     if is_running; then
         local pid
         pid=$(cat "$PID_FILE")
@@ -576,10 +613,10 @@ cmd_stop() {
         fi
     fi
 
-    # Stop updater PID-file tracked process
+  # 停止 Updater PID 文件记录的进程。
     stop_pid_file "$UPDATER_PID_FILE"
 
-    # Kill any remaining orphan processes
+  # 再清理没有被 PID 文件覆盖的残留孤儿进程。
     pkill -f "loongsuite-pilot/bin/collector-daemon" 2>/dev/null || true
     pkill -f "loongsuite-pilot/bin/updater-daemon" 2>/dev/null || true
 
@@ -587,6 +624,7 @@ cmd_stop() {
     echo "✅ loongsuite-pilot stopped"
 }
 
+# 后台启动 Shell 资源采样器、记录 PID，并避免重复实例。
 cmd_process_monitor_start() {
     if is_pid_file_running "$MONITOR_PID_FILE"; then
         echo "✅ loongsuite-pilot process monitor is already running (PID $(cat "$MONITOR_PID_FILE"))"
@@ -605,12 +643,14 @@ cmd_process_monitor_start() {
     echo "✅ loongsuite-pilot process monitor started (PID $!)"
 }
 
+# 停止采样器 PID 并清理监控状态文件。
 cmd_process_monitor_stop() {
     stop_pid_file "$MONITOR_PID_FILE"
     pkill -f "monitor-loongsuite-pilot\.sh" 2>/dev/null || true
     echo "✅ loongsuite-pilot process monitor stopped"
 }
 
+# 后台启动本地 Dashboard HTTP server，写 PID/日志并检查早期退出。
 cmd_dashboard_start() {
     if is_pid_file_running "$DASHBOARD_PID_FILE"; then
         echo "✅ loongsuite-pilot dashboard is already running (PID $(cat "$DASHBOARD_PID_FILE"))"
@@ -634,12 +674,14 @@ cmd_dashboard_start() {
     echo "   open http://127.0.0.1:${LOONGSUITE_PILOT_MONITOR_PORT:-8765}/"
 }
 
+# 停止 Dashboard HTTP 进程并清理 PID 文件。
 cmd_dashboard_stop() {
     stop_pid_file "$DASHBOARD_PID_FILE"
     pkill -f "serve-loongsuite-pilot-monitor\.mjs" 2>/dev/null || true
     echo "✅ loongsuite-pilot dashboard stopped"
 }
 
+# 依次启动资源采样器和 Dashboard，形成完整 monitor 功能。
 cmd_monitor_start() {
     cmd_process_monitor_start
     cmd_dashboard_start
@@ -647,13 +689,14 @@ cmd_monitor_start() {
     echo "   dashboard: http://127.0.0.1:${LOONGSUITE_PILOT_MONITOR_PORT:-8765}/"
 }
 
+# 依次停止 Dashboard 与资源采样器，允许组件已停止。
 cmd_monitor_stop() {
     cmd_dashboard_stop
     cmd_process_monitor_stop
     echo "✅ loongsuite-pilot monitor stopped"
 }
 
-# Restart only the collector (used by updater after deploying a new version)
+  # 只重启 Collector；Updater 部署新版本后使用此入口。
 cmd_restart_collector() {
     local target_user
     target_user=$(whoami)
@@ -664,7 +707,7 @@ cmd_restart_collector() {
         init_type=$(cat "$INIT_TYPE_FILE" 2>/dev/null | tr -d '[:space:]')
     fi
 
-    # Stop collector only (leave updater running)
+  # 只停止 Collector，保持 Updater 继续运行。
     case "$(uname -s)" in
         Darwin)
             launchctl stop "$SERVICE_LABEL" 2>/dev/null || true
@@ -748,7 +791,7 @@ cmd_restart_collector() {
         fi
     fi
     if [ "$_restarted" = false ]; then
-        # Self-healing: try to register a proper service for degraded (nohup/unknown) installs
+  # 自修复：对退化为 nohup/unknown 的安装尝试注册正式系统服务。
         case "$init_type" in
             nohup|unknown|"")
                 local _new_init
@@ -793,8 +836,7 @@ cmd_restart_collector() {
         exit 1
     fi
 
-    # Schedule updater restart in a NEW process group so that
-    # "launchctl stop / systemctl stop" of the updater won't kill this subprocess.
+  # 在新的进程组中安排 Updater 重启，避免停止旧 Updater 的 launchctl/systemctl 命令顺带杀死该子进程。
     local _restart_bin="$LOONGSUITE_PILOT_BIN"
     local _restart_log="$UPDATER_LOG_FILE"
     if command -v setsid &>/dev/null; then
@@ -804,6 +846,7 @@ cmd_restart_collector() {
     fi
 }
 
+# 独立停止并重启 Updater，避免与 Collector 生命周期耦合。
 cmd_restart_updater() {
     local target_user
     target_user=$(whoami)
@@ -814,7 +857,7 @@ cmd_restart_updater() {
         init_type=$(cat "$INIT_TYPE_FILE" 2>/dev/null | tr -d '[:space:]')
     fi
 
-    # Stop updater via service manager
+  # 通过当前服务管理器停止 Updater。
     case "$(uname -s)" in
         Darwin)
             launchctl stop "$UPDATER_LABEL" 2>/dev/null || true
@@ -841,7 +884,7 @@ cmd_restart_updater() {
     ensure_dirs
     sync_bootstrap_scripts
 
-    # Start updater via service manager
+  # 通过当前服务管理器启动 Updater。
     local _restarted=false
     case "$(uname -s)" in
         Darwin)
@@ -876,7 +919,7 @@ cmd_restart_updater() {
             esac
             ;;
     esac
-    # Verify the service manager actually started the updater process
+  # 验证服务管理器确实创建了 Updater 进程。
     if [ "$_restarted" = true ]; then
         sleep 1
         if ! updater_process_exists; then
@@ -885,7 +928,7 @@ cmd_restart_updater() {
         fi
     fi
     if [ "$_restarted" = false ]; then
-        # Self-healing: try to register a proper service for degraded installs
+  # 自修复：对退化安装尝试补注册正式服务。
         case "$init_type" in
             nohup|unknown|"")
                 local _new_init
@@ -931,12 +974,14 @@ cmd_restart_updater() {
     fi
 }
 
+# 按 stop 后 start 的顺序完整重启 Collector 和可选 Updater。
 cmd_restart() {
     cmd_stop
     sleep 1
     cmd_start
 }
 
+# 综合 PID 和服务管理器状态输出 Collector、Updater 与自启动健康信息。
 cmd_status() {
     local ver_info=""
     local version_dir
@@ -973,6 +1018,7 @@ cmd_status() {
     autostart_status
 }
 
+# 输出当前/上一版本、路径、Node、日志和服务管理方式等诊断信息。
 cmd_info() {
     local version_dir
     version_dir=$(resolve_current_version) || true
@@ -1015,6 +1061,7 @@ cmd_info() {
     fi
 }
 
+# 把 worker 子命令和剩余参数转发给当前版本 dist 入口。
 cmd_worker() {
     ensure_dirs
     sync_bootstrap_scripts
@@ -1036,6 +1083,7 @@ cmd_worker() {
     exec "$node_bin" "$entry" worker "$@"
 }
 
+# 定位当前版本入口并启动 token usage TUI，保持终端标准输入输出。
 cmd_token_usage() {
     ensure_dirs
 
@@ -1076,6 +1124,7 @@ cmd_token_usage() {
     exec "$node_bin" "$entry" token-usage "$@"
 }
 
+# 校验 previous，交换版本指针、同步脚本并重启；失败则恢复指针。
 cmd_rollback() {
     if [ ! -f "$PREVIOUS_FILE" ]; then
         echo "❌ No previous version to roll back to"
@@ -1118,8 +1167,9 @@ cmd_rollback() {
     cmd_restart
 }
 
-# ---- Autostart management (internal) ----
+# ---- 内部自动启动管理。 ----
 
+# 生成或原子写入 _write_launchd_plist 对应的配置文件，供服务/后续进程读取。
 _write_launchd_plist() {
     # 如果$HOME/Library/LaunchAgents/com.loongsuite-pilot.plist目录不存在，则创建目录
     mkdir -p "$(dirname "$LAUNCHD_PLIST")"
@@ -1184,6 +1234,7 @@ WantedBy=default.target
 UNITEOF
 }
 
+# 生成或原子写入 _write_systemd_user_updater_unit 对应的配置文件，供服务/后续进程读取。
 _write_systemd_user_updater_unit() {
     mkdir -p "$SYSTEMD_USER_UNIT_DIR"
     cat > "$SYSTEMD_USER_UNIT_DIR/loongsuite-pilot-updater.service" << UNITEOF
@@ -1206,6 +1257,7 @@ WantedBy=default.target
 UNITEOF
 }
 
+# 生成或原子写入 _write_systemd_system_unit 对应的配置文件，供服务/后续进程读取。
 _write_systemd_system_unit() {
     local target_user="$1"
     local target_home
@@ -1240,6 +1292,7 @@ WantedBy=multi-user.target
 UNITEOF
 }
 
+# 生成或原子写入 _write_launchd_updater_plist 对应的配置文件，供服务/后续进程读取。
 _write_launchd_updater_plist() {
     mkdir -p "$(dirname "$UPDATER_PLIST")"
     ensure_dirs
@@ -1280,6 +1333,7 @@ _write_launchd_updater_plist() {
 PLISTEOF
 }
 
+# 生成或原子写入 _write_systemd_system_updater_unit 对应的配置文件，供服务/后续进程读取。
 _write_systemd_system_updater_unit() {
     local target_user="$1"
     local target_home
@@ -1315,6 +1369,7 @@ WantedBy=multi-user.target
 UNITEOF
 }
 
+# 生成或原子写入 _write_initd_script 对应的配置文件，供服务/后续进程读取。
 _write_initd_script() {
     local target_user="$1"
     local target_home
@@ -1352,6 +1407,7 @@ PID_FILE="PID_PLACEHOLDER"
 LOG_FILE="LOG_PLACEHOLDER"
 CONFIG_FILE="CONFIG_PLACEHOLDER"
 
+# 由生成的 init.d 脚本调用，后台启动 daemon、记录 PID 并返回启动结果。
 do_start() {
     if [ -f "$PID_FILE" ]; then
         local pid
@@ -1382,6 +1438,7 @@ do_start() {
     echo "done"
 }
 
+# 由生成的 init.d 脚本调用，TERM/KILL 停止 PID 并清理状态文件。
 do_stop() {
     if [ ! -f "$PID_FILE" ]; then
         echo "$DAEMON_NAME is not running"
@@ -1409,6 +1466,7 @@ do_stop() {
     echo "done"
 }
 
+# 由生成的 init.d 脚本调用，以标准 LSB 退出码报告进程状态。
 do_status() {
     if [ -f "$PID_FILE" ]; then
         local pid
@@ -1447,6 +1505,7 @@ INITEOF
     rm -f "$tmp_script"
 }
 
+# 生成或原子写入 _write_initd_updater_script 对应的配置文件，供服务/后续进程读取。
 _write_initd_updater_script() {
     local target_user="$1"
     local target_home
@@ -1484,6 +1543,7 @@ PID_FILE="PID_PLACEHOLDER"
 LOG_FILE="LOG_PLACEHOLDER"
 CONFIG_FILE="CONFIG_PLACEHOLDER"
 
+# 由生成的 init.d 脚本调用，后台启动 daemon、记录 PID 并返回启动结果。
 do_start() {
     if [ -f "$PID_FILE" ]; then
         local pid
@@ -1514,6 +1574,7 @@ do_start() {
     echo "done"
 }
 
+# 由生成的 init.d 脚本调用，TERM/KILL 停止 PID 并清理状态文件。
 do_stop() {
     if [ ! -f "$PID_FILE" ]; then
         echo "$DAEMON_NAME is not running"
@@ -1541,6 +1602,7 @@ do_stop() {
     echo "done"
 }
 
+# 由生成的 init.d 脚本调用，以标准 LSB 退出码报告进程状态。
 do_status() {
     if [ -f "$PID_FILE" ]; then
         local pid
@@ -1579,6 +1641,7 @@ INITEOF
     rm -f "$tmp_script"
 }
 
+# 使用 update-rc.d 或 chkconfig 注册 init.d 开机启动，工具缺失时提示手工管理。
 _register_initd_boot() {
     local name="$1"
     if command -v chkconfig &>/dev/null; then
@@ -1590,6 +1653,7 @@ _register_initd_boot() {
     fi
 }
 
+# 使用发行版可用工具移除 init.d 开机链接，清理时保持 best-effort。
 _unregister_initd_boot() {
     local name="$1"
     if command -v chkconfig &>/dev/null; then
@@ -1599,6 +1663,7 @@ _unregister_initd_boot() {
     fi
 }
 
+# 只重建并启动 Collector 服务配置，不触碰正在运行的 Updater。
 autostart_install_collector_only() {
     local interactive="${1:-true}"
 
@@ -1639,6 +1704,7 @@ autostart_install_collector_only() {
     esac
 }
 
+# 只重建并启动 Updater 服务配置，不重启 Collector。
 autostart_install_updater_only() {
     local interactive="${1:-true}"
 
@@ -1763,6 +1829,7 @@ autostart_install() {
     esac
 }
 
+# 停止并卸载 launchd/systemd/init.d 配置，删除 init-type 记录。
 autostart_remove() {
     local init_system
     init_system=$(detect_init_system "false")
@@ -1804,6 +1871,7 @@ autostart_remove() {
     rm -f "$INIT_TYPE_FILE"
 }
 
+# 只读查询当前自启动配置是否存在且处于运行状态。
 autostart_status() {
     local init_system
     init_system=$(detect_init_system)
@@ -1853,9 +1921,8 @@ autostart_status() {
     esac
 }
 
-# Manage ~/.loongsuite-pilot/span-attributes.json — user-defined attributes
-# injected into trace spans (not the event log). The collector re-reads the
-# file per turn, so changes take effect without a restart.
+# 管理 `~/.loongsuite-pilot/span-attributes.json`：其中的用户属性只注入 trace span，不进入事件日志。
+# Collector 每个 turn 都会重读该文件，因此修改无需重启即可生效。
 _span_attr_run() {
     local node_bin
     node_bin=$(resolve_node) || { echo "[span-attr] node runtime not found" >&2; exit 1; }
@@ -1880,6 +1947,7 @@ if (op === "set") {
 ' "$SPAN_ATTR_FILE" "$@"
 }
 
+# 通过 Node 小程序原子管理 span-attributes.json 的 list/set/remove 子命令。
 cmd_span_attr() {
     local sub="${1:-}"
     case "$sub" in
@@ -1908,6 +1976,7 @@ cmd_span_attr() {
     esac
 }
 
+# 打印运维 CLI 支持的命令、monitor 与 span-attr 用法。
 cmd_help() {
     echo "Usage: loongsuite-pilot <command> [options]"
     echo ""
@@ -1926,6 +1995,7 @@ cmd_help() {
     echo "  help            Show this help message"
 }
 
+# 解析 monitor 的 start/stop/status 子命令并分派到采样器和 Dashboard。
 cmd_monitor() {
     case "${1:-}" in
         start) cmd_monitor_start ;;
@@ -1937,7 +2007,7 @@ cmd_monitor() {
     esac
 }
 
-# ---- Dispatch ----
+# ---- 根据首个命令行参数分派子命令。 ----
 # ${1:-status}：读取脚本第一个入参 $1；如果没传任何参数，默认值填充为 status
 case "${1:-status}" in
     # 丢弃已经匹配完毕的第一个参数 start，参数列表整体向前挪一位

@@ -4,20 +4,22 @@
 /**
  * stdin-reader.mjs — 共享 stdin 解析 + Cursor 调用方检测。
  *
- * Hook 进程由 host agent (Claude Code / Codex / Cursor / ...) 通过 stdin 传入 JSON 事件。
- * - readStdinJson(): 同步读 fd 0,4KB buffer 循环,容错 fallback,失败返回 {}。
+ * Hook 进程由宿主 Agent（Claude Code / Codex / Cursor / ...）通过 stdin 传入 JSON 事件。
+ * - readStdinJson()：以 4 KB 缓冲区循环同步读取 fd 0，失败时容错回退并返回 {}。
  * - isCursorCaller(event): 仅 Claude 端使用 — Cursor IDE 启动 Claude 时会通过 Claude 的 hook
- *   路径触发同样事件,会与 cursor-hook 双重采集,故在 Claude handler 入口早返回。
+ *   路径触发同样事件，会与 cursor-hook 双重采集，故在 Claude 处理器入口提前返回。
  */
 
 import fs from 'node:fs';
 
 export function readStdinJson() {
   try {
+    // 分块读取避免预先假设 stdin 大小；每次保存副本，防止下一轮覆盖复用的 buf。
     const chunks = [];
     const buf = Buffer.alloc(4096);
     let fd;
     try {
+      // Unix 优先显式打开 `/dev/stdin`；Windows 或路径不可用时直接使用标准 fd 0。
       fd = fs.openSync('/dev/stdin', 'rs');
     } catch {
       fd = 0;
@@ -26,10 +28,12 @@ export function readStdinJson() {
     while ((bytes = fs.readSync(fd, buf, 0, buf.length, null)) > 0) {
       chunks.push(Buffer.from(buf.subarray(0, bytes)));
     }
+    // fd 0 由 Node 进程管理，只有本函数主动打开的描述符才需要关闭。
     if (fd !== 0) {
       try { fs.closeSync(fd); } catch {}
     }
     let raw = Buffer.concat(chunks).toString('utf-8');
+    // PowerShell 管道可能在 JSON 前加入 BOM，必须先剥离。
     if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
     if (!raw.trim()) return {};
     return JSON.parse(raw);
@@ -40,7 +44,7 @@ export function readStdinJson() {
 
 /**
  * Cursor IDE 在调用 Claude Code 时,hook stdin 会携带 `cursor_version` 字段。
- * Claude handler 检测到此字段则早返回 — 让 Cursor 自己的 cursor-hook 采集即可。
+ * Claude 处理器检测到此字段便提前返回，让 Cursor 自己的 cursor-hook 负责采集。
  */
 export function isCursorCaller(event) {
   return !!(event && event.cursor_version);

@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
+# `env` 从 PATH 选择 Bash；严格模式让参数/管道错误进入统一 fail-open 分支。
 set -euo pipefail
 
-# Claude Code hook entrypoint — delegates to claude-code-hook-processor.mjs.
+# Claude Code Hook 入口：把 stdin JSON 和子命令委托给 claude-code-hook-processor.mjs。
 #
-# Usage (registered in ~/.claude/settings.json by pilot HookStrategy):
+# HookStrategy 将下列命令注册到 ~/.claude/settings.json：
 #   $PILOT_DATA/hooks/claude-code-loongsuite-pilot-hook.sh <subcommand>
 #
-# Subcommand (v2: 只处理 3 个):
+# v2 只处理以下三个子命令：
 #   stop / subagent-start / subagent-stop
 #
-# Fail-open 原则: 任何错误都输出 "{}" 并 exit 0,不阻塞宿主 agent。
+# processor 在 stop 时读取 transcript 并写 logs/claude-code/*.jsonl；子 Agent 事件先存 state。
+# fail-open：任何错误都输出 `{}` 并 exit 0，不阻塞宿主 Agent。
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROCESSOR="$SCRIPT_DIR/claude-code-hook-processor.mjs"
 EMPTY_RESULT='{}'
 SUBCOMMAND="${1:-unknown}"
 
-# Only process registered subcommands; early-return for legacy/unregistered ones.
+# 仅分派当前声明注册的子命令；旧版或未知事件返回空结果，避免重复采集。
 case "$SUBCOMMAND" in
   stop|subagent-start|subagent-stop)
     ;;
@@ -44,7 +46,7 @@ log_error() {
     >> "$file" 2>/dev/null || true
 }
 
-# stdin 是 tty 说明被人手工执行(无 hook payload);快返回。
+# stdin 是 TTY 表示人工执行、没有 Hook payload；快速返回。
 if [[ -t 0 ]]; then
   printf '%s\n' "$EMPTY_RESULT"
   exit 0
@@ -85,7 +87,7 @@ node_is_suitable() {
 NODE_PIN_FILE="$HOME/.loongsuite-pilot/node-bin"
 NODE_BIN=""
 
-# 1. pinned node
+# 1. 优先使用安装器固定到 node-bin 的 Node。
 if [[ -f "$NODE_PIN_FILE" ]]; then
   pinned="$(cat "$NODE_PIN_FILE" 2>/dev/null | tr -d '[:space:]')"
   if [[ -n "$pinned" ]] && node_is_suitable "$pinned"; then
@@ -93,7 +95,7 @@ if [[ -f "$NODE_PIN_FILE" ]]; then
   fi
 fi
 
-# 2. fallback search (read-only)
+# 2. 固定 Node 无效时只读搜索常见安装位置。
 if [[ -z "$NODE_BIN" ]]; then
   nvm_candidates=("$HOME/.nvm/versions/node"/*/bin/node)
   candidates=()
@@ -125,7 +127,7 @@ if [[ -z "$NODE_BIN" ]]; then
   exit 0
 fi
 
-# Hook stdin payload 通过管道转发给 processor
+# 不显式读取 stdin，让 processor 直接继承同一管道，避免一次额外编码转换。
 if ! "$NODE_BIN" "$PROCESSOR" "$SUBCOMMAND"; then
   echo "[claude-code-hook] processor failed (subcommand=$SUBCOMMAND)" >&2
   log_error "processor_failed" "hook processor exited non-zero (subcommand=$SUBCOMMAND)"

@@ -1,9 +1,13 @@
 import XCTest
 @testable import LoongSuitePilotMenuBarApp
 
+// 本文件验证菜单栏数字格式化的边界。`@testable import` 允许测试访问未声明为 public 的内部实现，
+// 测试不读写 Collector 文件，也不启动 AppKit 事件循环。
+
+/// 覆盖百万、千、小数和百分比四舍五入规则的 XCTest 用例集合。
 final class FormattersTests: XCTestCase {
 
-    // MARK: - compactNumber
+    // MARK: - 紧凑数字
 
     func testCompactNumber_millions() {
         XCTAssertEqual(Formatters.compactNumber(48_534_323), "48.5M")
@@ -25,7 +29,7 @@ final class FormattersTests: XCTestCase {
         XCTAssertEqual(Formatters.compactNumber(999), "999")
     }
 
-    // MARK: - percent
+    // MARK: - 百分比
 
     func testPercent_basic() {
         XCTAssertEqual(Formatters.percent(0.0), "0%")

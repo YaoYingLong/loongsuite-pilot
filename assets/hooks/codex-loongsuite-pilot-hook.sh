@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
+# 通过 PATH 选择 Bash；严格模式检测未定义变量、命令和管道错误。
 set -euo pipefail
 
-# Codex hook entrypoint — delegates to codex-hook-processor.mjs.
+# Codex Hook 入口：把事件交给 codex-hook-processor.mjs。
 #
-# Usage (registered in ~/.codex/hooks.json by pilot HookStrategy + trust hash 在 ~/.codex/config.toml):
+# HookStrategy 将命令写入 ~/.codex/hooks.json，并在 ~/.codex/config.toml 写 trust hash：
 #   $PILOT_DATA/hooks/codex-loongsuite-pilot-hook.sh <subcommand>
 #
-# Subcommand 与 Codex hook event 一一对应:
+# 子命令与 Codex Hook event 一一对应：
 #   session-start / user-prompt-submit / pre-tool-use / post-tool-use / stop
 #
-# Fail-open 原则: 任何错误都输出 "{}" 并 exit 0,不阻塞宿主 agent。
+# 当前 processor 不直接生成遥测，只在 stop 写 transcript wakeup marker；Collector 的
+# CodexTranscriptInput 才读取 rollout 文件。任何错误均输出 `{}` 并 exit 0。
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROCESSOR="$SCRIPT_DIR/codex-hook-processor.mjs"

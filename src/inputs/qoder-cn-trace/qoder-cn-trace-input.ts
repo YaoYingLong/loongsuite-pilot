@@ -1,3 +1,4 @@
+/** Qoder CN canonical Hook trace Input，包含 CN SQLite token enrich 与 bootstrap 历史保护。 */
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { ClientType, CollectionMethod } from '../../types/index.js';
@@ -17,14 +18,11 @@ export interface QoderCnTraceInputOptions extends InputOptions {
 }
 
 /**
- * Multi-source merge input for QoderCN (IDE-only).
- * Reads hook JSONL (content+structure) and SQLite (IDE tokens),
- * merges per session, outputs enriched events for both event logs (SLS)
- * and trace conversion (ARMS).
+ * Qoder CN IDE 的多来源合并 Input。
  *
- * Pattern mirrors qoder-trace-input.ts: always emit immediately, never buffer.
- * The token enricher's timestamp fallback handles any unmatched entries
- * (sets token=0), which is safe for downstream consumers.
+ * Hook JSONL 提供内容与结构，SQLite 提供 IDE token；按 session 合并后输出给 SLS 事件日志和 ARMS
+ * trace 转换。本实现与国际版 qoder-trace-input 对齐：每周期立即返回事件，不跨周期缓冲完整 turn。
+ * token enricher 对未匹配事件使用 token=0 的时间戳回退，保证下游仍能消费结构完整的事件。
  */
 export class QoderCnTraceInput extends BaseInput {
   readonly id = 'qoder-cn-trace';
@@ -34,26 +32,29 @@ export class QoderCnTraceInput extends BaseInput {
   private readonly logDir: string;
   private readonly logPrefix = 'qoder-cn';
 
-  // Persists across collect() cycles: tracks the last anchor turn.id and its
-  // max step counter per session so orphan turns from later cycles can be
-  // merged into the correct turn.
+  // 该 Map 跨 collect 周期保留每个 session 最近的锚点 turn 及最大 step 序号，使后续没有用户输入的
+  // orphan turn 可以合并回正确 turn；Input 实例停止后 Map 随实例释放，不写入持久化状态。
   private readonly sessionAnchor = new Map<string, { turnId: string; maxStep: number }>();
 
+  /** 保存 StateStore、Hook 日志目录和轮询间隔，构造阶段不访问文件或 SQLite。 */
   constructor(opts: QoderCnTraceInputOptions) {
     super({ ...opts, pollIntervalMs: opts.pollIntervalMs ?? 30_000 });
     this.logDir = opts.logDir ?? resolveHome('~/.loongsuite-pilot/logs/qoder-cn/history');
   }
 
+  /** 通过 `~/.qoder-cn` 是否存在判断 Qoder CN 是否可用。 */
   static async checkAvailability(): Promise<boolean> {
     return directoryExists(resolveHome('~/.qoder-cn'));
   }
 
+  /** 返回 Qoder CN Hook history 目录，供发现服务监听。 */
   static getWatchPaths(): string[] {
     return [
       resolveHome('~/.loongsuite-pilot/logs/qoder-cn/history'),
     ];
   }
 
+  /** 创建日志目录并初始化不回放旧历史的启动 checkpoint。 */
   protected override async onStart(): Promise<void> {
     await ensureDir(this.logDir);
     const checkpoint = await createHookHistoryStartupCheckpoint(
@@ -72,16 +73,17 @@ export class QoderCnTraceInput extends BaseInput {
     }
   }
 
+  /**
+   * 执行一次完整合并：读取 Hook、新旧 turn 合并、去重、按 session 查询 SQLite、后处理并排序输出。
+   */
   protected async collect(): Promise<AgentActivityEntry[]> {
     const rawEntries = await this.readHookJsonl();
     if (rawEntries.length === 0) return [];
 
     const turnGroups = this.groupByTurn(rawEntries);
 
-    // Cross-cycle orphan turn merge: turns that have no user input (orphan)
-    // are merged into the most recent anchor turn for that session.
-    // Because the anchor turn was produced in a previous collect() cycle, we
-    // keep its turn.id and step counter in sessionAnchor (instance-level).
+    // 跨周期 orphan 合并：没有用户输入边界的 turn 归到该 session 最近的锚点 turn。锚点可能在
+    // 上一次 collect 已输出，因此必须使用实例级 sessionAnchor 记住 turn.id 和已用最大 step 序号。
     for (const [turnId, entries] of turnGroups) {
       const sessionId = this.extractSessionId(entries);
       if (!sessionId) continue;
@@ -91,7 +93,7 @@ export class QoderCnTraceInput extends BaseInput {
       );
 
       if (hasUserInput) {
-        // Anchor turn: record it and its max step number for future orphans.
+        // 含用户输入的是锚点 turn；记录其最大 step 序号，未来 orphan 从下一序号继续。
         let maxStep = 0;
         for (const e of entries) {
           const m = ((e['gen_ai.step.id'] as string) || '').match(/:s(\d+)$/);
@@ -99,11 +101,11 @@ export class QoderCnTraceInput extends BaseInput {
         }
         this.sessionAnchor.set(sessionId, { turnId, maxStep });
       } else {
-        // Orphan turn: reassign to the last anchor if one exists.
+        // orphan turn 只有在该 session 已有锚点时才重写；无锚点时保留原始 turn，避免错误猜测。
         const anchor = this.sessionAnchor.get(sessionId);
         if (!anchor) continue;
 
-        // Collect orphan step.ids sorted so renumbering is deterministic.
+        // 先排序并去重 orphan step.id，使相同输入的重新编号结果确定、可测试。
         const orphanStepIds = [...new Set(
           entries.map(e => (e['gen_ai.step.id'] as string) || '').filter(Boolean),
         )].sort();
@@ -124,20 +126,17 @@ export class QoderCnTraceInput extends BaseInput {
       }
     }
 
-    // Re-group after orphan merge since turn.id may have been mutated.
+    // 上一步可能原地改写 turn.id，必须重新分组后才能做 turn 级去重和 trace 注入。
     const mergedGroups = this.groupByTurn(rawEntries);
 
-    // Deduplicate events within each turn BEFORE enrichment so that
-    // enrichIdeTurn only sees canonical events. When the hook processor
-    // writes the same turn multiple times (partial retry + complete Stop),
-    // dedup keeps only the last event per (step_id, event_name, tool_call_id).
+    // enrich 前先去重，确保 enrichIdeTurn 只看到 canonical 事件。Hook processor 在 partial retry
+    // 与最终 Stop 时可能重复写同一 turn；按 step/event/tool key 保留最后一条完整版本。
     for (const [, turnEntries] of mergedGroups) {
       dedupeEventsInTurn(turnEntries);
     }
 
-    // Aggregate all turns in the same session so enrichIdeTurn can use
-    // SQLite request ordering to match tokens correctly across turns.
-    // Mirrors qoder-trace-input.ts ideSessionGroups pattern.
+    // 同 session 的所有 turn 合并查询，使 enrichIdeTurn 可用 SQLite request 顺序跨 turn 对齐 token，
+    // 与国际版 qoder-trace-input 的 ideSessionGroups 策略一致。
     const ideSessionGroups = new Map<string, AgentActivityEntry[]>();
     const noSessionEntries: AgentActivityEntry[] = [];
     for (const [, turnEntries] of mergedGroups) {
@@ -154,14 +153,14 @@ export class QoderCnTraceInput extends BaseInput {
     for (const [sessionId, sessionEntries] of ideSessionGroups) {
       const sqliteRows = await readSqliteTokensForSession(sessionId);
       enrichIdeTurn(sessionEntries, sqliteRows);
-      // Post-processing after enrichIdeTurn:
+      // token/时间 enrich 后，再修正容器时间、模型传播、工具耗时和用户边界。
       expandContainerTimes(sessionEntries);
       propagateModelToToolEvents(sessionEntries);
       computeToolCallDurations(sessionEntries);
       alignUserBoundaryToFirstLlmRequest(sessionEntries);
     }
 
-    // Aggregate all session entries.
+    // 汇总有 session 的事件，随后重新按 turn 注入 trace_id。
     const allSessionEntries: AgentActivityEntry[] = [];
     for (const sessionEntries of ideSessionGroups.values()) {
       allSessionEntries.push(...sessionEntries);
@@ -172,17 +171,15 @@ export class QoderCnTraceInput extends BaseInput {
       injectTraceId(turnEntries);
     }
 
-    // No-session entries also get dedup + trace_id injection.
+    // 无 session 事件无法查 SQLite，但仍执行 turn 去重和 trace_id 注入。
     const noSessionTurnGroups = this.groupByTurn(noSessionEntries);
     for (const [, turnEntries] of noSessionTurnGroups) {
       dedupeEventsInTurn(turnEntries);
       injectTraceId(turnEntries);
     }
 
-    // Return events grouped by turn so all events for the same turn are
-    // contiguous. The OTLP flusher flushes a turn when it sees events from
-    // a different turn, so interleaved turns cause synthetic events (tool.result,
-    // llm.request) to be dropped as "late arrivals" for already-flushed turns.
+    // 输出时保证同 turn 连续。OTLP flusher 看到另一 turn 就会 flush 当前 turn；若交错排列，后续
+    // 合成的 tool.result/llm.request 会被视为已 flush turn 的“迟到事件”而丢弃。
     const ordered: AgentActivityEntry[] = [];
     for (const [, turnEntries] of allTurnGroups) {
       ordered.push(...turnEntries);
@@ -193,8 +190,9 @@ export class QoderCnTraceInput extends BaseInput {
     return ordered;
   }
 
-  // ─── Hook JSONL reading ─────────────────────────────────────────────────────
+  // ─── Hook JSONL 增量读取。 ───
 
+  /** 按 StateStore offset 读取当天日志，坏行隔离、句柄 finally 关闭，并过滤 bootstrap 历史 turn。 */
   private async readHookJsonl(): Promise<AgentActivityEntry[]> {
     const today = getTodayDateString();
     const logFileName = `${this.logPrefix}-${today}.jsonl`;
@@ -242,8 +240,9 @@ export class QoderCnTraceInput extends BaseInput {
     return filterBootstrapHistoryTurns(entries);
   }
 
-  // ─── Record transformation ──────────────────────────────────────────────────
+  // ─── canonical 记录转换与 Git enrich。 ───
 
+  /** 将 canonical Hook record 转成 QoderCn 标准事件，未知格式返回 null。 */
   private async transformRecord(record: Record<string, unknown>): Promise<AgentActivityEntry | null> {
     const canonicalEntry = buildCanonicalHookEntry(record, ClientType.QoderCn);
     if (canonicalEntry) {
@@ -253,8 +252,9 @@ export class QoderCnTraceInput extends BaseInput {
     return null;
   }
 
-  // ─── Grouping ───────────────────────────────────────────────────────────────
+  // ─── turn/session 分组辅助。 ───
 
+  /** 按 turn.id 保持输入顺序分组，缺失 ID 的旧事件统一使用 unknown。 */
   private groupByTurn(entries: AgentActivityEntry[]): Map<string, AgentActivityEntry[]> {
     const groups = new Map<string, AgentActivityEntry[]>();
     for (const entry of entries) {
@@ -266,6 +266,7 @@ export class QoderCnTraceInput extends BaseInput {
     return groups;
   }
 
+  /** 返回 turn 中第一条非空 session ID。 */
   private extractSessionId(entries: AgentActivityEntry[]): string | undefined {
     for (const entry of entries) {
       const sid = entry['gen_ai.session.id'] as string;
@@ -275,11 +276,12 @@ export class QoderCnTraceInput extends BaseInput {
   }
 }
 
-// Deduplicate events within a single turn by (step_id, event_name, tool_call_id).
-// When the hook processor writes events for the same turn multiple times (e.g.,
-// a partial turn from an earlier retry followed by a complete turn from the
-// Stop retry), this keeps only the last event for each key — the complete
-// version written last.
+/**
+ * 按 `(step_id, event_name, tool_call_id)` 原地去重单个 turn。
+ *
+ * Hook processor 可能先写 partial retry，之后 Stop 重试又写完整 turn；倒序删除时保留每个 key
+ * 最后一条，也就是通常更完整的新版本。此函数会修改传入数组。
+ */
 function dedupeEventsInTurn(entries: AgentActivityEntry[]): void {
   const seen = new Map<string, number>();
   for (let i = 0; i < entries.length; i++) {
@@ -299,12 +301,12 @@ function dedupeEventsInTurn(entries: AgentActivityEntry[]): void {
   }
 }
 
-// Align the 'other' (user-boundary) event to the step-1 llm.request within
-//   1. Set time_unix_nano equal to the llm.request time (removes any 1ms gap
-//      that would make the converter insert an empty STEP).
-//   2. Set gen_ai.step.id to the step-1 step.id. Without a step.id the
-//      converter creates a separate 0ms empty STEP container for step-less
-//      events, resulting in a "STEP has 0 LLM children" validation error.
+/**
+ * 把 `other` 用户边界事件对齐到同 turn 的第一个 llm.request。
+ *
+ * 时间改为 request 时间可去掉导致转换器插入空 STEP 的 1ms 间隙；补上 step.id 可避免转换器为
+ * 无 step 事件创建 0ms 空容器并触发“STEP 没有 LLM 子节点”校验错误。同时传播真实模型/provider。
+ */
 function alignUserBoundaryToFirstLlmRequest(entries: AgentActivityEntry[]): void {
   const byTurn = new Map<string, AgentActivityEntry[]>();
   for (const e of entries) {
@@ -321,7 +323,7 @@ function alignUserBoundaryToFirstLlmRequest(entries: AgentActivityEntry[]): void
       if (e['event.name'] === 'other' && !e['gen_ai.step.id']) {
         e.time_unix_nano = firstReq.time_unix_nano;
         e['gen_ai.step.id'] = firstReq['gen_ai.step.id'];
-        // Propagate model from the real LLM request so 'other' doesn't show 'unknown'
+        // 使用真实 LLM request 的模型，让用户边界事件不再显示 unknown。
         if (firstReq['gen_ai.request.model'] && firstReq['gen_ai.request.model'] !== 'unknown') {
           e['gen_ai.request.model'] = firstReq['gen_ai.request.model'];
           e['gen_ai.response.model'] = firstReq['gen_ai.request.model'];
@@ -334,11 +336,10 @@ function alignUserBoundaryToFirstLlmRequest(entries: AgentActivityEntry[]): void
   }
 }
 
-// Propagate model from llm.response to tool.call/tool.result in the same step.
-// The hook processor sets tool events' model to 'unknown' because it doesn't
-// have visibility into the LLM call's model. Since tool.call/tool.result and
-// llm.response are part of the same step (same step_id), they should share
-// the same model.
+/**
+ * 把同 step 的 llm.response 模型/provider 传播到 model 为 unknown 的 tool.call/tool.result。
+ * Hook processor 生成工具事件时看不到 LLM 模型，但相同 step_id 明确表示它们属于同一次响应波次。
+ */
 function propagateModelToToolEvents(entries: AgentActivityEntry[]): void {
   const byStep = new Map<string, AgentActivityEntry[]>();
   for (const e of entries) {
@@ -369,11 +370,12 @@ function propagateModelToToolEvents(entries: AgentActivityEntry[]): void {
   }
 }
 
-// Compute gen_ai.tool.call.duration on each tool.result event as
-// tool.result.time - tool.call.time (in milliseconds).
-// Matches tool.call and tool.result by (step_id, tool.call.id).
+/**
+ * 按 `(step_id, tool.call.id)` 配对 call/result，用纳秒时间差计算毫秒级工具耗时。
+ * 时间无效、找不到配对或结果早于调用时保持原字段不变。
+ */
 function computeToolCallDurations(entries: AgentActivityEntry[]): void {
-  // Build a map of tool.call times keyed by (step_id, tool.call.id)
+  // 先建立工具调用开始时间索引，BigInt 可避免纳秒时间戳超出安全整数范围。
   const callTimes = new Map<string, bigint>();
   for (const e of entries) {
     if (e['event.name'] !== 'tool.call') continue;
@@ -381,10 +383,10 @@ function computeToolCallDurations(entries: AgentActivityEntry[]): void {
     const callId = (e['gen_ai.tool.call.id'] as string) || '';
     const t = e.time_unix_nano;
     if (typeof t !== 'string') continue;
-    try { callTimes.set(`${sid}|${callId}`, BigInt(t)); } catch { /* skip */ }
+    try { callTimes.set(`${sid}|${callId}`, BigInt(t)); } catch { /* 跳过无效纳秒字符串。 */ }
   }
 
-  // For each tool.result, compute duration from matching tool.call
+  // 再遍历结果，从索引中找相同 step/callId 的开始时间。
   for (const e of entries) {
     if (e['event.name'] !== 'tool.result') continue;
     const sid = (e['gen_ai.step.id'] as string) || '';
@@ -397,23 +399,17 @@ function computeToolCallDurations(entries: AgentActivityEntry[]): void {
     try { resultTime = BigInt(resultTimeStr); } catch { continue; }
     const durationNs = resultTime - callTime;
     if (durationNs < 0n) continue;
-    // Convert nanoseconds to milliseconds (integer)
+    // 整数除法把纳秒转换为毫秒，小于 1ms 的部分按 schema 精度舍去。
     e['gen_ai.tool.call.duration'] = Number(durationNs / 1_000_000n);
   }
 }
 
-// Expand container span times so ENTRY/AGENT spans end at/after their last
-// child STEP. The converter derives these spans from event log times; if the
-// last event in a turn has an earlier time than earlier events, the generated
-// ENTRY/AGENT span ends up with duration=0. We rewrite non-{llm.request,
-// tool.call, tool.result} entries in each turn to the max time in that turn.
-//
-// Why we skip llm.request / tool.call / tool.result:
-//   - llm.request  → used as LLM span startTime; bumping would change LLM duration
-//   - tool.call    → used as TOOL span startTime; hook processor sets it to
-//                    the llm.response time
-//   - tool.result  → used as TOOL span endTime; hook processor writes real tool
-//                    results with the tool's actual finish time
+/**
+ * 将容器类事件时间扩展到所在 turn 的最大时间，确保派生 ENTRY/AGENT span 覆盖最后一个子 STEP。
+ *
+ * 转换器从事件时间推导容器边界；若数组最后事件反而更早，容器可能得到 0 duration。LLM、工具和
+ * `other` 的时间具有真实 start/end 语义，不能移动；这里只调整未来可能出现的其他容器类事件。
+ */
 function expandContainerTimes(entries: AgentActivityEntry[]): void {
   const ms = (e: AgentActivityEntry): bigint => {
     const v = e.time_unix_nano;
@@ -435,17 +431,8 @@ function expandContainerTimes(entries: AgentActivityEntry[]): void {
       if (t > max) max = t;
     }
     for (const e of list) {
-      // Keep these events at their post-enrich times:
-      //   - llm.request  → used as LLM span startTime; bumping would change LLM duration
-      //   - llm.response → used as LLM span endTime; hook processor sets it to the
-      //                    actual PreToolUse/Stop timestamp for each step. Bumping to
-      //                    turn max would overwrite step 1's time with step 2's end
-      //                    time, causing STEP spans to overlap.
-      //   - tool.call    → used as TOOL span startTime; hook processor sets it
-      //   - tool.result  → used as TOOL span endTime; hook processor sets it
-      //   - other        → user-boundary entry; enrichIdeTurn uses its time as
-      //                    step-1 llm.request time; bumping it to turn max would set
-      //                    request.time = response.time and collapse LLM duration to 0
+      // llm.request/response 是 LLM span 起止，tool.call/result 是 TOOL span 起止；移动会改变真实耗时。
+      // other 是 step-1 用户边界，enrichIdeTurn 用它作为 request 时间；移到 turn 末尾会让 LLM 耗时归零。
       const name = e['event.name'] as string;
       if (name === 'llm.request' || name === 'llm.response' || name === 'tool.call' || name === 'tool.result' || name === 'other') continue;
       if (ms(e) < max) {

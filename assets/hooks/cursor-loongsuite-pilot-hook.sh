@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
+# 通过 PATH 选择 Bash；严格模式检测失败，脚本的各失败分支仍返回 0 以保护宿主。
 set -euo pipefail
 
-# Cursor hook entrypoint — delegates to cursor-hook-processor.mjs.
+# Cursor Hook 入口：把 stdin JSON 委托给 cursor-hook-processor.mjs。
+# HookManager 把本命令注册到 ~/.cursor/hooks.json。processor 先追加 event journal，父会话
+# stop 时再组装 ReAct 记录并写 history JSONL。所有诊断只写独立 error JSONL。
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROCESSOR="$SCRIPT_DIR/cursor-hook-processor.mjs"
@@ -66,7 +69,7 @@ NODE_PIN_FILE="$HOME/.loongsuite-pilot/node-bin"
 
 NODE_BIN=""
 
-# 1. Try pinned node
+# 1. 优先使用安装器固定的 Node 路径。
 if [[ -f "$NODE_PIN_FILE" ]]; then
   pinned="$(cat "$NODE_PIN_FILE" 2>/dev/null | tr -d '[:space:]')"
   if [[ -n "$pinned" ]] && node_is_suitable "$pinned"; then
@@ -74,7 +77,7 @@ if [[ -f "$NODE_PIN_FILE" ]]; then
   fi
 fi
 
-# 2. Fallback search (read-only — does NOT update pin)
+# 2. 只读搜索常见 Node 安装位置，不由高并发 Hook 回写 pin。
 if [[ -z "$NODE_BIN" ]]; then
   nvm_candidates=("$HOME/.nvm/versions/node"/*/bin/node)
   candidates=()

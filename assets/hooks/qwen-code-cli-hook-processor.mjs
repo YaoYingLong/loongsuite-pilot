@@ -3,23 +3,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * qwen-code-cli-hook-processor.mjs — Qwen Code CLI hook dispatcher.
+ * Qwen Code CLI Hook 子命令分派器与 transcript 导出器。
  *
- * Invoked by qwen-code-cli-loongsuite-pilot-hook.sh per registered hook event:
- *   $ node qwen-code-cli-hook-processor.mjs <subcommand>
+ * `qwen-code-cli-loongsuite-pilot-hook.sh` 为每个注册事件执行
+ * `node qwen-code-cli-hook-processor.mjs <subcommand>`。v1 的 stop 增量解析 transcript 并
+ * 写 event_t JSONL；subagent-start/stop 只累积 state.events，尚不展开为子 trace。
  *
- * v1 subcommands handled:
- *   stop              → main export (parse transcript → write event_t records)
- *   subagent-start    → v1: accumulate into state.events (deferred to v2)
- *   subagent-stop     → v1: accumulate into state.events (deferred to v2)
- *
- * Architecture mirrors assets/hooks/claude-code-hook-processor.mjs v2:
- *   pure transcript-driven (timestamps from record.timestamp, not hook fire time).
- *
- * Field names align with loongsuite-pilot/docs/ai_event_schema.md and the
- * trace-conversion rules in docs/EVENT_LOG_TO_TRACE_SPEC.md. The C1-C11
- * constraints from the implementation plan map directly to the lines below
- * marked with `// [Cn] ...`.
+ * 架构与 Claude Code v2 相似，以 transcript 的 record.timestamp 为事实时间，而不是 Hook
+ * 触发时间。输入是 stdin payload 和 `~/.qwen/projects/<projectHash>/chats/<session>.jsonl`；输出是
+ * `logs/qwen-code-cli/*.jsonl` 及 session offset/state。成功写出后才推进 offset，stdout
+ * 最终返回 `{}`，异常写独立 error JSONL 并 fail-open。
  */
 
 import fs from 'node:fs';
@@ -59,7 +52,7 @@ import { inferProvider } from './qwen-code-cli/provider-inferrer.mjs';
 
 const AGENT_ID = 'qwen-code-cli';
 
-// ─── utilities ───
+// ─── 通用工具 ───
 
 function nowSec() { return Date.now() / 1000; }
 
@@ -95,11 +88,10 @@ function requireSessionId(event, stage = 'cmd') {
 }
 
 /**
- * ISO 8601 → time_unix_nano string. [C10]
+ * 把 ISO 8601 转为 time_unix_nano 字符串。[C10]
  *
- * Some records may have undefined/empty timestamps; we return '0' so downstream
- * BigInt parsing doesn't throw. The trace converter treats time=0 as a "no
- * timestamp" sentinel and warns; we prefer that to silently dropping the event.
+ * 时间缺失时返回 `'0'`，避免下游 BigInt 抛错；trace converter 会将 0 视为无时间并告警，
+ * 这比静默丢弃事件更可诊断。
  */
 function isoToUnixNanos(isoStr) {
   if (!isoStr) return '0';
@@ -108,23 +100,17 @@ function isoToUnixNanos(isoStr) {
   return String(ms) + '000000';
 }
 
-// ─── cmd handlers ───
+// ─── 子命令处理器 ───
 
-// v1: subagent_start / subagent_stop are INTENTIONALLY INERT.
+// v1：subagent_start / subagent_stop 有意不生成输出。
 //
-// We register these hooks so the wiring is in place for v2, but in v1 we
-// only persist the events into state.events for later consumption — we do
-// NOT emit any event_t records here. The transcript parser explicitly
-// filters out subagent (sidechain) records (`r.isSidechain === true || r.agentId`),
-// so subagent activity is dropped end-to-end in v1.
+// 当前只把事件存入 state.events 为 v2 预留，不发 event_t；parser 也显式过滤 sidechain，
+// 因此 v1 端到端不会输出子 Agent 活动。
 //
-// v2 will: read state.events at Stop time, fetch the child session's chats
-// JSONL (via subagent_session_id), build a nested AGENT→STEP→LLM/TOOL
-// subtree, and attach it under the parent TOOL span via
-// `gen_ai.subagent.parent_tool_call.id`. See EVENT_LOG_TO_TRACE_SPEC §4.4.
+// 规划中的 v2 才会读取子 session JSONL，构造嵌套 AGENT -> STEP -> LLM/TOOL，并通过
+// `gen_ai.subagent.parent_tool_call.id` 挂到父 TOOL span。
 //
-// Until then, do not add record-emission logic here — leave the handlers
-// minimal and side-effect-free (state accumulation only).
+// 在此之前处理器只做最小状态累积，不应误加记录输出。
 function cmdSubagentStart() {
   const event = tryReadStdin();
   const sessionId = requireSessionId(event, 'subagent_start');
@@ -199,7 +185,7 @@ async function cmdStop() {
   }
 }
 
-// ─── transcript stability wait ───
+// ─── 等待 transcript 稳定 ───
 
 async function waitForTranscriptStable(transcriptPath, minSize = 0) {
   let prevSize = -1;
@@ -222,7 +208,7 @@ async function waitForTranscriptStable(transcriptPath, minSize = 0) {
   }
 }
 
-// ─── Stop main export flow ───
+// ─── Stop 主导出流程 ───
 
 async function exportSession(state, stopReason) {
   const runtimeConfig = loadHookRuntimeConfig(pilotDataDir());
@@ -240,10 +226,7 @@ async function exportSession(state, stopReason) {
   const transcriptPath = state.transcript_path;
   const baseOffset = state.transcript_offset || 0;
 
-  // If the transcript hasn't grown since the last export, there's nothing new
-  // to do — return fast. This is the common case for repeated Stop hooks
-  // (e.g. when a Stop hook fires for a session whose new turn data isn't yet
-  // written, OR when the user re-invokes Stop without producing new output).
+  // 文件未超过上次 offset 就没有新数据；重复 Stop、新 turn 尚未写入或用户未产生输出时快速返回。
   let currentSize = 0;
   try { currentSize = fs.statSync(transcriptPath).size; } catch {}
   if (currentSize <= baseOffset) return;
@@ -263,9 +246,7 @@ async function exportSession(state, stopReason) {
       });
       break;
     }
-    // No turns parsed: retry only if file is still growing. If size is stable
-    // and we got 0 turns, it means new bytes exist but they don't form a
-    // complete turn yet (rare) — give it 1 quick retry, then give up.
+    // 没解析出 turn 时仅在文件仍增长期间重试；大小稳定但新增字节未形成完整 turn 时快速再试一次。
     await new Promise((r) => setTimeout(r, 200));
     let newSize = 0;
     try { newSize = fs.statSync(transcriptPath).size; } catch {}
@@ -284,10 +265,7 @@ async function exportSession(state, stopReason) {
 
   const baseTurnCount = state.turn_count || 0;
 
-  // First-run guard: on fresh install/reinstall (no turn_count + offset=0), if
-  // the transcript has historic turns from before pilot was deployed, only
-  // export the last turn (= the just-completed conversation). This prevents
-  // back-loading months of history on first deploy.
+  // 首次安装/重装无 turn_count 且 offset=0 时，只导出最后一个刚完成 turn，避免回放数月历史。
   const isFirstRun = !state.turn_count && baseOffset === 0;
   let turnsToExport = parseResult.turns;
   if (isFirstRun && parseResult.turns.length > 1) {
@@ -306,14 +284,8 @@ async function exportSession(state, stopReason) {
     allRecords.push(...records);
     logHash = hash;
 
-    // Surface positional-fallback usage so it is visible in operator
-    // dashboards rather than silently producing potentially-mismatched
-    // tool_call/tool_result links. The fallback is brittle (it uses a
-    // global cursor that can mis-pair when a turn has multiple ID-less
-    // tool calls with interleaved results) — but qwen-code's @google/genai
-    // SDK almost always supplies functionCall.id, so this should rarely
-    // fire. If it starts firing in production it's a signal that upstream
-    // behavior changed (PR #37 review: A1 + B4).
+    // 位置回退可能把多个无 ID、交错结果的工具配错，因此把使用次数暴露到运维字段而非静默处理。
+    // @google/genai 通常提供 functionCall.id；频繁触发说明上游行为可能改变。
     if (turn.positionalFallbacksUsed > 0) {
       logHookError({
         agentId: AGENT_ID,
@@ -327,32 +299,34 @@ async function exportSession(state, stopReason) {
     }
   }
 
-  // turn_count includes ALL parsed turns (incl. ones skipped by first-run guard)
-  // so the byte offset advances past them and they aren't re-processed.
+  // turn_count 包含首次防护跳过的历史 turn，使 offset 越过它们并避免下次重复解析。
   state.turn_count = baseTurnCount + parseResult.turns.length;
 
   const cleaned = allRecords.map((r) => applyHookContentPolicy(sanitizeObject(r) || r, runtimeConfig));
   writeJsonlRecords(defaultLogDir(), AGENT_ID, cleaned);
 }
 
-// ─── buildTurnRecords — convert one parsed Turn into event_t records ───
+// ─── buildTurnRecords：把一个已解析 turn 转成 event_t ───
 
 /**
- * @param turn  Result of parseQwenTranscript().turns[i]
- * @param turnIndex 0-based turn index (used in turn.id suffix)
- * @param sessionId qwen session id (becomes gen_ai.session.id and turn.id prefix)
- * @param prevHash  Running input.messages_hash chain head (carried across turns)
- * @param userId    Resolved user.id
- * @param turnStopReason Stop reason for the last LLM call in this turn
- * @param cwd       Optional working dir for agent.qwen-code-cli.cwd
- * @returns {{records: object[], hash: string}}
+ * 把 parser 产出的一个 turn 展开为按时间排序的 event_t 记录，并继续输入消息哈希链。
+ * 本函数是纯内存转换：不读写文件、不启动异步任务；调用方 `exportSession` 汇总各 turn 后统一落盘。
+ *
+ * @param {object} turn `parseQwenTranscript().turns[i]` 返回的一轮对话。
+ * @param {number} turnIndex 从 0 开始的 turn 序号，用于生成 turn.id 后缀。
+ * @param {string} sessionId Qwen session ID，同时作为 gen_ai.session.id 和 turn.id 前缀。
+ * @param {string} prevHash 上一轮留下的 input.messages_hash 链头。
+ * @param {string} userId 配置解析后得到的 user.id。
+ * @param {string} turnStopReason 本 turn 最后一次 LLM 调用的停止原因。
+ * @param {string|undefined} cwd 可选工作目录，写入 agent.qwen-code-cli.cwd。
+ * @returns {{records: object[], hash: string}} records 是待写 JSONL 的事件数组，hash 是更新后的链头。
  */
 export function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, turnStopReason, cwd) {
   const records = [];
-  // [C2] turn.id = <sessionId>:t<N>
+  // [C2] turn.id 使用 `<sessionId>:t<N>`。
   const turnId = `${sessionId}:t${turnIndex + 1}`;
   let runningHash = prevHash;
-  // [C1] trace_id: generate once per turn, reuse for every event in this turn
+  // [C1] 每 turn 只生成一个 trace_id，本 turn 全部事件复用。
   const traceId = generateTraceId();
 
   const baseFields = {
@@ -366,9 +340,8 @@ export function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, t
     ...(turn.gitBranch ? { 'git.branch': turn.gitBranch } : {}),
   };
 
-  // [C7] User input → event.name=other + messages_delta (做法 A).
-  // We DON'T emit llm.request for the user prompt; the converter glues delta
-  // into ENTRY/AGENT's input.messages.
+  // [C7] 用户输入 -> event.name=other + messages_delta（做法 A）。
+  // user prompt 不单独作为 llm.request；converter 会把 delta 合入 ENTRY/AGENT input.messages。
   if (turn.prompt) {
     records.push({
       time_unix_nano: isoToUnixNanos(turn.promptTimestamp),
@@ -381,32 +354,26 @@ export function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, t
     });
   }
 
-  // For each LLM call (= one assistant record), emit:
-  //   - llm.request   (request side, with messages_delta and hash)
-  //   - llm.response  (response side, with token + multi-part output messages)
-  //   - tool.call + tool.result for each functionCall (paired by callId)
-  // [C3] STEP is created per LLM call boundary → STEP count == LLM count
+  // 每条 assistant（一次 LLM）输出 request、response，以及每个 functionCall 的工具对。
+  // [C3] 每个 LLM 边界创建一个 STEP，所以 STEP 数等于 LLM 数。
   const llmCalls = turn.llmCalls || [];
   let stepRound = 0;
 
   for (const llm of llmCalls) {
     stepRound++;
-    // [C2] step.id = <turnId>:s<M>
+    // [C2] step.id 使用 `<turnId>:s<M>`。
     const stepId = `${turnId}:s${stepRound}`;
     const stepSpanId = generateSpanId();
     const llmSpanId = generateSpanId();
-    // [C4] LLM pairing key: request + response share gen_ai.response.id
+    // [C4] request 与 response 共用 gen_ai.response.id 作为配对键。
     const responseId =
       llm.apiResponse?.responseId || llm.assistantUuid || `${stepId}:r`;
 
-    // [C8] Provider from model name with auth_type fallback (not hardcoded)
+    // [C8] provider 由模型名推断，auth_type 兜底，不硬编码。
     const provider = inferProvider(llm.model, llm.apiResponse?.authType);
 
-    // inputMessagesDeltaRecords holds the user/tool_result records produced
-    // BETWEEN the previous step and this one, so the call.id we need for each
-    // tool_call_response part lives on each record's own `toolCallResult.callId`.
-    // buildInputMessagesDelta reads that directly — no per-call override map is
-    // needed (PR #37 review: B1 dead-Map removed).
+    // deltaRecords 保存上一步至本步之间新增的 user/tool_result；所需 call.id 就在各记录自己的
+    // toolCallResult.callId，converter 可直接读取，无需额外 override Map。
     const inputMsgsDelta = buildInputMessagesDelta(
       llm.inputMessagesDeltaRecords || [],
     );
@@ -414,8 +381,7 @@ export function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, t
 
     // ─── llm.request ───
     records.push({
-      // [C11] request time MUST differ from response time — use upstream
-      // requestStartTime (timestamp of last user/tool_result before assistant)
+      // [C11] request 时间必须不同于 response，使用 assistant 前最后一条 user/tool_result 时间。
       time_unix_nano: isoToUnixNanos(llm.requestStartTime || llm.timestamp),
       'event.id': crypto.randomUUID(),
       'event.name': 'llm.request',
@@ -432,17 +398,14 @@ export function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, t
     runningHash = inputMsgsHash;
 
     // ─── llm.response ───
-    // Token priority: assistant.usageMetadata (model-side, always present)
-    // → api_response telemetry (transport-side, may be missing if user disabled
-    //    telemetry). Both should agree, but assistant.usageMetadata is canonical.
+    // token 优先 assistant.usageMetadata；缺失再用可能被用户关闭的 api_response telemetry。
     const usage = llm.usageMetadata || {};
     const inputTokens = usage.promptTokenCount ?? llm.apiResponse?.inputTokenCount ?? 0;
     const outputTokens = usage.candidatesTokenCount ?? llm.apiResponse?.outputTokenCount ?? 0;
     const cacheRead = usage.cachedContentTokenCount ?? llm.apiResponse?.cachedContentTokenCount ?? 0;
     const totalTokens = usage.totalTokenCount ?? (inputTokens + outputTokens);
 
-    // [C5] All parts (reasoning + text + tool_call) MUST be in the SAME
-    // response, not split into multiple records.
+    // [C5] reasoning/text/tool_call 必须位于同一 response，不能拆多条记录。
     const outputMessages = buildOutputMessages(llm.assistantRecord);
     const finishReason = inferAssistantFinishReason(llm.assistantRecord);
 
@@ -465,7 +428,7 @@ export function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, t
       'gen_ai.usage.total_tokens': totalTokens,
       'gen_ai.output.messages': outputMessages,
     };
-    // attach api_error info if telemetry recorded the call as failed
+    // telemetry 标记调用失败时附加 api_error 信息。
     if (llm.apiResponse?.eventName === 'qwen-code.api_error') {
       respRecord['error.type'] = llm.apiResponse.errorType || 'ApiError';
       respRecord['error.message'] = String(llm.apiResponse.errorMessage || '').slice(0, 500);
@@ -476,16 +439,13 @@ export function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, t
     }
     records.push(respRecord);
 
-    // ─── tool.call + tool.result for each declared tool ───
+    // ─── 为每个已声明工具生成 tool.call + tool.result ───
     for (const tool of llm.declaredTools) {
       const toolSpanId = generateSpanId();
-      // [C6] tool.call and tool.result share gen_ai.tool.call.id
+      // [C6] tool.call 与 tool.result 共用 gen_ai.tool.call.id。
       const callIdForEvent = tool.callId || `${stepId}:t${tool.partIndex}`;
 
-      // tool.call: tied to the assistant's emit time (response time). If the
-      // model emitted multiple parallel tool_calls in one assistant record,
-      // they all share that timestamp — acceptable since the actual execution
-      // start isn't separately observable from the transcript.
+      // tool.call 使用 assistant 发出时间；并行工具共享该时间，因为 transcript 无法观察真实执行起点。
       records.push({
         time_unix_nano: isoToUnixNanos(llm.timestamp),
         'event.id': crypto.randomUUID(),
@@ -522,15 +482,11 @@ export function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, t
         }
         records.push(resultRec);
       }
-      // Orphan tool.call (no result) emitted without tool.result — the trace
-      // converter will warn but won't crash; this preserves the LLM's intent
-      // in the trace.
+      // 无结果的孤立 tool.call 仍保留模型意图；converter 会告警但不会崩溃。
     }
   }
 
-  // [Sort by time_unix_nano] so events flow in chronological order. The trace
-  // converter's pairing logic doesn't strictly require ordering, but flushers
-  // process records sequentially, and out-of-order events can confuse downstream.
+  // 按 time_unix_nano 排序；虽配对不强制顺序，但 flusher 串行消费，乱序会干扰下游。
   records.sort((a, b) => {
     const ta = BigInt(a.time_unix_nano || '0');
     const tb = BigInt(b.time_unix_nano || '0');
@@ -539,9 +495,7 @@ export function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, t
     return 0;
   });
 
-  // Apply the final turn's stop_reason to the LAST llm.response (overrides
-  // 'stop' inferred from parts). For example, qwen finishing with content
-  // filter would be reflected in the host hook stdin's stop_reason field.
+  // 用 Hook 的最终 stop_reason 覆盖末条 response 的内容推断值，例如 content filter。
   if (turnStopReason && turnStopReason !== 'end_turn') {
     for (let i = records.length - 1; i >= 0; i--) {
       if (records[i]['event.name'] === 'llm.response') {
@@ -554,7 +508,7 @@ export function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, t
   return { records, hash: runningHash };
 }
 
-// ─── CLI dispatch ───
+// ─── CLI 子命令分派 ───
 
 const SUBCOMMAND = process.argv[2];
 
@@ -570,19 +524,18 @@ async function main() {
       cmdSubagentStop();
       break;
     default:
-      // Unregistered subcommand — early return per fail-open contract.
+      // 未注册子命令按 fail-open 契约直接返回。
       break;
   }
-  // Hook output MUST be {} on success (qwen-code expects JSON; non-JSON
-  // would mark the hook as failed in qwen-code's TRUSTED_HOOKS logs).
+  // 成功时 Hook stdout 必须是 `{}`；非 JSON 会被 Qwen Code TRUSTED_HOOKS 记为失败。
   process.stdout.write('{}\n');
 }
 
-// Only run when invoked as the main script (not when imported by tests).
+// 仅直接作为主脚本执行；单元测试 import 时不自动读取 stdin。
 if (import.meta.url === `file://${process.argv[1]}` ||
     process.argv[1]?.endsWith('qwen-code-cli-hook-processor.mjs')) {
   main().catch((err) => {
-    // Last-resort safety net: log and exit 0 to avoid blocking qwen-code.
+    // 最后一层兜底：记录异常并以 0 退出，避免阻塞 Qwen Code。
     try {
       logHookError({
         agentId: AGENT_ID, stage: 'main',

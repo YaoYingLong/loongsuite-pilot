@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 /**
- * L1 E2E entry — Docker quick check for current branch code.
- * Three scenarios: preflight, install-smoke, uninstall.
- * env contract: 9 user envs (see .env.e2e.example).
- * Everything else gets a hardcoded default in lib/l1-env.mjs.
+ * L1 E2E 的 Node.js 入口，用 Docker 快速验证当前分支。
+ * 支持 preflight、install-smoke、uninstall 和扩展场景；用户环境变量契约集中在
+ * `lib/l1-env.mjs`，其余值使用固定默认值保证本地/CI 可复现。
+ * 本文件负责场景选择、临时目录、子进程调用和最终断言；异步异常由顶层捕获并返回退出码 1。
  */
 import process from 'node:process';
 import path from 'node:path';
@@ -43,6 +43,7 @@ import {
 
 const ARTIFACT_DIR = process.env.E2E_ARTIFACT_DIR?.trim() || '/opt/artifacts';
 
+/** 按 E2E 保活开关等待，便于失败后进入容器排障；默认立即返回原退出码。 */
 async function keepAliveIfRequested(code) {
   const keepAlive = process.env.E2E_KEEP_ALIVE === '1';
   if (code === 0 && !keepAlive) return;
@@ -53,11 +54,13 @@ async function keepAliveIfRequested(code) {
   await new Promise(() => { setInterval(() => {}, 1 << 30); });
 }
 
+/** 按 E2E 保活开关等待，便于失败后进入容器排障；默认立即返回原退出码。 */
 async function keepAliveOnFailure(code) {
   await keepAliveIfRequested(code);
   process.exit(code);
 }
 
+/** 内部函数异步地执行 waitForPilotReady 流程，可能启动子进程、等待状态或受超时控制。 */
 async function waitForPilotReady(requiredAgents) {
   const waitScript = [
     'set -euo pipefail',
@@ -106,6 +109,7 @@ async function waitForPilotReady(requiredAgents) {
   });
 }
 
+/** 执行本地包安装、服务就绪、Agent 探测及 JSONL/SLS 断言，并把各阶段日志写入 artifacts。 */
 async function installSmokeScenario(env) {
   console.log('[e2e-l1] install-smoke: phase 1 = installer with local package');
   const install = await runLocalScript({
@@ -169,7 +173,7 @@ mkdir -p \
   "$HOME/.loongsuite-pilot/logs/qwen-code-cli" \
   "$HOME/.loongsuite-pilot/logs/opencode"
 
-# Create default opencode.jsonc so pilot can inject plugin
+# 创建默认 opencode.jsonc，供 Pilot 注入插件
 cat > "$HOME/.config/opencode/opencode.jsonc" <<'OPENCODE_JSON'
 {
   "$schema": "https://opencode.ai/config.json",
@@ -177,7 +181,7 @@ cat > "$HOME/.config/opencode/opencode.jsonc" <<'OPENCODE_JSON'
 }
 OPENCODE_JSON
 
-# Create default qwen settings.json so pilot can inject hooks
+# 创建默认 qwen settings.json，供 Pilot 注入 Hook
 cat > "$HOME/.qwen/settings.json" <<'QWEN_JSON'
 {
   "hooks": {}
@@ -277,6 +281,7 @@ loongsuite-pilot status`,
   console.log('[e2e-l1] install-smoke PASSED.');
 }
 
+/** 先安装可用服务，再运行卸载与残留检查，验证命令、进程、Hook 和数据清理语义。 */
 async function uninstallScenario(env) {
   const installerUrl = (env.E2E_INSTALLER_URL ?? DEFAULT_E2E_INSTALLER_URL).trim();
   console.log('[e2e-l1] uninstall scenario: phase 1 = installer with local package');
@@ -314,13 +319,14 @@ exit $fail
   console.log('[e2e-l1] uninstall scenario PASSED.');
 }
 
+/** 按可跳过阶段串行验证动态发现、自动升级/回滚、双发和脱敏，累计失败并支持 fail-fast。 */
 async function expandFeaturesScenario(env) {
   const skipPhases = (env.E2E_EXPAND_SKIP_PHASES || '').split(',').map(s => s.trim()).filter(Boolean);
   const failFast = env.E2E_EXPAND_FAIL_FAST === '1';
   const portBase = Number(env.E2E_EXPAND_MOCK_PORT_BASE || '19100');
   let failures = 0;
 
-  // Phase 0: Install pilot
+  // 阶段 0：安装 Pilot
   console.log('[e2e-expand] phase 0: install pilot');
   const install = await runLocalScript({
     script: localBuildInstallScript(env.E2E_USER_ID, env),
@@ -332,7 +338,7 @@ async function expandFeaturesScenario(env) {
     await keepAliveOnFailure(install.code ?? 1);
   }
 
-  // Phase 1: Agent Dynamic Discovery
+  // 阶段 1：Agent 动态发现
   if (!skipPhases.includes('1')) {
     console.log('[e2e-expand] phase 1: agent dynamic discovery');
     const r = await runLocalScript({
@@ -349,7 +355,7 @@ async function expandFeaturesScenario(env) {
     console.log('[e2e-expand] phase 1: SKIPPED');
   }
 
-  // Phase 2: Auto Upgrade
+  // 阶段 2：自动升级
   if (!skipPhases.includes('2')) {
     console.log('[e2e-expand] phase 2: auto upgrade');
     const manifestPort = portBase;
@@ -379,7 +385,7 @@ async function expandFeaturesScenario(env) {
     console.log('[e2e-expand] phase 2: SKIPPED');
   }
 
-  // Phase 3: Auto Rollback
+  // 阶段 3：自动回滚
   if (!skipPhases.includes('3')) {
     console.log('[e2e-expand] phase 3: auto rollback');
     const rollbackPort = portBase + 1;
@@ -414,7 +420,7 @@ async function expandFeaturesScenario(env) {
     console.log('[e2e-expand] phase 3: SKIPPED');
   }
 
-  // Phase 4: Dual Send
+  // 阶段 4：双路发送
   if (!skipPhases.includes('4')) {
     console.log('[e2e-expand] phase 4: dual send');
     const portA = portBase + 2;
@@ -433,7 +439,7 @@ async function expandFeaturesScenario(env) {
         failures++;
         if (failFast) await keepAliveOnFailure(r.code ?? 1);
       } else {
-        // Assert both collectors received data
+        // 断言两个 Collector 都收到了数据。
         let phase4Pass = true;
         if (collectorA.received.length === 0) {
           console.error('[e2e-expand] Phase 4 FAILED: endpoint A received 0 requests');
@@ -462,7 +468,7 @@ async function expandFeaturesScenario(env) {
     console.log('[e2e-expand] phase 4: SKIPPED');
   }
 
-  // Phase 5: Masking Validation
+  // 阶段 5：脱敏验证
   if (!skipPhases.includes('5')) {
     console.log('[e2e-expand] phase 5: masking validation');
     const r = await runLocalScript({
@@ -486,6 +492,7 @@ async function expandFeaturesScenario(env) {
   console.log('[e2e-expand] expand-features PASSED (all phases).');
 }
 
+/** 作为 run-l1.mjs 的命令入口，编排参数、I/O 和退出码；顶层错误由文件末尾统一处理。 */
 async function main() {
   const env = process.env;
   const scenario = (env.E2E_SCENARIO ?? 'install-smoke').trim();

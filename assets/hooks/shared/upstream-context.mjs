@@ -22,6 +22,7 @@ const ZERO_TRACE = '0'.repeat(32);
 const ZERO_SPAN = '0'.repeat(16);
 
 function safeName(value) {
+  // basename 先去除父路径，再把剩余特殊字符替换为 `_`，避免 sessionId 路径穿越。
   return path.basename(String(value)).replace(/[^a-zA-Z0-9_-]/g, '_') || 'unknown';
 }
 
@@ -49,22 +50,22 @@ export function recordUpstreamContextOnce({ agentId, sessionId, dataDir }) {
 
     const base = safeName(sessionId);
     const lock = path.join(dir, `${base}.env.lock`);
-    // O_CREAT|O_EXCL:抢锁成功者才写;已存在(EEXIST)= 已写过,直接返回。
+    // `wx` 对应 O_CREAT|O_EXCL：只有独占创建锁文件成功的进程才写；EEXIST 表示已经记录过。
     try {
       fs.closeSync(fs.openSync(lock, 'wx'));
     } catch (err) {
-      if (err && err.code === 'EEXIST') return; // 正常路径,非错误
+      if (err && err.code === 'EEXIST') return; // 并发或重复 Hook 的正常路径，不是错误。
       throw err;
     }
 
     const record = { type: 'session', sessionId, traceparent: tp, ts: new Date().toISOString() };
     fs.appendFileSync(path.join(dir, `${base}.jsonl`), JSON.stringify(record) + '\n', 'utf-8');
   } catch (err) {
-    // fail-open: 记录标记失败绝不能影响宿主 agent
+    // fail-open：关联标记写入失败绝不能影响宿主 Agent。
     try {
       process.stderr.write(`[${agentId || 'hook'}] upstream_correlate skip: ${String((err && err.message) || err)}\n`);
     } catch {
-      // ignore
+      // stderr 自身不可写时也直接忽略；遥测永远不是 Agent 执行的前置条件。
     }
   }
 }

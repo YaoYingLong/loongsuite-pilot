@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Shebang 通过当前 PATH 选择 Bash；脚本只做诊断读取，不修改 OpenCode 或 Pilot 配置。
 #
 # check-opencode-injection.sh
 # ---------------------------------------------------------------------------
@@ -22,6 +23,7 @@ else
   RED=''; GRN=''; YLW=''; BLU=''; BLD=''; RST=''
 fi
 
+# 用统一颜色和符号输出诊断成功项；非 TTY 时颜色变量为空。
 ok()   { printf "  ${GRN}✔${RST} %s\n" "$1"; }
 warn() { printf "  ${YLW}!${RST} %s\n" "$1"; }
 bad()  { printf "  ${RED}✘${RST} %s\n" "$1"; }

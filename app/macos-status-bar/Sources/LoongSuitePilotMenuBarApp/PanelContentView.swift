@@ -1,8 +1,13 @@
 import SwiftUI
 import Charts
 
-// MARK: - Design Tokens
+// 本文件声明浮动面板的完整 SwiftUI 视图树。它只消费两个 Store 已归一化的快照，
+// 不直接进行文件 I/O、定时轮询或进程探测；用户选择范围时回调 `PilotMetricsStore`。
+// Charts 用于 token 面积图和会话柱状图，面板关闭动作由 AppKit 控制器注入。
 
+// MARK: - 设计常量
+
+/// 集中定义颜色，避免各子视图重复硬编码；仅在本文件可见。
 private enum DT {
     static let bg       = Color(red: 0.059, green: 0.067, blue: 0.090)
     static let card     = Color(red: 0.102, green: 0.114, blue: 0.153)
@@ -12,15 +17,17 @@ private enum DT {
     static let muted    = Color(red: 0.42, green: 0.45, blue: 0.50)
     static let dim      = Color(red: 0.28, green: 0.31, blue: 0.36)
 
-    static let accent   = Color(red: 0.39, green: 0.40, blue: 0.95)   // indigo
+    static let accent   = Color(red: 0.39, green: 0.40, blue: 0.95)   // 靛蓝主强调色
     static let green    = Color(red: 0.13, green: 0.77, blue: 0.37)
     static let amber    = Color(red: 0.96, green: 0.62, blue: 0.04)
     static let red      = Color(red: 0.94, green: 0.27, blue: 0.27)
     static let cyan     = Color(red: 0.13, green: 0.83, blue: 0.93)
 }
 
-// MARK: - PanelContentView
+// MARK: - 面板根视图
 
+/// 组合运行状态、汇总数字、Agent/Provider/模型/仓库列表和趋势图的滚动面板。
+/// `@ObservedObject` 表示 Store 由外部控制器持有，本视图不会负责创建或销毁它们。
 struct PanelContentView: View {
     @ObservedObject var runtimeStore: PilotRuntimeStore
     @ObservedObject var metricsStore: PilotMetricsStore
@@ -56,7 +63,7 @@ struct PanelContentView: View {
         .frame(minWidth: 480, minHeight: 640)
     }
 
-    // MARK: - Header
+    // MARK: - 顶栏
 
     private var header: some View {
         HStack(spacing: 10) {
@@ -100,7 +107,7 @@ struct PanelContentView: View {
         runtimeStore.isReachable ? DT.green : DT.amber
     }
 
-    // MARK: - Stats Grid
+    // MARK: - 汇总网格
 
     private var statsGrid: some View {
         HStack(spacing: 8) {
@@ -128,7 +135,7 @@ struct PanelContentView: View {
         .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(DT.card))
     }
 
-    // MARK: - Range Selector
+    // MARK: - 时间范围选择
 
     private var rangeSelector: some View {
         HStack(spacing: 4) {
@@ -153,7 +160,7 @@ struct PanelContentView: View {
         .background(RoundedRectangle(cornerRadius: 8).fill(DT.card))
     }
 
-    // MARK: - Agents
+    // MARK: - Agent 列表
 
     private var agentsSection: some View {
         section(title: "AGENTS") {
@@ -194,7 +201,7 @@ struct PanelContentView: View {
         }
     }
 
-    // MARK: - Providers
+    // MARK: - Provider 占比
 
     private var providersSection: some View {
         section(title: "PROVIDERS") {
@@ -235,7 +242,7 @@ struct PanelContentView: View {
         }
     }
 
-    // MARK: - Repositories
+    // MARK: - 模型与仓库
 
     private var modelsSection: some View {
         section(title: "MODELS") {
@@ -316,7 +323,7 @@ struct PanelContentView: View {
         }
     }
 
-    // MARK: - Token Trend
+    // MARK: - Token 趋势
 
     private var tokenTrendSection: some View {
         section(title: metricsStore.snapshot.aggregationRange.tokenTrendTitle) {
@@ -346,7 +353,7 @@ struct PanelContentView: View {
         }
     }
 
-    // MARK: - Session Trend
+    // MARK: - 会话趋势
 
     private var sessionTrendSection: some View {
         section(title: metricsStore.snapshot.aggregationRange.sessionTrendTitle) {
@@ -372,7 +379,7 @@ struct PanelContentView: View {
         }
     }
 
-    // MARK: - Token Breakdown
+    // MARK: - Token 构成
 
     private var tokenBreakdownSection: some View {
         section(title: "TOKEN BREAKDOWN") {
@@ -402,7 +409,7 @@ struct PanelContentView: View {
         .padding(.vertical, 8)
     }
 
-    // MARK: - Error
+    // MARK: - 错误提示
 
     private func errorBanner(_ message: String) -> some View {
         HStack(spacing: 8) {
@@ -419,7 +426,7 @@ struct PanelContentView: View {
         .background(RoundedRectangle(cornerRadius: 8).fill(DT.amber.opacity(0.06)).overlay(RoundedRectangle(cornerRadius: 8).stroke(DT.amber.opacity(0.15), lineWidth: 0.5)))
     }
 
-    // MARK: - Shared
+    // MARK: - 共享视图构造器
 
     private func section<Content: View>(title: String, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 10) {

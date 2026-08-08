@@ -1,25 +1,27 @@
 #!/usr/bin/env bash
+# `env` 从 PATH 定位 Bash；严格模式确保错误可检测，再由 fail-open 分支转换为成功退出。
 set -euo pipefail
 
 # ============================================================================
-# Kiro CLI Hook Script — delegates to kiro-cli-hook-processor.mjs
+# Kiro CLI Hook 入口：委托给 kiro-cli-hook-processor.mjs。
 # ============================================================================
-# Usage (registered in ~/.kiro/agents/<pilot-agent>.json by pilot deploy):
+# Pilot 部署后注册在 ~/.kiro/agents/<pilot-agent>.json，调用方式：
 #   kiro-cli-loongsuite-pilot-hook.sh <event>
 #
-#   event  camelCase hook trigger (userPromptSubmit / preToolUse /
-#          postToolUse / stop). Kiro passes the event JSON via stdin.
+#   event  camelCase Hook 触发器（userPromptSubmit / preToolUse /
+#          postToolUse / stop）；Kiro 通过 stdin 传事件 JSON。
 #
-# The deploy prepends the event name to the hook command:
+# 部署器把事件名预先放进命令：
 #   command: "<PILOT_HOOKS>/kiro-cli-loongsuite-pilot-hook.sh postToolUse"
-# so $1 carries the event; the processor dispatches by argv.
+# 因而 `$1` 是事件名，processor 再依据 argv 分派。
 #
-# Fail-open: any error prints "{}" and exits 0, never blocks the host agent.
+# transcript SQLite/session JSONL 是主数据源，Hook 主要补齐工具结果和触发 stop 采集。
+# fail-open：任何错误均打印 `{}` 并退出 0，绝不阻塞宿主 Agent。
 # ============================================================================
 
 EMPTY_RESULT='{}'
 
-# stdin is a TTY → manual run, no payload; return fast.
+# stdin 是 TTY 表示人工执行且没有 payload，快速返回。
 [[ -t 0 ]] && { printf '%s\n' "$EMPTY_RESULT"; exit 0; }
 
 EVENT="${1:-unknown}"
@@ -113,7 +115,7 @@ fi
   printf '%s\n' "$EMPTY_RESULT"; exit 0
 }
 
-# Hook stdin payload piped through to the processor.
+# processor 直接继承 stdin 管道，避免 Shell 改变 JSON 编码。
 if ! "$NODE_BIN" "$PROCESSOR" "$EVENT"; then
   log_error "processor_failed" "hook processor exited non-zero (event=$EVENT)"
   printf '%s\n' "$EMPTY_RESULT"

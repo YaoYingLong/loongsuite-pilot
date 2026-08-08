@@ -1,3 +1,14 @@
+/**
+ * Runtime 包内 `worker.manifest.json` 的本地进程监督器。
+ *
+ * PluginProbeStrategy 和 LocalWorkerActivationService 通过本类按 manifest 启停 Worker。
+ * 它解析 command/cwd/env 与 pid/status/log 路径，spawn 子进程并把 stdout/stderr 追加
+ * 到日志；监督循环观察退出码，按 never/on-failure、最大次数和退避秒数决定重启。
+ * 停止时向 detached 进程组发送信号并等待，状态直接写为 JSON。manifest 可通过绝对
+ * 路径或实例占位符把 PID/状态/日志定向到实例隔离目录。
+ */
+
+
 import * as fs from 'node:fs/promises';
 import { createWriteStream, type Dirent } from 'node:fs';
 import * as path from 'node:path';
@@ -54,6 +65,10 @@ export class WorkerManifestSupervisor {
   /** 仅保存当前进程启动的 Worker 运行态；跨 Collector 重启的信息通过 PID 文件恢复。 */
   private readonly runtimes = new Map<string, WorkerRuntime>();
 
+  /**
+   * 存在 manifest 时停止旧 Worker 并启动新实例；不存在时返回 true，便于普通插件包复用。
+   * @param baseEnv PluginProbeStrategy 提供的基础环境。
+   */
   async startIfPresent(
     agentId: string,
     installDir: string,
@@ -72,6 +87,7 @@ export class WorkerManifestSupervisor {
     return this.start(agentId, location.bundleRoot, manifest, env, options);
   }
 
+  /** 查找 manifest 并停止对应 Worker；manifest 不存在视为已停止。 */
   async stopIfPresent(
     agentId: string,
     installDir: string,
@@ -86,10 +102,12 @@ export class WorkerManifestSupervisor {
     return this.stop(agentId, location.bundleRoot, manifest, options);
   }
 
+  /** 只检查安装目录或一级包根是否包含合法 manifest 路径。 */
   async hasManifest(installDir: string): Promise<boolean> {
     return !!await this.findManifest(installDir);
   }
 
+  /** 展开实例路径、读取 PID 并用 signal 0 判断进程是否活跃。 */
   async isWorkerRunning(installDir: string, options: WorkerManifestOptions = {}): Promise<boolean> {
     const location = await this.findManifest(installDir);
     if (!location) return false;
@@ -102,6 +120,7 @@ export class WorkerManifestSupervisor {
     return !!pid && this.isAlive(pid);
   }
 
+  /** 在 installDir 自身及一级子目录中定位 manifest，并返回真实 bundleRoot。 */
   private async findManifest(installDir: string): Promise<ManifestLocation | undefined> {
     // 同时兼容包内容直接落在 destDir，以及 tar 解压后额外包含一层顶级目录的结构。
     const direct = path.join(installDir, 'worker.manifest.json');
@@ -128,6 +147,7 @@ export class WorkerManifestSupervisor {
     return undefined;
   }
 
+  /** 解析 JSON 并验证 name/command 最小契约；坏文件记录警告后返回 undefined。 */
   private async readManifest(manifestPath: string): Promise<WorkerManifest | undefined> {
     try {
       const raw = await fs.readFile(manifestPath, 'utf-8');
@@ -144,6 +164,10 @@ export class WorkerManifestSupervisor {
     }
   }
 
+  /**
+   * 展开路径/命令/env，创建日志流并 detached spawn Worker；随后写 PID 和 running 状态，
+   * 注册 exit/error 回调进入重启状态机。
+   */
   private async start(
     agentId: string,
     bundleRoot: string,
@@ -189,6 +213,7 @@ export class WorkerManifestSupervisor {
       let startPersisted = false;
       // 子进程可能在 PID/状态落盘前退出，先暂存退出信息，待 running 状态写完后统一处理。
       let earlyExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
+      // 启动阶段任一步骤失败时只执行一次：关日志、删 PID、写 failed 状态并释放运行态。
       const failStart = async (err: unknown): Promise<void> => {
         if (settled) return;
         settled = true;
@@ -281,6 +306,10 @@ export class WorkerManifestSupervisor {
     }
   }
 
+  /**
+   * 标记主动停止，取消待重启 timer，向整个进程组发 SIGTERM；5 秒后仍活跃则 SIGKILL，
+   * 最后删除 PID 并写 stopped 状态。
+   */
   private async stop(
     agentId: string,
     bundleRoot: string,
@@ -329,6 +358,10 @@ export class WorkerManifestSupervisor {
     return true;
   }
 
+  /**
+   * 处理子进程退出并写状态。只有非零/信号退出、on-failure、非主动停止且次数未超限时，
+   * 才按 backoffSeconds 安排下一次 start。
+   */
   private async handleExit(
     agentId: string,
     bundleRoot: string,
@@ -374,6 +407,7 @@ export class WorkerManifestSupervisor {
     }, delayMs).unref();
   }
 
+  /** 解析 PID/status/log 的 manifest 路径，未配置时使用包内 `.agent-worker` 默认目录。 */
   private resolvePaths(
     bundleRoot: string,
     manifest: WorkerManifest,
@@ -393,6 +427,7 @@ export class WorkerManifestSupervisor {
     };
   }
 
+  /** 合并基础环境与 manifest env，并对所有值执行占位符展开。 */
   private expandEnv(
     source: Record<string, string>,
     bundleRoot: string,
@@ -406,6 +441,7 @@ export class WorkerManifestSupervisor {
     return result;
   }
 
+  /** 展开 `${bundleRoot}`、`${destDir}` 与 `${instance:<name>}`。 */
   private expand(
     value: string,
     bundleRoot: string,
@@ -418,6 +454,7 @@ export class WorkerManifestSupervisor {
       .replace(/\$\{instance:([^}]+)\}/g, (_match, name: string) => this.expandInstanceValue(name, options));
   }
 
+  /** 固定实例字段优先，再按原名和 kebab-case 查询用户 Runtime 参数。 */
   private expandInstanceValue(name: string, options: WorkerManifestOptions): string {
     // 固定实例字段优先，防止用户通过同名 Runtime 参数覆盖 token 路径、状态目录等关键值。
     const fixedValue = options.instance?.[name];
@@ -432,6 +469,7 @@ export class WorkerManifestSupervisor {
     return runtimeValue !== undefined ? String(runtimeValue) : '';
   }
 
+  /** 相对路径命令锚定 bundleRoot，裸命令保留给 PATH 解析。 */
   private resolveCommand(bundleRoot: string, command: string): string {
     // 带路径语义的相对命令以包根目录为基准；裸命令名则交给操作系统 PATH 查找。
     if (path.isAbsolute(command)) return command;
@@ -441,10 +479,12 @@ export class WorkerManifestSupervisor {
     return command;
   }
 
+  /** 展开后的相对文件路径锚定 bundleRoot。 */
   private resolvePath(bundleRoot: string, value: string): string {
     return path.isAbsolute(value) ? value : path.join(bundleRoot, value);
   }
 
+  /** 容错读取正整数 PID；文件缺失或非法返回 undefined。 */
   private async readPid(pidPath: string): Promise<number | undefined> {
     try {
       const raw = await fs.readFile(pidPath, 'utf-8');
@@ -455,11 +495,13 @@ export class WorkerManifestSupervisor {
     }
   }
 
+  /** 确保父目录后直接覆盖写状态 JSON。 */
   private async writeStatus(statusPath: string, payload: Record<string, unknown>): Promise<void> {
     await ensureDir(path.dirname(statusPath));
     await fs.writeFile(statusPath, `${JSON.stringify(payload, null, 2)}\n`, 'utf-8');
   }
 
+  /** 使用 signal 0 探测 PID；EPERM 也由 Node 表现为异常，当前按不活跃处理。 */
   private isAlive(pid: number): boolean {
     try {
       process.kill(pid, 0);
@@ -469,6 +511,7 @@ export class WorkerManifestSupervisor {
     }
   }
 
+  /** 向负 PGID 发信号覆盖 detached 子进程组；ESRCH 返回 false，其他错误抛出。 */
   private signalProcessGroup(pgid: number, signal: NodeJS.Signals): boolean {
     try {
       // start() 使用 detached=true，子进程在 Linux/macOS 上会成为进程组组长。
@@ -480,6 +523,7 @@ export class WorkerManifestSupervisor {
     }
   }
 
+  /** 以 100ms 轮询等待退出，达到 timeout 后返回，不自行发送信号。 */
   private async waitForExit(pid: number, timeoutMs: number): Promise<void> {
     const started = Date.now();
     while (Date.now() - started < timeoutMs) {

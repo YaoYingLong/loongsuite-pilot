@@ -2,42 +2,39 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * message-converter.mjs — qwen-code transcript message → ARMS event_t messages.
+ * qwen-code transcript 消息到 ARMS event_t 消息的转换器。
  *
- * qwen-code stores chat history in the `@google/genai` Content shape:
+ * qwen-code 使用 `@google/genai` Content 结构保存历史：
  *   { role: 'user' | 'model' | 'tool', parts: [TextPart | FunctionCallPart | FunctionResponsePart] }
- * where each part is one of:
+ * 其中每个 part 为：
  *   { text: string, thought?: true }                  // text / reasoning
  *   { functionCall: { name, args, id? } }              // tool call
  *   { functionResponse: { name, response } }           // tool result
  *
- * Target ARMS schema (per ai_event_schema.md + EVENT_LOG_TO_TRACE_SPEC.md §7):
+ * 目标 ARMS schema：
  *   { role, parts: [TextPart | ReasoningPart | ToolCallPart | ToolCallResponsePart] }
- * where parts use:
+ * part 使用：
  *   { type: 'text', content }
  *   { type: 'reasoning', content }                     // ← qwen `thought: true` text
  *   { type: 'tool_call', id, name, arguments }
  *   { type: 'tool_call_response', id, response }
  *
- * MUST output nested-parts structure (not OpenAI's flat content). MUST keep
- * reasoning + text + tool_call together in one assistant message (don't split
- * across multiple messages) — EVENT_LOG_TO_TRACE_SPEC §4.2.
+ * 必须输出嵌套 parts，而不是 OpenAI 扁平 content；同一次响应的 reasoning、text、tool_call
+ * 必须留在一个 assistant message 中，不能拆成多条。
+ * 本模块只做纯数据转换，无文件或状态副作用；未知 part 返回 null 由调用方过滤。
  */
 
 /**
- * Convert a single qwen-code message.parts[] element → ARMS part object.
- * Returns null for unrecognized parts (caller filters).
+ * 把一个 qwen-code message.parts[] 元素转为 ARMS part；无法识别时返回 null。
  *
- * @param {Object} qwenPart  e.g. { text: 'hi' } or { functionCall: {...} }
- * @param {string|null} [toolCallIdForResponse]  Optional callId to attach when
- *   converting a functionResponse part (qwen's functionResponse doesn't carry
- *   the original call id, so we accept it from caller's tool_result.toolCallResult.callId).
+ * @param {Object} qwenPart 例如 `{text:'hi'}` 或 `{functionCall:{...}}`。
+ * @param {string|null} [toolCallIdForResponse] functionResponse 不带原 call id，调用方可从
+ * tool_result.toolCallResult.callId 补入。
  */
 export function convertQwenPart(qwenPart, toolCallIdForResponse = null) {
   if (!qwenPart || typeof qwenPart !== 'object') return null;
 
-  // Reasoning (thought-tagged text) — must precede the plain text branch
-  // because qwen sets BOTH `text` and `thought: true` on the same part.
+  // thought part 同时含 text 和 thought=true，必须先于普通 text 分支判断。
   if (qwenPart.thought === true && typeof qwenPart.text === 'string') {
     return { type: 'reasoning', content: qwenPart.text };
   }
@@ -65,15 +62,12 @@ export function convertQwenPart(qwenPart, toolCallIdForResponse = null) {
     };
   }
 
-  // Unknown part shape — drop it (rather than emit `{type:'unknown'}` which
-  // would pollute downstream validation).
+  // 未知结构直接丢弃，不生成会污染下游 schema 校验的 `{type:'unknown'}`。
   return null;
 }
 
 /**
- * Convert qwen's message.parts[] array → ARMS parts[] array.
- * Maintains source order so reasoning/text/tool_call appear in the same
- * sequence the model produced them.
+ * 把 qwen message.parts[] 转为 ARMS parts[]，保持模型原始 reasoning/text/tool_call 顺序。
  */
 export function convertQwenParts(qwenParts, toolCallIdForResponse = null) {
   if (!Array.isArray(qwenParts)) return [];
@@ -86,13 +80,10 @@ export function convertQwenParts(qwenParts, toolCallIdForResponse = null) {
 }
 
 /**
- * Build the assistant output messages array for a single `llm.response` event.
- * MUST emit exactly one message with role='assistant' and all parts in one
- * messages[0].parts[] — never split reasoning/text/tool_call into multiple
- * messages (EVENT_LOG_TO_TRACE_SPEC §4.2).
+ * 为单个 llm.response 构造 assistant 输出数组；全部 part 必须放在唯一一条 assistant message。
  *
- * @param {Object} assistantRecord  A qwen-code transcript record of type='assistant'
- * @returns {Array} gen_ai.output.messages payload
+ * @param {Object} assistantRecord type=assistant 的 qwen transcript 记录。
+ * @returns {Array} `gen_ai.output.messages` 值。
  */
 export function buildOutputMessages(assistantRecord) {
   const message = assistantRecord?.message || {};
@@ -106,11 +97,8 @@ export function buildOutputMessages(assistantRecord) {
 }
 
 /**
- * Infer finish_reason for an assistant record. qwen-code's transcript doesn't
- * have an explicit stop_reason field, so we derive from message contents:
- *   - has functionCall parts → "tool_call"  (pilot's normalized singular form)
- *   - has only text parts    → "stop"
- *   - empty                  → "stop" (defensive default)
+ * 推断 assistant finish_reason。transcript 没有显式 stop_reason：含 functionCall 时为
+ * `tool_call`，只有文本或为空时为 `stop`。
  */
 export function inferAssistantFinishReason(assistantRecord) {
   const parts = assistantRecord?.message?.parts;
@@ -122,24 +110,19 @@ export function inferAssistantFinishReason(assistantRecord) {
 }
 
 /**
- * Build a `gen_ai.input.messages_delta` array for a single LLM call.
- * The delta contains all input messages that were ADDED between the previous
- * LLM call (or turn start) and this LLM call — i.e. one of:
+ * 为单次 LLM 调用构造 `gen_ai.input.messages_delta`，只包含自上一调用/turn 开始新增的输入：
  *
- *   - the original user prompt (for the first step of a turn)
- *   - tool_result records produced since the last assistant call
- *   - mid-turn user messages
+ *   - turn 第一步的原始 user prompt
+ *   - 上次 assistant 后产生的 tool_result
+ *   - turn 中途 user 消息
  *
- * Each input is a qwen-code transcript record. We extract its message.parts
- * and convert to ARMS format, mapping role appropriately:
+ * 输入是 qwen transcript 记录，提取 message.parts 并映射 role：
  *   - type=user → role: 'user'
- *   - type=tool_result → role: 'tool' (with tool_call_response parts)
+ *   - type=tool_result → role: 'tool'（包含 tool_call_response part）
  *
- * @param {Array} sourceRecords  qwen-code transcript records (user or tool_result)
+ * @param {Array} sourceRecords user 或 tool_result transcript 记录。
  * @param {Map<string,string>} [toolCallIdByResponseUuid]
- *   Optional map: tool_result record uuid → original tool call id. Used because
- *   qwen's functionResponse doesn't carry the call id; we recover it from the
- *   tool_result record's toolCallResult.callId.
+ * 可选映射：tool_result uuid -> 原工具 call id，用于补齐 functionResponse。
  */
 export function buildInputMessagesDelta(sourceRecords, toolCallIdByResponseUuid = new Map()) {
   if (!Array.isArray(sourceRecords)) return [];
@@ -155,7 +138,7 @@ export function buildInputMessagesDelta(sourceRecords, toolCallIdByResponseUuid 
       }
       continue;
     }
-    // type=user (also mid_turn_user_message)
+    // type=user，同时覆盖 mid_turn_user_message。
     const parts = convertQwenParts(msg.parts);
     if (parts.length > 0) {
       const role = msg.role === 'tool' ? 'tool' : 'user';

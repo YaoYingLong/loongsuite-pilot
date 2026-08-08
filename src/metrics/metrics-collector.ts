@@ -1,3 +1,11 @@
+/**
+ * Collector 运行状态与数据流指标的快照转换器。
+ *
+ * MetricsWriter 周期传入 Orchestrator/InputManager 的 `DataflowSnapshot`，本类把累计计数转成
+ * L1/L2 输出，并同步探测 CPU、内存、文件描述符、版本指针、node-bin 和 Updater 存活状态。
+ * 本类不写文件、不发网络，也不创建定时器。
+ */
+
 import * as os from 'node:os';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -7,6 +15,7 @@ import { checkProcessLiveness, UPDATER_PROCESS_PATTERNS } from '../utils/pid-uti
 import type { ProcessLiveness } from '../utils/pid-utils.js';
 import type { AgentsConfig, SlsEndpoint } from '../types/index.js';
 
+/** 十分钟级进程/安装/总数据流快照。 */
 export interface L1Metrics {
   version: string;
   os_detail: string;
@@ -48,6 +57,7 @@ export interface L1Metrics {
   __time__: number;
 }
 
+/** 每 Input 的健康行；名称保留 AlarmMetrics 以兼容下游 topic。 */
 export interface AlarmMetrics {
   category: 'alarm';
   input_name: string;
@@ -60,6 +70,7 @@ export interface AlarmMetrics {
   __time__: number;
 }
 
+/** 每 Input 的累计流量明细。 */
 export interface InputMetrics {
   category: 'input';
   label: {
@@ -76,6 +87,7 @@ export interface InputMetrics {
   __time__: number;
 }
 
+/** 每输出 endpoint 的累计发送明细。 */
 export interface FlusherMetrics {
   category: 'flusher';
   label: {
@@ -96,6 +108,7 @@ export interface FlusherMetrics {
   __time__: number;
 }
 
+/** 内部统一的输出累计计数。 */
 export interface FlusherStats {
   inEntries: number;
   inBytes: number;
@@ -106,6 +119,7 @@ export interface FlusherStats {
   startTime: string;
 }
 
+/** 内部统一的 Input 累计计数。 */
 export interface InputStats {
   inEvents: number;
   inBytes: number;
@@ -115,6 +129,7 @@ export interface InputStats {
   startTime: string;
 }
 
+/** 指标采集时从各模块读取的一致数据流快照。 */
 export interface DataflowSnapshot {
   sendEntriesTotal: number;
   receivedBytesTotal: number;
@@ -126,6 +141,7 @@ export interface DataflowSnapshot {
   inputIdleMinutes: Map<string, number>;
 }
 
+/** 安装/更新基础设施的最近健康状态。 */
 export interface InfraHealthSnapshot {
   updaterPidAlive: boolean;
   currentVersionValid: boolean;
@@ -136,6 +152,7 @@ export interface InfraHealthSnapshot {
   updaterConsecutiveFailures: number;
 }
 
+/** 将进程累计状态转换成 L1/L2 指标结构。 */
 export class MetricsCollector {
   private readonly version: string;
   private readonly userId: string;
@@ -155,13 +172,17 @@ export class MetricsCollector {
   private lastCpuTime = 0;
   private lastCollectTime = 0;
   private isFirstCpuSample = true;
-  // null until the first L1 sample seeds the baseline; until then rates are reported as 0
+  // 首次 L1 前没有速率基线；使用 null 区分累计值恰好为 0，并在首轮输出 0 rate。
   private prevSendEntries: number | null = null;
   private prevReceivedBytes: number | null = null;
   private l1CycleCount = 0;
   private updaterConsecutiveFailures = 0;
   private lastInfraHealth: InfraHealthSnapshot | null = null;
 
+  /**
+   * 构造时固定实例身份、启动时间和初始化类型，后续周期保持一致。
+   * updaterLiveness 可由测试注入，生产默认使用 pid 文件+命令行扫描。
+   */
   constructor(opts: { version: string; userId: string; dataDir: string; canaryPolicy?: string; agentsConfig?: AgentsConfig; slsEndpoints?: SlsEndpoint[]; cmsWorkspace?: string; updaterLiveness?: (pidFile: string) => ProcessLiveness }) {
     this.version = opts.version;
     this.userId = opts.userId;
@@ -179,23 +200,25 @@ export class MetricsCollector {
     this.initType = readInitType(opts.dataDir);
   }
 
+  /** 返回固定用户标识，供 MetricsWriter 做格式告警。 */
   getUserId(): string {
     return this.userId;
   }
 
+  /** 采集进程、总流量、速率和安装健康状态的一条 L1 记录。 */
   collectL1(snapshot: DataflowSnapshot): L1Metrics {
     const now = Date.now();
     const cpuPercent = this.calcCpuPercent(now);
     const mem = process.memoryUsage();
 
-    // First sample: seed the baseline and report 0 rates rather than dividing
-    // a full cumulative count by a near-zero elapsed window.
+    // 首轮只建立累计基线并输出 0，避免用全部历史计数除以接近 0 的时间窗。
     let entriesPs = '0.0';
     let bytesPs = '0.0';
     if (this.prevSendEntries === null || this.prevReceivedBytes === null) {
       this.prevSendEntries = snapshot.sendEntriesTotal;
       this.prevReceivedBytes = snapshot.receivedBytesTotal;
     } else {
+      // 时间差至少按 1ms，防止测试或重复调用出现除零。
       const elapsedSec = Math.max((now - this.lastCollectTime) / 1000, 0.001);
       const entriesDelta = snapshot.sendEntriesTotal - this.prevSendEntries;
       const bytesDelta = snapshot.receivedBytesTotal - this.prevReceivedBytes;
@@ -251,6 +274,7 @@ export class MetricsCollector {
     };
   }
 
+  /** 将每个 Input 的累计状态展开为独立 L2 行。 */
   collectL2Inputs(snapshot: DataflowSnapshot): InputMetrics[] {
     const now = Math.floor(Date.now() / 1000);
     const results: InputMetrics[] = [];
@@ -275,6 +299,7 @@ export class MetricsCollector {
     return results;
   }
 
+  /** 将每个 Flusher endpoint 的累计状态展开为独立 L2 行。 */
   collectL2Flushers(snapshot: DataflowSnapshot): FlusherMetrics[] {
     const now = Math.floor(Date.now() / 1000);
     const results: FlusherMetrics[] = [];
@@ -303,9 +328,8 @@ export class MetricsCollector {
     return results;
   }
 
-  // Per-input health row. Global flusher stats (outFailed / latency) intentionally
-  // live in collectL2Flushers — emitting them here would smear a single failing
-  // endpoint across every input row and mislead downstream consumers.
+  // 这里仅生成每 Input 健康行。全局 Flusher 失败/延迟只属于 collectL2Flushers；若复制到
+  // 每个 Input 行，会让单个 endpoint 故障看起来像所有 Input 同时失败。
   collectL2Alarms(snapshot: DataflowSnapshot): AlarmMetrics[] {
     const now = Math.floor(Date.now() / 1000);
     const results: AlarmMetrics[] = [];
@@ -327,6 +351,7 @@ export class MetricsCollector {
     return results;
   }
 
+  /** 返回关闭 message content 的 Agent ID 排序列表。 */
   private buildCaptureMessageDisabledAgents(): string {
     const disabled: string[] = [];
     for (const [agentType, cfg] of Object.entries(this.agentsConfig)) {
@@ -336,6 +361,7 @@ export class MetricsCollector {
     return disabled.join(' ');
   }
 
+  /** 汇总所有 SLS endpoint 的唯一 project，稳定排序后空格分隔。 */
   private buildProject(): string {
     const seen = new Set<string>();
     for (const ep of this.slsEndpoints) {
@@ -344,10 +370,15 @@ export class MetricsCollector {
     return Array.from(seen).sort().join(' ');
   }
 
+  /** CMS workspace 已由 ConfigLoader 解析，直接输出固定值。 */
   private buildCmsWorkspace(): string {
     return this.cmsWorkspace;
   }
 
+  /**
+   * 探测 Updater、current、node-bin、previous 和 versions 目录。
+   * 前两轮跳过 Updater 存活扫描，给服务启动/调度留出宽限时间。
+   */
   private collectInfraHealth(): InfraHealthSnapshot {
     this.l1CycleCount++;
 
@@ -381,10 +412,12 @@ export class MetricsCollector {
     return this.lastInfraHealth;
   }
 
+  /** 返回最近一次 L1 保存的基础设施状态；尚未采集时为 null。 */
   getLastInfraHealth(): InfraHealthSnapshot | null {
     return this.lastInfraHealth;
   }
 
+  /** 通过两次 process.cpuUsage 差值计算当前进程占单核百分比。 */
   private calcCpuPercent(now: number): number {
     const cpuUsage = process.cpuUsage();
 
@@ -411,6 +444,7 @@ export class MetricsCollector {
   }
 }
 
+/** Linux 读 `/proc/<pid>/fd`，macOS 读 `/dev/fd`；其他平台或失败返回 -1。 */
 function getOpenFdCount(): number {
   if (os.platform() === 'linux' || os.platform() === 'darwin') {
     try {
@@ -425,6 +459,7 @@ function getOpenFdCount(): number {
   return -1;
 }
 
+/** 读取安装脚本写入的 init-type；缺失时为 unknown。 */
 function readInitType(dataDir: string): string {
   try {
     const raw = fs.readFileSync(path.join(dataDir, 'init-type'), 'utf-8').trim();
@@ -434,6 +469,7 @@ function readInitType(dataDir: string): string {
   }
 }
 
+/** 校验 current 指针非空、未逃逸 versions 目录且目标存在。 */
 function checkVersionPointer(dataDir: string): boolean {
   try {
     const current = fs.readFileSync(path.join(dataDir, 'current'), 'utf-8').trim();
@@ -446,6 +482,7 @@ function checkVersionPointer(dataDir: string): boolean {
   }
 }
 
+/** 校验 node-bin 指向当前用户可执行文件。 */
 function checkNodeBin(dataDir: string): boolean {
   try {
     const nodePath = fs.readFileSync(path.join(dataDir, 'node-bin'), 'utf-8').trim();
@@ -457,6 +494,7 @@ function checkNodeBin(dataDir: string): boolean {
   }
 }
 
+/** 校验 previous 指针对应版本存在，从而判断 rollback 是否可用。 */
 function checkRollbackAvailable(dataDir: string): boolean {
   try {
     const previous = fs.readFileSync(path.join(dataDir, 'previous'), 'utf-8').trim();
@@ -469,6 +507,7 @@ function checkRollbackAvailable(dataDir: string): boolean {
   }
 }
 
+/** 统计 versions 下非隐藏条目；目录缺失/不可读时返回 0。 */
 function countVersions(dataDir: string): number {
   try {
     return fs.readdirSync(path.join(dataDir, 'versions')).filter(e => !e.startsWith('.')).length;

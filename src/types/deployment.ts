@@ -1,8 +1,11 @@
 /**
- * Deployment types — agent definition, deploy strategy, and related interfaces.
+ * 声明式 Agent 部署的类型契约。
+ *
+ * AgentDefLoader 从 `agents.d/*.json` 读取这些结构，DeploymentManager 按 deployMode 选择
+ * Strategy。该文件只定义跨模块协议，不执行探测或写配置。
  */
 
-// ─── Deploy Mode ───
+// 部署模式与 Hook/插件子类型。
 
 export type DeployMode = 'hook' | 'plugin-probe' | 'plugin-inject' | 'detection-only';
 export type MountType = 'wrapper' | 'rc-inject' | 'env-inject';
@@ -41,7 +44,7 @@ export interface AgentHookConfig {
   format: HookFormat;
   matcher?: string;
   replaceHookCommands?: string[];
-  /** Events previously owned by this hook that must be removed during deploy. */
+  /** 旧版本曾管理、当前部署时必须清理的事件名。 */
   retiredEvents?: string[];
   /**
    * 可选的 trust TOML 配置。仅 Codex 等需要 trust hash 校验的 agent 填写。
@@ -62,32 +65,22 @@ export interface AgentHookConfig {
    */
   eventSubcommand?: 'kebab-case' | 'as-is';
   /**
-   * If true, omit quotes around the -File path on Windows.
-   * Use for agents whose hook executor does direct spawn (not shell),
-   * where the quoted path in -File "..." would become literal characters.
+   * Windows 下是否省略 `-File` 路径外层引号。
+   * 某些 Agent 直接 spawn 而不经 shell，引号会成为参数中的字面字符，此时需要开启。
    */
   rawCommand?: boolean;
   /**
-   * Optional env block to merge into the agent's settings.json on deploy.
+   * 部署时可选合并到 Agent settings.json 的 env 块。
    *
-   * Each value may contain the `$PILOT_DATA` token; AgentDefLoader resolves
-   * it (recursively, honoring `LOONGSUITE_PILOT_DATA_DIR`) when loading the
-   * agent definition, so HookStrategy receives already-expanded strings.
+   * 值可包含 `$PILOT_DATA`；AgentDefLoader 加载声明时递归展开并尊重
+   * `LOONGSUITE_PILOT_DATA_DIR`，所以 HookStrategy 接收到的是最终路径。
    *
-   * Merge semantics:
-   *   - Regular keys: overwrite if present
-   *   - `BUN_OPTIONS` is treated as space-separated flags; if every token
-   *     we would add is already present, the write is skipped to keep
-   *     deploy idempotent and to coexist with other preload scripts the
-   *     user may have configured.
+   * 合并语义：普通 key 覆盖同名值；`BUN_OPTIONS` 按空格分词，待添加 token 已全部存在时
+   * 跳过写入，以保持部署幂等并兼容用户配置的其他 preload。
    *
-   * NOTE: settings.json env is read AFTER the agent's main process starts,
-   * so it can only affect child processes the agent spawns. It cannot
-   * influence runtime flags that the host process itself consumes at
-   * startup — most notably `BUN_OPTIONS` for Bun-compiled binaries, which
-   * Bun reads before any JS executes. For BUN_OPTIONS-style injections,
-   * use a shell-rc wrapper instead (see installer-opensource.sh
-   * inject_claude_code_fetch_intercept).
+   * 注意：settings.json env 在 Agent 主进程启动后才读取，只能影响它创建的子进程，无法影响
+   * 宿主启动时消费的 runtime flag。Bun 会在任何 JS 执行前读取 `BUN_OPTIONS`，因此此类注入
+   * 应改用 shell rc wrapper（见 installer 的 inject_claude_code_fetch_intercept）。
    */
   env?: Record<string, string>;
   /**
@@ -131,9 +124,9 @@ export interface PluginInjectConfig {
   pluginSpec: string;
   pluginId: string;
   replaceSpecs?: string[];
-  /** Target array field. Defaults to auto-detected `plugins` / `plugin`. */
+  /** 目标数组字段；缺省时自动识别 `plugins` 或 `plugin`。 */
   configKey?: string;
-  /** Create the first config path with an empty object when none exists. */
+  /** 所有候选配置都不存在时，是否以空对象创建第一个路径。 */
   createIfMissing?: boolean;
 }
 
@@ -161,7 +154,7 @@ export interface AgentDefinition {
   runtime?: AgentRuntimeConfig;
 }
 
-// ─── Deploy Result ───
+// Strategy 的统一执行结果。
 
 export interface DeployResult {
   success: boolean;
@@ -171,16 +164,20 @@ export interface DeployResult {
   error?: string;
 }
 
-// ─── Deploy Strategy ───
+// 所有具体部署 Strategy 必须实现的异步接口。
 
 export interface DeployStrategy {
+  /** 判断目标 Agent 当前是否存在。 */
   detect(def: AgentDefinition): Promise<boolean>;
+  /** 比较当前配置/源码 hash，判断是否需要重新部署。 */
   needsDeploy(def: AgentDefinition, record?: DeployedAgentRecord): Promise<boolean>;
+  /** 执行部署并返回结构化结果；实现通常自行捕获可恢复错误。 */
   deploy(def: AgentDefinition): Promise<DeployResult>;
+  /** 移除 Pilot 管理的注入内容。 */
   undeploy(def: AgentDefinition): Promise<boolean>;
 }
 
-// ─── Deployed Agent Record (persisted to deployed-agents.json) ───
+// 持久化到 deployed-agents.json 的幂等记录。
 
 export interface DeployedAgentRecord {
   deployMode: DeployMode;

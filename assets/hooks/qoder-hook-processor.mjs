@@ -1,11 +1,15 @@
 #!/usr/bin/env node
 /**
- * Qoder / Qoder-CLI hook transcript processor.
+ * Qoder / Qoder CLI / Qoder CN 的 Hook transcript 处理器。
  *
- * Parses the full transcript (including progress events) to determine
- * precise LLM call boundaries, merges thinking+text+tool_use into
- * unified multi-part responses, and uses progress timestamps for
- * accurate LLM span timing.
+ * wrapper 通过 `--agent-id` 指定变体，并把 Stop payload 从 stdin 传入。处理器读取本次新增的
+ * transcript 行（Qoder CN 会按设计重读完整文件），利用 progress Hook 时间划分 LLM 调用，
+ * 将 thinking/text/tool_use 合成多 part response，再把标准事件追加到
+ * `logs/<agentId>/history/*.jsonl`，由对应 Input 继续采集。
+ *
+ * 非交互/打印模式中 Stop 可能早于 transcript 刷盘，因此会启动延迟重试子进程。Qoder CN
+ * 又可能每 turn 多次触发 Stop，故以 transcript 路径哈希锁串行化重试。history 成功写入后才
+ * 推进持久化行游标；失败保留游标供下次恢复。stdout 协议和大部分 I/O 均 fail-open。
  */
 
 import fs from 'node:fs';
@@ -43,18 +47,13 @@ const RESOURCE_BASE_FIELD_PATCH = agentBaseFieldPatch(RESOURCE_ATTRIBUTES);
 const RESOURCE_ATTRIBUTE_FIELDS = Object.keys(RESOURCE_ATTRIBUTES).length > 0
   ? { resourceAttributes: RESOURCE_ATTRIBUTES }
   : {};
-// Caller-supplied span attributes (e.g. multica.*) stamped as top-level record
-// fields so the trace flusher can pass matching keys through to span attributes.
+// 调用方 span 属性（如 multica.*）铺到事件顶层，供 trace flusher 透传。
 const SPAN_ATTRIBUTES = parseSpanAttributesFromEnv(process.env, { agentId: 'qoder' });
 
-// --- Retry lockfile (qoder-cn only) -----------------------------------------
-// QoderCN fires Stop hook multiple times per turn AND incomplete transcript
-// causes background retries — without coordination these can stack up and
-// produce duplicate records. We guard at two points:
-//   1. parent process: skip spawn if a live lock exists
-//   2. retry subprocess: refuse to enter processTranscript if a peer holds it
-// The lock file lives at <HOOKS_DIR>/.retry-locks/<sha1>.lock and contains
-// JSON `{ pid, sessionId, startedAt }`.
+// --- 重试锁（仅 Qoder CN） -------------------------------------------------
+// Qoder CN 每 turn 会多次触发 Stop，未完整 transcript 又会启动后台重试；若不协调会堆叠并
+// 生成重复记录。父进程在已有活锁时不 spawn，重试子进程也在同伴持锁时拒绝处理。
+// 锁位于 <HOOKS_DIR>/.retry-locks/<sha1>.lock，内容为 `{pid, sessionId, startedAt}`。
 
 export const RETRY_LOCK_DIR = path.join(HOOKS_DIR, '.retry-locks');
 export const RETRY_LOCK_MAX_AGE_MS = 60_000;
@@ -79,7 +78,7 @@ export function readRetryLock(lockPath) {
     const raw = fs.readFileSync(lockPath, 'utf-8');
     const parsed = JSON.parse(raw);
     if (parsed && typeof parsed === 'object') return parsed;
-  } catch { /* fall through */ }
+  } catch { /* 文件不存在或损坏时按无有效锁继续。 */ }
   return null;
 }
 
@@ -104,7 +103,7 @@ export function tryAcquireRetryLock(transcriptPath, sessionId, dir = RETRY_LOCK_
       if (err && err.code === 'EEXIST') {
         const existing = readRetryLock(lockPath);
         if (isRetryLockStale(existing)) {
-          try { fs.unlinkSync(lockPath); } catch { /* ignore */ }
+          try { fs.unlinkSync(lockPath); } catch { /* 不能清理陈旧锁时本轮获取会自然失败。 */ }
           try {
             const handle = fs.openSync(lockPath, 'wx');
             fs.writeSync(handle, payload);
@@ -125,14 +124,14 @@ export function releaseRetryLock(transcriptPath, dir = RETRY_LOCK_DIR) {
   try {
     const lockPath = retryLockPath(transcriptPath, dir);
     const existing = readRetryLock(lockPath);
-    // Only release if we own the lock (avoid wiping a peer's lock on crash recovery)
+    // 仅删除自己 PID 持有的锁，避免崩溃恢复时误删同伴新锁。
     if (existing && existing.pid === process.pid) {
       fs.unlinkSync(lockPath);
     }
-  } catch { /* best-effort */ }
+  } catch { /* 尽力清理；失败不影响后续流程。 */ }
 }
 
-// --- Timestamp helpers -------------------------------------------------------
+// --- 时间戳辅助函数 --------------------------------------------------------
 
 function isoToUnixNanos(isoString) {
   if (!isoString) return '';
@@ -163,13 +162,13 @@ function computeDurationMs(startNanos, endNanos) {
   }
 }
 
-// --- Main --------------------------------------------------------------------
+// --- 主流程 ----------------------------------------------------------------
 
 async function main() {
   const args = process.argv.slice(2);
   const isRetry = args.includes('--retry');
 
-  // Retry mode: called by background subprocess after delay, reads transcript directly
+  // 重试模式由延迟后台子进程调用，不再读取 stdin，直接从 argv 取得 transcript/session。
   if (isRetry) {
     const transcriptIdx = args.indexOf('--transcript');
     const sessionIdx = args.indexOf('--session');
@@ -182,10 +181,8 @@ async function main() {
     logDebug(agentId, `Retry: processing ${transcriptPath} for session ${sessionId}`);
     const runtimeConfig = loadHookRuntimeConfig(path.join(HOOKS_DIR, '..'));
 
-    // qoder-cn only: serialize concurrent retries on the same transcript.
-    // We wait the HOOK_RETRY_DELAY first (so all queued Stop hooks have
-    // already advanced the offset via updateLineRecord), then acquire the
-    // lock. The losers see currentCount==lastCount in getLineRangeInfo and exit.
+    // Qoder CN：先等待 HOOK_RETRY_DELAY，让排队 Stop 有机会推进 offset，再争抢同一 transcript
+    // 锁；未抢到或稍后发现 currentCount==lastCount 的进程直接退出。
     const retryDelay = parseInt(process.env.HOOK_RETRY_DELAY || '0', 10);
     if (retryDelay > 0) {
       await new Promise(r => setTimeout(r, retryDelay));
@@ -211,7 +208,7 @@ async function main() {
     return;
   }
 
-  // Normal mode: called from Stop hook via stdin
+  // 正常模式由 Stop Hook 调用，从 stdin 校验 transcriptPath/sessionId/cwd。
   const { agentId, logPrefix } = parseArgs();
   const payload = await parseStdinPayload(agentId);
   if (!payload) return;
@@ -237,29 +234,25 @@ async function main() {
     return;
   }
 
-  // Detect incomplete transcript (race condition in print/non-interactive mode:
-  // Stop hook fires BEFORE transcript is fully written, and writes happen AFTER hook returns).
-  // Solution: spawn a background retry that runs after 5s delay.
+  // print/非交互模式中 Stop 早于 transcript 完整刷盘，剩余写入又发生在 Hook 返回后；
+  // 发现不完整时启动后台子进程，延迟后重读。
   let parsed = [];
   for (const line of lines) {
-    try { parsed.push(JSON.parse(line)); } catch { /* skip */ }
+    try { parsed.push(JSON.parse(line)); } catch { /* 跳过无法解析的行。 */ }
   }
 
-  // last-prompt is the authoritative end-of-transcript marker written by qodercli on exit.
-  // If absent, the file is still being flushed (race: Stop hook fires before transcript flush).
+  // `last-prompt` 是 qodercli 退出时写入的权威结束标记；缺失说明文件仍在刷盘。
   const hasLastPrompt = parsed.some(p => p.type === 'last-prompt');
   if (parsed.length > 0 && !hasLastPrompt) {
     logDebug(agentId, `Transcript incomplete (${parsed.length} lines, no last-prompt marker). Spawning background retry in 5s.`);
     if (agentId === 'qoder-cn') {
-      // qoder-cn: QoderCN fires Stop multiple times per turn. The retry's
-      // child-side lock serializes actual processing, but skipping needless
-      // spawn calls here keeps process churn down.
+      // 子进程锁会保证正确性；父进程先跳过明显重复 spawn，可减少 Qoder CN 进程抖动。
       const lockPath = retryLockPath(transcriptPath);
       const existing = readRetryLock(lockPath);
       if (existing && !isRetryLockStale(existing)) {
         logDebug(agentId, `Skip spawn: live retry lock held by pid ${existing.pid}`);
       } else {
-        if (existing) { try { fs.unlinkSync(lockPath); } catch { /* ignore */ } }
+        if (existing) { try { fs.unlinkSync(lockPath); } catch { /* 忽略旧锁清理失败。 */ } }
         spawnDelayedRetry(agentId, transcriptPath, sessionId, logPrefix, cwd);
       }
     } else {
@@ -290,9 +283,8 @@ async function main() {
   );
 }
 
-// NOTE: Retry subprocess won't race with normal hook because non-interactive mode (--print)
-// only fires Stop once per session (process exits after hook returns). The offset check in
-// getLineRangeInfo prevents double-processing if another hook invocation somehow occurs.
+// 非交互 `--print` 每 session 只触发一次 Stop，正常 Hook 与重试通常不竞争；即使意外并发，
+// getLineRangeInfo 的 offset 检查也会阻止重复处理。
 function spawnDelayedRetry(agentId, transcriptPath, sessionId, logPrefix, cwd) {
   const nodebin = process.argv[0];
   const script = fileURLToPath(import.meta.url);
@@ -315,7 +307,7 @@ function spawnDelayedRetry(agentId, transcriptPath, sessionId, logPrefix, cwd) {
 }
 
 async function processTranscript(agentId, logPrefix, transcriptPath, sessionId, startLine, initialEndLine, runtimeConfig, cwd, opts) {
-  // Handle retry delay
+  // 重试子进程先按参数等待，让宿主有时间继续完成 transcript 写入。
   const delayApplied = !!(opts && opts.delayApplied);
   if (!delayApplied) {
     const retryDelay = parseInt(process.env.HOOK_RETRY_DELAY || '0', 10);
@@ -324,7 +316,7 @@ async function processTranscript(agentId, logPrefix, transcriptPath, sessionId, 
     }
   }
 
-  // Re-read transcript (may have grown since initial read)
+  // 延迟后重新统计并读取 transcript，它可能已经增长。
   let endLine = initialEndLine;
   const currentCount = getTranscriptLineCount(transcriptPath);
   if (currentCount > endLine) {
@@ -338,13 +330,13 @@ async function processTranscript(agentId, logPrefix, transcriptPath, sessionId, 
     return;
   }
 
-  // --- Phase 1: Parse all transcript lines ---
+  // --- 阶段 1：解析全部目标 transcript 行 ---
   let parsed = [];
   for (const line of lines) {
-    try { parsed.push(JSON.parse(line)); } catch { /* skip */ }
+    try { parsed.push(JSON.parse(line)); } catch { /* 跳过无法解析的行。 */ }
   }
 
-  // --- Phase 2: Extract progress timing + content events ---
+  // --- 阶段 2：提取 progress 时序与内容事件 ---
   const progressEvents = [];
   const contentEvents = [];
 
@@ -354,8 +346,7 @@ async function processTranscript(agentId, logPrefix, transcriptPath, sessionId, 
     if (rowType === 'progress') {
       const data = row.data || {};
       const hookEvent = data.hookEvent || '';
-      // Deduplicate: each hookEvent fires multiple progress lines (one per registered command).
-      // Only take the first of each consecutive same-hookEvent group.
+      // 同一 hookEvent 会为每个已注册命令写 progress，只保留连续同名组的第一条。
       if (hookEvent && hookEvent !== lastProgressHookEvent) {
         progressEvents.push({ hookEvent, ts: row.timestamp, hookName: data.hookName || '' });
       }
@@ -363,35 +354,28 @@ async function processTranscript(agentId, logPrefix, transcriptPath, sessionId, 
     } else if (rowType === 'user' || rowType === 'assistant') {
       contentEvents.push(row);
     }
-    // session_meta, other types: ignored
+    // session_meta 及其他非内容类型不参与事件构造。
   }
 
-  // --- Phase 2.5 (qoder-cn only): Skip processing if transcript hasn't reached Stop ---
-  // For qoder-cn, only process the transcript when the Stop progress event has been
-  // written. A PostToolUse retry (which runs before Stop is written) would see an
-  // incomplete ReAct chain and produce partial events. The Stop retry (fired after
-  // the final assistant text is written) sees the complete chain and can correctly
-  // generate all llm.request events with proper input.messages_delta (including
-  // tool_result as input delta for step 2).
+  // --- 阶段 2.5（仅 Qoder CN）：transcript 尚未出现 Stop 时不处理 ---
+  // PostToolUse 重试发生在 Stop 写入前，只能看到不完整 ReAct 链；等待 Stop 后才能生成完整
+  // request 及 step 2 的 tool_result 输入增量。
   if (agentId === 'qoder-cn') {
     const hasStop = progressEvents.some(pe => pe.hookEvent === 'Stop');
     if (!hasStop) {
       logDebug(agentId, `Transcript not yet complete (no Stop event in progress). Skipping processing.`);
       return;
     }
-    // Stop detected — reprocess the entire transcript from the beginning so
-    // splitContentEventsIntoTurns sees the complete ReAct chain (user →
-    // assistant(text+tool_use) → user(tool_result) → assistant(text)) and
-    // generates one turn with all LLM calls and correct input.messages_delta.
+    // 检测到 Stop 后从头重读，使 turn 切分看到完整 user -> assistant/tool -> result -> assistant 链。
     startLine = 0;
     lines = readTranscriptLines(transcriptPath, startLine, endLine);
     logDebug(agentId, `Reprocessing full transcript from 0-${endLine} (${lines.length} lines)`);
-    // Re-parse since we reset startLine
+    // startLine 已重置，必须重新解析目标行。
     parsed = [];
     for (const line of lines) {
-      try { parsed.push(JSON.parse(line)); } catch { /* skip */ }
+      try { parsed.push(JSON.parse(line)); } catch { /* 跳过无法解析的行。 */ }
     }
-    // Re-extract progress + content events from the full transcript
+    // 从完整 transcript 重新提取 progress 和内容事件。
     progressEvents.length = 0;
     contentEvents.length = 0;
     lastProgressHookEvent = '';
@@ -410,17 +394,12 @@ async function processTranscript(agentId, logPrefix, transcriptPath, sessionId, 
     }
   }
 
-  // --- Phase 3: Split content events into turns by real user prompts ---
-  // Each real user prompt starts a new turn. Tool results stay attached to the
-  // preceding turn. This ensures each turn gets its own user input instead of
-  // inheriting the first prompt of the whole transcript segment.
+  // --- 阶段 3：按真实 user prompt 切分 turn ---
+  // 每个真实 prompt 开新 turn，tool result 留在前一 turn，避免所有 turn 继承首个 prompt。
   const allTurnSegments = splitContentEventsIntoTurns(contentEvents);
   const rangeReason = opts?.rangeReason || 'incremental';
-  // Cursor recovery always reads the full transcript to re-establish a safe
-  // checkpoint, but only the latest logical turn is new. QoderCN also rebuilds
-  // from line 0 on every completed Stop so its full ReAct chain is available;
-  // it must therefore emit only the latest logical turn even with a valid
-  // incremental cursor.
+  // 游标恢复和 Qoder CN 完整链重建都会从行 0 读取，但只有最后一个逻辑 turn 是新数据，
+  // 因此即使 offset 有效也只能输出最后 turn。
   const turnSegments = selectTurnSegmentsForCollection(allTurnSegments, rangeReason, agentId);
   const keepLatestTurnOnly = turnSegments.length < allTurnSegments.length;
   if (keepLatestTurnOnly && allTurnSegments.length > turnSegments.length) {
@@ -431,13 +410,13 @@ async function processTranscript(agentId, logPrefix, transcriptPath, sessionId, 
   }
   logDebug(agentId, `Split transcript segment into ${turnSegments.length} turn(s)`);
 
-  // --- Phase 4: Build events per turn ---
+  // --- 阶段 4：逐 turn 构造标准事件 ---
   const records = [];
   for (let turnIdx = 0; turnIdx < turnSegments.length; turnIdx++) {
     const turnContentEvents = turnSegments[turnIdx];
     const turnId = crypto.randomUUID();
 
-    // Determine LLM call boundaries within this turn.
+    // 使用本 turn 的 progress/content 计算 LLM 调用边界。
     const llmBoundaries = buildLlmBoundaries(progressEvents, turnContentEvents);
     logDebug(agentId, `Turn ${turnIdx + 1}: detected ${llmBoundaries.length} LLM call(s)`);
 
@@ -457,7 +436,7 @@ async function processTranscript(agentId, logPrefix, transcriptPath, sessionId, 
     record['agent.transcript.cursor_batch_id'] = cursorBatchId;
   }
 
-  // --- Phase 5: Write to history ---
+  // --- 阶段 5：追加 history，成功后推进 offset ---
   const rowsToAppend = records.map(r => JSON.stringify(r));
   const success = appendRowsToHistory(agentId, logPrefix, rowsToAppend);
   if (success) {
@@ -467,21 +446,18 @@ async function processTranscript(agentId, logPrefix, transcriptPath, sessionId, 
 }
 
 export function selectTurnSegmentsForCollection(turnSegments, rangeReason, agentId) {
-  // QoderCN intentionally reparses the complete transcript on every Stop to
-  // rebuild its ReAct chain. Other variants only do that during cursor
-  // recovery. In both cases, only the latest logical turn may be emitted.
+  // Qoder CN 每次 Stop 都有意重读完整文件，其他变体仅游标恢复时如此；两者都只输出最新 turn。
   if (rangeReason !== 'incremental' || agentId === 'qoder-cn') {
     return turnSegments.slice(-1);
   }
   return turnSegments;
 }
 
-// --- LLM Boundary Detection --------------------------------------------------
+// --- LLM 边界检测 ---------------------------------------------------------
 
 function buildLlmBoundaries(progressEvents, contentEvents) {
-  // Step 1: Group assistant blocks into LLM calls.
-  // Priority: use message.id (CLI variant has it) > progress window (IDE variant)
-  // > fallback to timestamp proximity when progress events are absent.
+  // 第一步：把 assistant block 分组为 LLM 调用。优先级为 message.id（CLI）> progress 窗口
+  //（IDE）> 无 progress 时按时间接近度回退。
   const assistantGroups = [];
   let currentGroup = [];
   let lastTs = null;
@@ -513,14 +489,14 @@ function buildLlmBoundaries(progressEvents, contentEvents) {
         ? progressWindowKey(progressEvents, ts)
         : null;
 
-    // Determine if this row starts a new LLM call
+    // 判断当前 assistant 行是否开启新的 LLM 调用。
     let isNewCall = false;
     if (currentGroup.length > 0 && key && currentKey) {
       isNewCall = key !== currentKey;
     } else if (currentGroup.length > 0 && !key && !currentKey) {
       isNewCall = lastTs !== null && (ts - lastTs) > 200;
     } else if (currentGroup.length > 0 && key !== currentKey) {
-      // Mixed keyed/unkeyed rows are unusual; keep the old time-gap fallback.
+      // 同时出现有/无 key 的行很少见，保留旧时间间隔回退。
       isNewCall = lastTs !== null && (ts - lastTs) > 200;
     }
 
@@ -532,14 +508,14 @@ function buildLlmBoundaries(progressEvents, contentEvents) {
   }
   flushGroup();
 
-  // Step 2: For each assistant group (= one LLM call), find timing from progress
+  // 第二步：为每个 assistant 组从 progress 中寻找开始/结束时间。
   const boundaries = [];
   for (let i = 0; i < assistantGroups.length; i++) {
     const group = assistantGroups[i];
     const groupStartMs = Date.parse(group[0].timestamp) || 0;
     const groupEndMs = Date.parse(group[group.length - 1].timestamp) || groupStartMs;
 
-    // Find start time: last PostToolUse or UserPromptSubmit BEFORE this group
+    // 开始时间取该组之前最近的 PostToolUse 或 UserPromptSubmit。
     let startTs = null;
     for (const pe of progressEvents) {
       const peMs = Date.parse(pe.ts) || 0;
@@ -549,7 +525,7 @@ function buildLlmBoundaries(progressEvents, contentEvents) {
       }
     }
 
-    // Find end time: first PreToolUse or Stop AFTER this group
+    // 结束时间取该组之后第一个 PreToolUse 或 Stop。
     let endTs = null;
     for (const pe of progressEvents) {
       const peMs = Date.parse(pe.ts) || 0;
@@ -579,9 +555,7 @@ function progressWindowKey(progressEvents, rowMs) {
     }
   }
 
-  // If no start boundary found, this row appears before any progress event.
-  // Return null to let the caller fall back to time-gap grouping, avoiding
-  // incorrect merging of distinct LLM calls that precede the first progress event.
+  // 找不到开始边界说明该行早于全部 progress；返回 null 改用时间间隔，避免错误合并多个调用。
   if (!startTs) return null;
 
   let endTs = null;
@@ -597,19 +571,19 @@ function progressWindowKey(progressEvents, rowMs) {
   return `progress:${startTs}->${endTs || ''}`;
 }
 
-// --- Event Builder -----------------------------------------------------------
+// --- 标准事件构造 ---------------------------------------------------------
 
 function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, turnId, sessionId, agentId, runtimeConfig, cwd) {
   const records = [];
   const observedTs = timestampToUnixNanos(Date.now());
 
-  // Find user prompt
+  // 找到本 turn 的真实用户 prompt。
   const userRow = contentEvents.find(r => r.type === 'user' && !isToolResult(r));
   const userId = resolveUserId(userRow || contentEvents[0], runtimeConfig);
   const agentType = inferVariant(userRow || contentEvents[0], agentId);
   const providerName = inferProviderName({ 'gen_ai.agent.type': agentType });
 
-  // User-hook event (ENTRY input)
+  // 用户 Hook 记录作为 ENTRY 输入，不属于具体 step。
   if (userRow) {
     const userText = extractUserText(userRow);
     if (userText) {
@@ -633,18 +607,17 @@ function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, turnId,
     }
   }
 
-  // If no progress boundaries detected, fall back to legacy behavior
+  // 没有任何 progress 边界时回退旧的逐行归一化。
   if (boundaries.length === 0) {
     const legacyRecords = buildLegacyEvents(contentEvents, turnId, sessionId, agentId, runtimeConfig, records, observedTs);
     return finalizeRecords(legacyRecords, cwd);
   }
 
-  // Assign content events to boundaries.
-  // Use extended ranges: each boundary "owns" content from its startTs up to the NEXT boundary's startTs.
-  // This ensures tool_result events (which occur between boundaries) are assigned to the preceding boundary.
+  // 每个边界拥有从自身 startTs 到下个边界 startTs 的内容，使夹在边界间的 tool_result
+  // 归属前一步而不会落入空隙。
   const assignedContent = assignContentToBoundaries(boundaries, contentEvents);
 
-  // For each LLM call boundary, produce events
+  // 为每个 LLM 调用边界输出 request/response/tool 记录。
   let toolResultsForNextStep = [];
   for (let i = 0; i < boundaries.length; i++) {
     const boundary = boundaries[i];
@@ -653,10 +626,10 @@ function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, turnId,
     const startNanos = isoToUnixNanos(boundary.startTs);
     const endNanos = boundary.endTs ? isoToUnixNanos(boundary.endTs) : startNanos;
 
-    // Pre-scan: extract model name from this step's assistant rows (CLI has message.model)
+    // 预扫描本 step assistant 行中的模型名；CLI 通常在 message.model 提供。
     const stepModel = content.find(r => r.type === 'assistant' && r.message?.model)?.message?.model || 'auto';
 
-    // llm.request for this step
+    // 构造本 step 的 llm.request。
     let inputDelta;
     if (i === 0 && userRow) {
       inputDelta = [{ role: 'user', parts: [{ type: 'text', content: extractUserText(userRow) }] }];
@@ -685,7 +658,7 @@ function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, turnId,
       });
     }
 
-    // Build merged llm.response (multi-parts)
+    // 构造合并多 part 的 llm.response。
     const outputParts = [];
     const toolCalls = [];
     toolResultsForNextStep = [];
@@ -704,7 +677,7 @@ function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, turnId,
           if (block.type === 'thinking') {
             outputParts.push({ type: 'reasoning', content: block.thinking || '' });
           } else if (block.type === 'redacted_thinking') {
-            // Redacted thinking blocks are skipped (content not available)
+            // thinking 已被脱敏且没有内容时跳过。
           } else if (block.type === 'text') {
             outputParts.push({ type: 'text', content: block.text || '' });
           } else if (block.type === 'tool_use') {
@@ -723,14 +696,13 @@ function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, turnId,
       }
     }
 
-    // When startTs == endTs (no distinguishable progress boundary), use assistant timestamp as end
+    // 无可区分 progress 导致起止相等时，用 assistant 时间作为结束。
     let responseEndNanos = endNanos;
     if (startNanos === endNanos && lastAssistantTs) {
       responseEndNanos = isoToUnixNanos(lastAssistantTs) || endNanos;
     }
 
-    // Determine finish reason from the last assistant row's stop_reason (authoritative),
-    // falling back to inference when not available.
+    // finish reason 优先取末条 assistant 的权威 stop_reason，缺失时再推断。
     const lastStopReason = [...content].reverse()
       .find(r => r.type === 'assistant' && r.message?.stop_reason)?.message?.stop_reason;
     let finishReason;
@@ -762,16 +734,15 @@ function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, turnId,
         'user.id': userId,
         'gen_ai.output.messages': [{ role: 'assistant', parts: outputParts, finish_reason: finishReason }],
         'agent.source': 'qoder-transcript-hook',
-        // Accurate per-response timestamp from the transcript's first assistant record
-        // (≈ SQLite gmt_create). Used only for token-enricher matching; dropped from
-        // SLS/JSONL output as an agent-scoped field. Absent for CLI (no firstAssistantTs).
+        // 首条 assistant 的精确响应时间仅供 token-enricher 匹配；作为 Agent 私有字段不会进入
+        // 最终 SLS/JSONL。CLI 没有 firstAssistantTs 时省略。
         'agent.qoder.match_ts': firstAssistantTs ? Date.parse(firstAssistantTs) : undefined,
         time_unix_nano: responseEndNanos,
         observed_time_unix_nano: observedTs,
       });
     }
 
-    // tool.call + tool.result events
+    // 构造配对的 tool.call 和 tool.result。
     for (let ti = 0; ti < toolCalls.length; ti++) {
       const tc = toolCalls[ti];
       const tr = toolResultsForNextStep[ti];
@@ -795,9 +766,9 @@ function buildEventsFromBoundaries(boundaries, contentEvents, allParsed, turnId,
       });
 
       if (tr) {
-        // Find PostToolUse timestamp for this tool
+        // 为该工具查找匹配的 PostToolUse 时间。
         const postToolTs = findPostToolUseTs(boundaries, i)
-          || (BigInt(toolCallTs) + 1_000_000n).toString(); // +1ms fallback → tool span duration ≥ 1ms
+          || (BigInt(toolCallTs) + 1_000_000n).toString(); // 回退为 +1ms，确保工具 span 时长至少 1ms。
         const toolDurationMs = computeDurationMs(toolCallTs, postToolTs);
         records.push({
           'event.id': crypto.randomUUID(),
@@ -832,21 +803,19 @@ function finalizeRecords(records, cwd) {
   return records;
 }
 
-// --- Content assignment to boundaries ----------------------------------------
+// --- 内容分配到边界 -------------------------------------------------------
 
 function assignContentToBoundaries(boundaries, contentEvents) {
   const assigned = boundaries.map(() => []);
 
   for (const row of contentEvents) {
-    // Skip the user prompt row (already handled as user-hook outside boundaries)
+    // 用户 prompt 已在边界外作为 user-hook 处理，此处跳过。
     if (row.type === 'user' && !isToolResult(row)) continue;
 
     const rowTs = row.timestamp ? Date.parse(row.timestamp) : 0;
     if (!rowTs) continue;
 
-    // Each boundary "owns" from its startTs to the NEXT boundary's startTs (exclusive).
-    // This ensures tool_result events (which occur between endTs and next startTs)
-    // are assigned to the current boundary, not lost in the gap.
+    // 区间右端不含下个 startTs，边界间的 tool_result 因而归当前 step，不会丢失。
     let bestIdx = -1;
     for (let i = 0; i < boundaries.length; i++) {
       const startMs = Date.parse(boundaries[i].startTs) || 0;
@@ -864,13 +833,11 @@ function assignContentToBoundaries(boundaries, contentEvents) {
   return assigned;
 }
 
-// --- Helpers -----------------------------------------------------------------
+// --- 辅助函数 -------------------------------------------------------------
 
 /**
- * Split a list of content events into turns.
- * Each real user prompt (type === 'user' and not a tool result) starts a new
- * turn. Tool results and assistant content following a prompt belong to that
- * turn until the next real user prompt.
+ * 把内容事件按真实 user prompt 切成 turn；tool result 不开启新 turn，后续工具结果和
+ * assistant 内容一直归属当前 turn，直到下一个真实 prompt。
  */
 function splitContentEventsIntoTurns(contentEvents) {
   const turns = [];
@@ -933,19 +900,18 @@ function resolveUserId(row, runtimeConfig) {
   return '';
 }
 
-// --- Legacy fallback (no progress events) ------------------------------------
-// Used when transcript has no progress events AND no assistant blocks detected.
-// Limitations: no llm.request synthesis (LLM spans will be 0ms orphan responses),
-// no multi-part merging. QoderTraceInput's token enricher provides tokens but timing is approximate.
+// --- 旧版回退（没有 progress） -------------------------------------------
+// transcript 同时没有 progress 和可分组 assistant 时使用。它不合成 llm.request、也不合并
+// 多 part，因此 LLM 可能成为 0ms 孤立 response；token 可由 enricher 补充，时间仍近似。
 
 function buildLegacyEvents(contentEvents, turnId, sessionId, agentId, runtimeConfig, existingRecords, observedTs) {
-  // When no progress events are available, use the old per-line normalization
+  // 无 progress 时使用旧的逐行归一化。
   for (const row of contentEvents) {
     const record = buildQoderHookRecord(row, { agentId, runtimeConfig, turnId });
     if (record) existingRecords.push(record);
   }
 
-  // Apply step.id with timestamp proximity (legacy logic)
+  // 旧逻辑按时间接近度分配 step.id。
   let stepCounter = 0;
   let lastResponseTs = null;
   for (const record of existingRecords) {
@@ -965,7 +931,7 @@ function buildLegacyEvents(contentEvents, turnId, sessionId, agentId, runtimeCon
   return existingRecords;
 }
 
-// --- Entry point -------------------------------------------------------------
+// --- 脚本入口 -------------------------------------------------------------
 
 function isDirectExec() {
   const argv1 = process.argv[1];
@@ -987,6 +953,6 @@ if (isDirectExec()) {
       fs.mkdirSync(path.dirname(file), { recursive: true });
       const ts = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
       fs.appendFileSync(file, `[${ts}] ${e.message}\n`, 'utf-8');
-    } catch { /* ignore */ }
+    } catch { /* 忽略兜底日志写入失败。 */ }
   });
 }

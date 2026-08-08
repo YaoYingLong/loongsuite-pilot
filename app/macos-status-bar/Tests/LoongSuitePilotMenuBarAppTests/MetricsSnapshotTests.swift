@@ -1,9 +1,13 @@
 import XCTest
 @testable import LoongSuitePilotMenuBarApp
 
+// 本文件验证指标摘要解码、默认值、范围标题和进度条安全边界。
+// 用例直接构造与 `metrics-summary.json` 相同的 JSON fixture，不启动定时器或访问真实用户数据目录。
+
+/// `PilotMetricsSnapshot` 及其 JSON 转换的回归测试集合。
 final class MetricsSnapshotTests: XCTestCase {
 
-    // MARK: - Snapshot computed properties
+    // MARK: - 快照计算属性
 
     func testFormattedTotalTokens() {
         var snapshot = PilotMetricsSnapshot.makeEmpty(range: .today)
@@ -39,14 +43,14 @@ final class MetricsSnapshotTests: XCTestCase {
         XCTAssertTrue(snapshot.modelShares.isEmpty)
     }
 
-    // MARK: - AgentStatusItem
+    // MARK: - Agent 状态条目
 
     func testAgentStatusItem_formattedTokens() {
         let item = AgentStatusItem(agentType: "claude-code", events: 415, tokens: 6_200_000, sessions: 3, share: 0.4)
         XCTAssertEqual(item.formattedTokens, "6.2M")
     }
 
-    // MARK: - ProviderShareItem
+    // MARK: - Provider 占比条目
 
     func testProviderShareItem_formattedShare() {
         let item = ProviderShareItem(provider: "anthropic", tokens: 6_200_000, share: 0.73)
@@ -54,7 +58,7 @@ final class MetricsSnapshotTests: XCTestCase {
         XCTAssertEqual(item.formattedTokens, "6.2M")
     }
 
-    // MARK: - ModelShareItem
+    // MARK: - 模型占比条目
 
     func testModelShareItem_formattedShare() {
         let item = ModelShareItem(model: "claude-opus-4-7", tokens: 7_300_000, share: 0.73)
@@ -69,7 +73,7 @@ final class MetricsSnapshotTests: XCTestCase {
         XCTAssertEqual(item.formattedTokens, "850")
     }
 
-    // MARK: - buildSnapshot decodes modelShares
+    // MARK: - buildSnapshot 解码模型占比
 
     @MainActor
     func testBuildSnapshot_decodesModelSharesInOrder() throws {
@@ -146,7 +150,7 @@ final class MetricsSnapshotTests: XCTestCase {
         XCTAssertTrue(store.snapshot.modelShares.isEmpty)
     }
 
-    // MARK: - MetricsAggregationRange
+    // MARK: - 指标聚合范围
 
     func testRangePickerTitles() {
         XCTAssertEqual(MetricsAggregationRange.today.pickerTitle, "今日")
@@ -160,7 +164,7 @@ final class MetricsSnapshotTests: XCTestCase {
         XCTAssertEqual(MetricsAggregationRange.thirtyDays.trendRange, .thirtyDays)
     }
 
-    // MARK: - #3 ModelShareItem share extremes / progress bar width safety
+    // MARK: - #3 模型占比极值与进度条宽度安全
     // 对应 PanelContentView.swift modelsSection: `max(4, geo.size.width * item.share)`
     // 安全契约: 进度条宽度必须是有限值，回落到最小 4 或被 clamp 到 totalWidth，避免 SwiftUI 因 NaN/越界宽度崩溃。
 
@@ -199,7 +203,7 @@ final class MetricsSnapshotTests: XCTestCase {
         XCTAssertTrue(width.isFinite, "share=NaN 时宽度必须有限，实际宽度=\(width)")
     }
 
-    // MARK: - #4 metrics-summary.json 字段为 null 的逐项缺失
+    // MARK: - #4 metrics-summary.json 字段逐项为 null
 
     @MainActor
     func testBuildSnapshot_modelShareEntry_nullModel_fallsBackToUnknown() throws {
@@ -342,7 +346,7 @@ final class MetricsSnapshotTests: XCTestCase {
         XCTAssertEqual(store.snapshot.modelShares[0].share, 0)
     }
 
-    // MARK: - #5 整个 metrics-summary.json 是 malformed JSON
+    // MARK: - #5 整个 metrics-summary.json 为畸形 JSON
 
     @MainActor
     func testBuildSnapshot_malformedJSON_returnsEmptySnapshotWithError() throws {
@@ -370,7 +374,7 @@ final class MetricsSnapshotTests: XCTestCase {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { expectation.fulfill() }
         wait(for: [expectation], timeout: 2.0)
 
-        // 安全契约: malformed → loadFile 返回 nil → buildSnapshot 走 empty + errorMessage 分支，不 crash
+        // 安全契约：畸形内容 → loadFile 返回 nil → buildSnapshot 走空快照 + errorMessage 分支，不会崩溃。
         XCTAssertEqual(store.snapshot.totalTokens, 0, "malformed JSON 应回落到 0 token 的空 snapshot")
         XCTAssertTrue(store.snapshot.modelShares.isEmpty, "malformed JSON 不应残留任何 modelShares")
         XCTAssertTrue(store.snapshot.agentStats.isEmpty)

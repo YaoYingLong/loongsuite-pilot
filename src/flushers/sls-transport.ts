@@ -1,3 +1,10 @@
+/**
+ * 可复用的 SLS WebTracking 传输函数。
+ *
+ * 文件/Qoder API 独立管道与其他调用方可直接使用这里，而不依赖主 SlsFlusher 的队列。模块
+ * 负责按条数/估算字节拆批、HTTP 超时、指数退避和失败元数据持久化，不负责事件归一化。
+ */
+
 import { createLogger } from '../utils/logger.js';
 import {
   SlsFailureLogWriter,
@@ -6,20 +13,24 @@ import {
 
 const logger = createLogger('SlsTransport');
 
+/** WebTracking 单请求的默认超时和服务端限制保护值。 */
 export const WEBTRACKING_TIMEOUT_MS = 10_000;
 export const WEBTRACKING_MAX_BODY_BYTES = 2_800_000;
 export const WEBTRACKING_MAX_LOGS = 4096;
 export const RETRY_MAX_ATTEMPTS = 3;
 export const RETRY_BASE_DELAY_MS = 1000;
 
+/** 明确允许重试的 HTTP 状态；4xx 参数/鉴权错误通常立即失败。 */
 export const RETRYABLE_STATUS_CODES = new Set([408, 429, 500, 502, 503, 504]);
 
+/** 保留 HTTP status 的错误类型，供重试分类和告警判断。 */
 export class HttpError extends Error {
   constructor(readonly status: number, body: string) {
     super(`${status} ${body}`);
   }
 }
 
+/** 单个 WebTracking 目标和重试参数。 */
 export interface SlsTransportConfig {
   endpoint: string;
   project: string;
@@ -29,6 +40,7 @@ export interface SlsTransportConfig {
   retryBaseDelayMs?: number;
 }
 
+/** 构造 WebTracking body/header 的可选元数据。 */
 export interface PostWebtrackingOptions {
   topic?: string;
   source?: string;
@@ -38,8 +50,13 @@ export interface PostWebtrackingOptions {
 
 export type PersistFailedLogContext = Omit<SlsFailureLogInput, 'endpoint' | 'error'>;
 
+/** 失败目录到 writer 的进程级缓存，避免每次失败重建串行写链。 */
 const failedLogWriters = new Map<string, SlsFailureLogWriter>();
 
+/**
+ * 按最大条数和估算 JSON 字节数顺序切分日志。
+ * 单条超大日志不会在字段内部拆开，而是形成独立 chunk 交由服务端决定。
+ */
 export function splitForWebtracking(
   logs: Record<string, string>[],
   maxLogs = WEBTRACKING_MAX_LOGS,
@@ -50,6 +67,7 @@ export function splitForWebtracking(
   let currentSize = 0;
 
   for (const log of logs) {
+    // Buffer.byteLength 默认 UTF-8，能正确计算中文等多字节内容。
     const logSize = Buffer.byteLength(JSON.stringify(log));
 
     if (
@@ -71,6 +89,7 @@ export function splitForWebtracking(
   return chunks;
 }
 
+/** 判断网络异常、服务忙或限流错误是否值得重试。 */
 export function isRetryable(err: unknown): boolean {
   if (err instanceof HttpError) return RETRYABLE_STATUS_CODES.has(err.status);
   const msg = String(err);
@@ -86,6 +105,7 @@ export function isRetryable(err: unknown): boolean {
   );
 }
 
+/** 拆分后按顺序逐批发送；任一 chunk 最终失败会 reject 并停止后续 chunk。 */
 export async function postWebtracking(
   config: SlsTransportConfig,
   logs: Record<string, string>[],
@@ -97,6 +117,7 @@ export async function postWebtracking(
   }
 }
 
+/** 构造并发送一个 WebTracking 请求，最多按指数退避重试配置次数。 */
 async function postWebtrackingChunk(
   config: SlsTransportConfig,
   logs: Record<string, string>[],
@@ -110,6 +131,7 @@ async function postWebtrackingChunk(
   };
 
   const raw = JSON.stringify(body);
+  // SLS WebTracking 域名要求 project 作为 endpoint 的子域前缀。
   const base = config.endpoint.replace(
     /^(https?:\/\/)/,
     `$1${config.project}.`,
@@ -136,6 +158,7 @@ async function postWebtrackingChunk(
       });
 
       if (!resp.ok) {
+        // 读取响应正文帮助诊断，但失败日志后续会做截断与凭据清理。
         const text = await resp.text();
         const err = new HttpError(resp.status, text);
         if (
@@ -172,6 +195,9 @@ async function postWebtrackingChunk(
   throw lastErr;
 }
 
+/**
+ * 将不可恢复失败写成不含 payload/headers 的有界诊断元数据。
+ */
 export async function persistFailedLogs(
   failedLogDir: string,
   name: string,
@@ -180,6 +206,7 @@ export async function persistFailedLogs(
 ): Promise<void> {
   let writer = failedLogWriters.get(failedLogDir);
   if (!writer) {
+    // 同一目录复用 writer 的 Promise 链，保证并发失败顺序写入。
     writer = new SlsFailureLogWriter(failedLogDir);
     failedLogWriters.set(failedLogDir, writer);
   }
@@ -190,6 +217,7 @@ export async function persistFailedLogs(
   });
 }
 
+/** Promise 化定时等待，不阻塞 Node.js 事件循环。 */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -1,4 +1,10 @@
 #!/usr/bin/env node
+
+// 规范化事件字段覆盖率诊断命令。它从默认 JSONL 输出目录或命令行指定 Agent/日期选择文件，
+// 统计各事件类型关键字段的填充率，与阈值比较后输出文本或 JSON 报告。
+// 本脚本同步读取本地文件，不修改采集状态；输入/参数错误或覆盖率不达标会通过非零退出码告知 CI。
+// `import`/`export` 属于项目 ESM 模式，Node.js 解析异步 API 时仍由 `main()` 顶层统一捕获错误。
+
 import { readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -57,6 +63,10 @@ const FIELD_SPECS = {
   },
 };
 
+/**
+ * 解析 Agent 列表、日期、阈值、格式和输出路径；非法用法以退出码 2 结束。
+ * @returns {{agents:string[],date:string,threshold:number,format:string,output?:string}}
+ */
 function parseCli() {
   const { values } = parseArgs({
     options: {
@@ -87,12 +97,22 @@ function parseCli() {
   };
 }
 
+/**
+ * 判断规范化字段是否真正有值；`undefined`、`null`、空串和字面量 `"null"` 均视为缺失。
+ * @returns {boolean}
+ */
 function isFilled(value) {
   if (value === undefined || value === null) return false;
   const s = String(value);
   return s !== '' && s !== 'null';
 }
 
+/**
+ * 把 Agent+日期转换为 JSONL 路径，并为缺失目标列出最多三个可用文件。
+ * @param {string[]} agents CLI Agent 名称。
+ * @param {string} date `YYYY-MM-DD`。
+ * @returns {{agent:string,filepath:string,filename:string}[]} 至少一个可读文件，否则退出码 2。
+ */
 function resolveFiles(agents, date) {
   const resolved = [];
   for (const agent of agents) {
@@ -117,6 +137,7 @@ function resolveFiles(agents, date) {
   return resolved;
 }
 
+/** 同步地汇总 collectStats 的输入记录，返回供报告或 Dashboard 使用的统计结构。 */
 function collectStats(files) {
   // stats[eventName][agentType] = { total, filled: { fieldKey: count } }
   const stats = {};
@@ -150,6 +171,12 @@ function collectStats(files) {
   return stats;
 }
 
+/**
+ * 把计数换算为一位小数百分比，标记是否达到阈值并按样本数排序。
+ * @param {object} stats `collectStats` 结果。
+ * @param {number} threshold 通过百分比阈值。
+ * @returns {{threshold:number,tables:object[]}}
+ */
 function buildReport(stats, threshold) {
   const report = { threshold, tables: [] };
   for (const [eventName, spec] of Object.entries(FIELD_SPECS)) {
@@ -170,6 +197,9 @@ function buildReport(stats, threshold) {
   return report;
 }
 
+/**
+ * 渲染中文终端表格并收集未达标字段，返回的 failures 供 main 决定退出码。
+ */
 function formatText(report) {
   const lines = [];
   const failures = [];
@@ -228,6 +258,7 @@ function formatText(report) {
   return lines.join('\n');
 }
 
+/** 作为 field-coverage.mjs 的命令入口，编排参数、I/O 和退出码；顶层错误由文件末尾统一处理。 */
 function main() {
   const opts = parseCli();
   console.error(`[field-coverage] agents: ${opts.agents.join(', ')} | date: ${opts.date} | threshold: ${opts.threshold}%`);

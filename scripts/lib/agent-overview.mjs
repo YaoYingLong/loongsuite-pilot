@@ -1,3 +1,10 @@
+// 本文件是本地 Dashboard 的聚合数据层。HTTP 服务通过 `createOverviewAggregator()` 创建一个长期实例，
+// 它增量读取 Collector 服务日志、规范化 JSONL 输出和失败上传目录，合并为服务、Agent、采集方式、
+// 上报健康、时间线与 token 使用概览，并把缓存原子写入数据目录以减少大文件重复扫描。
+//
+// 模块只读取 Pilot 本地文件，不连接 Agent 或远端后端。大部分 I/O 使用 Promise；文件轮转、截断、
+// 半写 JSON 和权限失败会被降级为空/部分结果并记录诊断，避免 Dashboard 请求拖垮 Collector。
+
 import { constants as fsConstants, createReadStream } from 'node:fs';
 import {
   access,
@@ -82,6 +89,7 @@ const METHOD_LABELS = {
   'codex-log': 'Codex logs',
 };
 
+/** 把 Date 转换为本地 YYYY-MM-DD，供每日 JSONL 文件筛选使用。 */
 export function localDateString(date = new Date()) {
   return [
     date.getFullYear(),
@@ -90,6 +98,7 @@ export function localDateString(date = new Date()) {
   ].join('-');
 }
 
+/** 把 attributes 对象或 JSON 字符串规范化为普通对象，非法值返回空对象。 */
 export function parseAttributes(value) {
   if (!value) return {};
   if (typeof value === 'object' && !Array.isArray(value)) return value;
@@ -102,6 +111,7 @@ export function parseAttributes(value) {
   }
 }
 
+/** 根据 Input ID 判断采集方式，供 Dashboard 合并同类监听器状态。 */
 export function classifyMethod(inputId) {
   switch (inputId) {
     case 'cursor-hook':
@@ -123,6 +133,7 @@ export function classifyMethod(inputId) {
   }
 }
 
+/** 从规范化事件识别 Agent、采集方式、token、会话和仓库维度。 */
 export function classifyRecord(record) {
   const attributes = parseAttributes(record.attributes);
   const agentType = stringValue(record['gen_ai.agent.type'] ?? record['agent.type']).toLowerCase();
@@ -148,6 +159,7 @@ export function classifyRecord(record) {
   return 'unknown';
 }
 
+/** 创建带内存缓存和串行刷新 Promise 的聚合器，HTTP 服务在进程生命周期内复用它。 */
 export function createOverviewAggregator(options = {}) {
   const dataDir = options.dataDir || path.join(homedir(), '.loongsuite-pilot');
   const cacheTtlMs = options.cacheTtlMs ?? DEFAULT_CACHE_TTL_MS;
@@ -221,6 +233,7 @@ export function createOverviewAggregator(options = {}) {
   return { getOverview, getAgent };
 }
 
+/** 并行读取配置、版本、服务日志、JSONL 和失败上传记录，再组装一次 Dashboard 总览。 */
 async function buildOverview(opts) {
   const config = await readConfig(opts.dataDir);
   const version = await readVersion(opts.dataDir);
@@ -288,6 +301,7 @@ async function buildOverview(opts) {
   };
 }
 
+/** 读取并容错解析 readConfig 所需的本地状态，不把非关键 I/O 错误传播给 Dashboard。 */
 async function readConfig(dataDir) {
   const configPath = path.join(dataDir, 'config.json');
   const raw = await safeReadFile(configPath, 'utf8');
@@ -299,6 +313,7 @@ async function readConfig(dataDir) {
   }
 }
 
+/** 读取并容错解析 readVersion 所需的本地状态，不把非关键 I/O 错误传播给 Dashboard。 */
 async function readVersion(dataDir) {
   const current = (await safeReadFile(path.join(dataDir, 'current'), 'utf8'))?.trim();
   const candidates = [
@@ -325,6 +340,7 @@ async function readVersion(dataDir) {
   return { version: 'unknown' };
 }
 
+/** 组合已聚合数据生成 buildServiceSummary 对应的 Dashboard 视图模型，不直接写源日志。 */
 async function buildServiceSummary(dataDir, version, now) {
   const pidFile = path.join(dataDir, 'loongsuite-pilot.pid');
   const pidRaw = (await safeReadFile(pidFile, 'utf8'))?.trim();
@@ -345,6 +361,7 @@ async function buildServiceSummary(dataDir, version, now) {
   };
 }
 
+/** 实现 Dashboard 聚合流程中的 processIsRunning 辅助计算；不产生网络请求。 */
 function processIsRunning(pid) {
   try {
     process.kill(pid, 0);
@@ -354,6 +371,7 @@ function processIsRunning(pid) {
   }
 }
 
+/** 解析 parseServiceLog 的输入并在格式无效时返回可跳过的空值。 */
 async function parseServiceLog(filePath, options) {
   const text = await readTail(filePath, options.maxBytes);
   const events = [];
@@ -445,6 +463,7 @@ async function parseServiceLog(filePath, options) {
   };
 }
 
+/** 解析 parseLogLine 的输入并在格式无效时返回可跳过的空值。 */
 function parseLogLine(line) {
   const match = line.match(/^\[([^\]]+)] \[([^\]]+)] \[([^\]]+)] ([^{]*?)(?: (\{.*\}))?$/);
   if (!match) return null;
@@ -466,6 +485,7 @@ function parseLogLine(line) {
   };
 }
 
+/** 枚举规范化 JSONL，并结合 offset/mtime 缓存做全量或增量汇总。 */
 async function aggregateOutputFiles(outputDir, options) {
   const result = {
     files: [],
@@ -520,6 +540,7 @@ async function aggregateOutputFiles(outputDir, options) {
   return result;
 }
 
+/** 从缓存 offset 读取单个 JSONL 新增块，处理截断和轮转后更新摘要。 */
 async function summarizeJsonlFile(filePath, options) {
   const fileStat = await safeStat(filePath);
   if (!fileStat) {
@@ -562,6 +583,7 @@ async function summarizeJsonlFile(filePath, options) {
   return cloneSummary(entry.summary);
 }
 
+/** 把 applyOutputLines 的源数据累加到目标摘要，并更新最近活动时间。 */
 function applyOutputLines(summary, lines, cachedOutputEventsPerFile) {
   for (const line of lines) {
     let record;
@@ -574,6 +596,7 @@ function applyOutputLines(summary, lines, cachedOutputEventsPerFile) {
   }
 }
 
+/** 把一条规范化事件累加到 Agent、方法、token、会话、仓库和时间维度。 */
 function applyOutputRecord(summary, record, cachedOutputEventsPerFile) {
   const agentId = classifyRecord(record);
   if (agentId === 'unknown') return;
@@ -608,10 +631,12 @@ function applyOutputRecord(summary, record, cachedOutputEventsPerFile) {
   }
 }
 
+/** 实现 Dashboard 聚合流程中的 trimCachedOutputEvents 辅助计算；不产生网络请求。 */
 function trimCachedOutputEvents(summary, limit) {
   summary.events = summary.events.slice(-Math.max(0, limit));
 }
 
+/** 实现 Dashboard 聚合流程中的 logPartialIndexProgress 辅助计算；不产生网络请求。 */
 function logPartialIndexProgress(fileSummary) {
   if (!fileSummary || !fileSummary.file) return;
   const filePath = fileSummary.file.path;
@@ -644,6 +669,7 @@ function logPartialIndexProgress(fileSummary) {
   }
 }
 
+/** 创建 newOutputCacheEntry 使用的零值结构，保证缓存 Schema 字段完整。 */
 function newOutputCacheEntry(filePath, date, fileStat) {
   const summary = emptyFileSummary(filePath);
   return {
@@ -661,6 +687,7 @@ function newOutputCacheEntry(filePath, date, fileStat) {
   };
 }
 
+/** 实现 Dashboard 聚合流程中的 validOutputCacheEntry 辅助计算；不产生网络请求。 */
 function validOutputCacheEntry(entry, filePath, fileStat) {
   if (!entry || entry.version !== OVERVIEW_CACHE_VERSION || entry.path !== filePath) return null;
   if (!Number.isFinite(entry.indexedThroughOffset) || entry.indexedThroughOffset < 0) return null;
@@ -680,6 +707,7 @@ function validOutputCacheEntry(entry, filePath, fileStat) {
   return entry;
 }
 
+/** 实现 Dashboard 聚合流程中的 fileMetadata 辅助计算；不产生网络请求。 */
 function fileMetadata(filePath, fileStat, indexedThroughOffset, indexing) {
   return {
     path: filePath,
@@ -691,16 +719,19 @@ function fileMetadata(filePath, fileStat, indexedThroughOffset, indexing) {
   };
 }
 
+/** 实现 Dashboard 聚合流程中的 cloneSummary 辅助计算；不产生网络请求。 */
 function cloneSummary(summary) {
   return JSON.parse(JSON.stringify(summary));
 }
 
+/** 实现 Dashboard 聚合流程中的 pruneOverviewCache 辅助计算；不产生网络请求。 */
 function pruneOverviewCache(cache, activeFileKeys, date) {
   for (const [filePath, entry] of Object.entries(cache.files)) {
     if (entry?.date !== date || !activeFileKeys.has(filePath)) delete cache.files[filePath];
   }
 }
 
+/** 创建 emptyFileSummary 使用的零值结构，保证缓存 Schema 字段完整。 */
 function emptyFileSummary(filePath) {
   return {
     file: {
@@ -719,6 +750,7 @@ function emptyFileSummary(filePath) {
   };
 }
 
+/** 汇总失败持久化目录，为各上报通道生成失败计数和最近错误。 */
 async function aggregateFailedUploads(failedDir, options) {
   const entries = await safeReaddir(failedDir);
   const files = entries
@@ -763,6 +795,7 @@ async function aggregateFailedUploads(failedDir, options) {
   return { total, events };
 }
 
+/** 组合已聚合数据生成 buildMethodStates 对应的 Dashboard 视图模型，不直接写源日志。 */
 function buildMethodStates(serviceLog, output, now) {
   const states = { ...serviceLog.methodStates };
   for (const agent of AGENTS) {
@@ -786,6 +819,7 @@ function buildMethodStates(serviceLog, output, now) {
   return states;
 }
 
+/** 组合已聚合数据生成 buildAgentSummaries 对应的 Dashboard 视图模型，不直接写源日志。 */
 function buildAgentSummaries({ methodStates, output, service, now }) {
   return AGENTS.map((agent) => {
     const outputSummary = output.byAgent[agent.id] || emptyAgentOutput();
@@ -828,6 +862,7 @@ function buildAgentSummaries({ methodStates, output, service, now }) {
   });
 }
 
+/** 结合配置开关、成功输出和失败记录判断各上报通道健康度。 */
 function buildReportingSummary(config, output, failures) {
   const sls = config.sls || {};
   const http = config.http || {};
@@ -874,6 +909,7 @@ function buildReportingSummary(config, output, failures) {
   };
 }
 
+/** 兼容旧配置并规范化 resolveSlsEnabled 的返回值，供状态计算使用。 */
 function resolveSlsEnabled(config) {
   const sls = config.sls || {};
   if (sls.enabled !== undefined) return Boolean(sls.enabled);
@@ -907,10 +943,12 @@ function resolveSlsEnabled(config) {
   return Boolean(accessKeyId && accessKeySecret && endpoint && hasEndpoint);
 }
 
+/** 兼容旧配置并规范化 normalizeSlsMode 的返回值，供状态计算使用。 */
 function normalizeSlsMode(mode) {
   return mode === 'ak' ? 'ak' : 'webtracking';
 }
 
+/** 组合已聚合数据生成 buildTimeline 对应的 Dashboard 视图模型，不直接写源日志。 */
 function buildTimeline({ serviceLog, output, failures, limit }) {
   const outputEvents = output.events
     .slice(-limit)
@@ -930,6 +968,7 @@ function buildTimeline({ serviceLog, output, failures, limit }) {
     .reverse();
 }
 
+/** 取得或创建 ensureMethod 对应的零值统计桶，供后续原地累加。 */
 function ensureMethod(states, methodId) {
   if (!states[methodId]) {
     states[methodId] = {
@@ -947,11 +986,13 @@ function ensureMethod(states, methodId) {
   return states[methodId];
 }
 
+/** 取得或创建 ensureAgentOutput 对应的零值统计桶，供后续原地累加。 */
 function ensureAgentOutput(byAgent, agentId) {
   if (!byAgent[agentId]) byAgent[agentId] = emptyAgentOutput();
   return byAgent[agentId];
 }
 
+/** 创建 emptyAgentOutput 使用的零值结构，保证缓存 Schema 字段完整。 */
 function emptyAgentOutput() {
   return {
     total: 0,
@@ -962,6 +1003,7 @@ function emptyAgentOutput() {
   };
 }
 
+/** 把 mergeAgentOutput 的源数据累加到目标摘要，并更新最近活动时间。 */
 function mergeAgentOutput(target, source) {
   target.total += source.total;
   target.tokens += source.tokens;
@@ -977,6 +1019,7 @@ function mergeAgentOutput(target, source) {
   }
 }
 
+/** 取得或创建 ensureMethodOutput 对应的零值统计桶，供后续原地累加。 */
 function ensureMethodOutput(methods, methodId) {
   if (!methods[methodId]) {
     methods[methodId] = { count: 0, tokens: 0, lastActivityAt: null };
@@ -984,6 +1027,7 @@ function ensureMethodOutput(methods, methodId) {
   return methods[methodId];
 }
 
+/** 实现 Dashboard 聚合流程中的 methodStatus 辅助计算；不产生网络请求。 */
 function methodStatus(method, now) {
   if (method.outputToday > 0 || method.dispatchedToday > 0) {
     if (method.lastSeenAt && now.getTime() - new Date(method.lastSeenAt).getTime() > STALE_AFTER_MS) {
@@ -994,6 +1038,7 @@ function methodStatus(method, now) {
   return 'not_detected';
 }
 
+/** 实现 Dashboard 聚合流程中的 agentStatus 辅助计算；不产生网络请求。 */
 function agentStatus(outputSummary, lastActivityAt, now) {
   if (outputSummary.total > 0) {
     if (lastActivityAt && now.getTime() - new Date(lastActivityAt).getTime() > STALE_AFTER_MS) return 'no_recent_activity';
@@ -1002,6 +1047,7 @@ function agentStatus(outputSummary, lastActivityAt, now) {
   return 'not_detected';
 }
 
+/** 实现 Dashboard 聚合流程中的 activityEvent 辅助计算；不产生网络请求。 */
 function activityEvent(event) {
   return {
     timestamp: event.timestamp,
@@ -1016,10 +1062,12 @@ function activityEvent(event) {
   };
 }
 
+/** 实现 Dashboard 聚合流程中的 agentLabel 辅助计算；不产生网络请求。 */
 function agentLabel(agentId) {
   return AGENT_BY_ID.get(agentId)?.label || agentId || 'LoongSuite Pilot';
 }
 
+/** 实现 Dashboard 聚合流程中的 recordTime 辅助计算；不产生网络请求。 */
 function recordTime(record) {
   const rawNano = stringValue(record.time_unix_nano || record.observed_time_unix_nano);
   if (/^\d+$/.test(rawNano)) {
@@ -1035,6 +1083,7 @@ function recordTime(record) {
   return null;
 }
 
+/** 读取并容错解析 readTail 所需的本地状态，不把非关键 I/O 错误传播给 Dashboard。 */
 async function readTail(filePath, maxBytes) {
   const fileStat = await safeStat(filePath);
   if (!fileStat || fileStat.size === 0) return '';
@@ -1053,6 +1102,7 @@ async function readTail(filePath, maxBytes) {
   }
 }
 
+/** 从指定 offset 读取有限大小 JSONL 块，只返回最后完整换行前的数据。 */
 async function readJsonlChunk(filePath, options) {
   const remaining = Math.max(0, options.fileSize - options.start);
   if (remaining === 0) return { lines: [], nextOffset: options.start };
@@ -1086,6 +1136,7 @@ async function readJsonlChunk(filePath, options) {
   }
 }
 
+/** 读取并容错解析 loadOverviewCache 所需的本地状态，不把非关键 I/O 错误传播给 Dashboard。 */
 async function loadOverviewCache(cachePath) {
   const raw = await safeReadFile(cachePath, 'utf8');
   if (!raw) return emptyOverviewCache();
@@ -1103,6 +1154,7 @@ async function loadOverviewCache(cachePath) {
   }
 }
 
+/** 创建 emptyOverviewCache 使用的零值结构，保证缓存 Schema 字段完整。 */
 function emptyOverviewCache() {
   return {
     version: OVERVIEW_CACHE_VERSION,
@@ -1110,6 +1162,7 @@ function emptyOverviewCache() {
   };
 }
 
+/** 先写同目录临时文件再 rename，原子持久化聚合缓存。 */
 async function saveOverviewCache(cachePath, cache) {
   try {
     await mkdir(path.dirname(cachePath), { recursive: true });
@@ -1119,6 +1172,7 @@ async function saveOverviewCache(cachePath, cache) {
   } catch {}
 }
 
+/** 以 fail-open 语义执行 safeReadFile；文件轮转、缺失或权限错误时返回空值。 */
 async function safeReadFile(filePath, encoding) {
   try {
     return await readFile(filePath, encoding);
@@ -1127,6 +1181,7 @@ async function safeReadFile(filePath, encoding) {
   }
 }
 
+/** 以 fail-open 语义执行 safeStat；文件轮转、缺失或权限错误时返回空值。 */
 async function safeStat(filePath) {
   try {
     return await stat(filePath);
@@ -1135,6 +1190,7 @@ async function safeStat(filePath) {
   }
 }
 
+/** 以 fail-open 语义执行 safeReaddir；文件轮转、缺失或权限错误时返回空值。 */
 async function safeReaddir(dirPath) {
   try {
     return await readdir(dirPath, { withFileTypes: true });
@@ -1143,25 +1199,30 @@ async function safeReaddir(dirPath) {
   }
 }
 
+/** 实现 Dashboard 聚合流程中的 stringValue 辅助计算；不产生网络请求。 */
 function stringValue(value) {
   return typeof value === 'string' ? value : '';
 }
 
+/** 实现 Dashboard 聚合流程中的 numberValue 辅助计算；不产生网络请求。 */
 function numberValue(value) {
   const number = Number(value);
   return Number.isFinite(number) ? number : 0;
 }
 
+/** 实现 Dashboard 聚合流程中的 maxIso 辅助计算；不产生网络请求。 */
 function maxIso(left, right) {
   if (!left) return right || null;
   if (!right) return left;
   return new Date(left).getTime() >= new Date(right).getTime() ? left : right;
 }
 
+/** 实现 Dashboard 聚合流程中的 latestIso 辅助计算；不产生网络请求。 */
 function latestIso(values) {
   return values.filter(Boolean).reduce((latest, value) => maxIso(latest, value), null);
 }
 
+/** 异步检查路径可访问性，任何 fs 错误均返回 false。 */
 export async function pathExists(filePath) {
   try {
     await access(filePath, fsConstants.F_OK);
@@ -1171,6 +1232,7 @@ export async function pathExists(filePath) {
   }
 }
 
+/** 创建文件 ReadStream，供 HTTP 层流式发送大文件。 */
 export function streamFile(filePath) {
   return createReadStream(filePath);
 }

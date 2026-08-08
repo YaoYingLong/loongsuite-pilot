@@ -67,11 +67,10 @@ const RESOURCE_BASE_FIELD_PATCH = agentBaseFieldPatch(RESOURCE_ATTRIBUTES);
 const RESOURCE_ATTRIBUTE_FIELDS = Object.keys(RESOURCE_ATTRIBUTES).length > 0
   ? { resourceAttributes: RESOURCE_ATTRIBUTES }
   : {};
-// Caller-supplied span attributes (e.g. multica.*) stamped as top-level record
-// fields so the trace flusher can pass matching keys through to span attributes.
+// 调用方提供的 span 属性（如 multica.*）铺到记录顶层，供 trace flusher 透传。
 const SPAN_ATTRIBUTES = parseSpanAttributesFromEnv(process.env, { agentId: AGENT_ID });
 
-// ─── utilities ───
+// ─── 通用工具 ───
 
 function nowSec() {
   return Date.now() / 1000;
@@ -85,19 +84,18 @@ function defaultLogDir() {
   return path.join(pilotDataDir(), 'logs', AGENT_ID);
 }
 
-// ─── intercept (BUN_OPTIONS preload) data integration ───
+// ─── 合并 BUN_OPTIONS preload 截获数据 ───
 
-const INTERCEPT_STALE_MS = 60 * 60 * 1000; // 1 hour
+const INTERCEPT_STALE_MS = 60 * 60 * 1000; // 截获文件超过 1 小时即视为过期。
 
 function interceptSessionDir(sessionId) {
   return path.join(pilotDataDir(), 'intercept', AGENT_ID, sessionId);
 }
 
 /**
- * Read per-LLM-call intercept records dropped by claude-code-fetch-intercept.mjs.
- * Returns Map<response_id, { ttft_ns, system_instructions, _file }>.
- * Tracks `_file` so reapInterceptFiles can delete merged records after
- * buildTurnRecords consumes them.
+ * 读取 fetch preload 为每次 LLM 调用落下的截获记录。
+ * @param {string} sessionId 当前 Claude 会话 ID。
+ * @returns {Map<string, object>} 以 response_id 为键；额外保存 `_file` 供成功合并后删除。
  */
 function loadInterceptForSession(sessionId) {
   const out = new Map();
@@ -111,8 +109,7 @@ function loadInterceptForSession(sessionId) {
     try {
       raw = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
     } catch (_) {
-      // Corrupt record (preload crashed mid-write): leave the file in place
-      // so the stale reaper picks it up later, do not block merging.
+      // preload 中途退出留下损坏文件时暂不删除，由陈旧文件清理器处理，也不阻塞其他记录合并。
       continue;
     }
     if (raw && typeof raw.response_id === 'string' && raw.response_id.length > 0) {
@@ -123,10 +120,8 @@ function loadInterceptForSession(sessionId) {
 }
 
 /**
- * Delete intercept files corresponding to response_ids that buildTurnRecords
- * actually merged into emitted events. Files whose response_id was not in
- * the transcript stay on disk (they may belong to a future turn or be
- * stragglers that reapStaleIntercept will clean up).
+ * 删除已经成功并入输出事件的 response_id 文件。
+ * 未出现在本轮 transcript 中的文件可能属于未来 turn，先保留，最终由陈旧文件清理器回收。
  */
 function reapInterceptFiles(intercept, mergedResponseIds) {
   for (const rid of mergedResponseIds) {
@@ -137,10 +132,8 @@ function reapInterceptFiles(intercept, mergedResponseIds) {
 }
 
 /**
- * Opportunistic cleanup: drop files in this session's intercept dir whose
- * mtime is older than STALE_MS (1h). Called once at the end of exportSession
- * — handles orphans from prior turns whose response_ids never showed up in
- * any subsequent transcript. Also rmdir if the dir is empty afterwards.
+ * 在 `exportSession()` 结束时顺带删除修改时间超过一小时的孤立截获文件。
+ * 这些文件的 response_id 始终未进入 transcript；清空后还会尝试删除空会话目录。
  */
 function reapStaleIntercept(sessionId) {
   const dir = interceptSessionDir(sessionId);
@@ -193,7 +186,7 @@ function isoToUnixNanos(isoStr) {
   return String(ms) + '000000';
 }
 
-// ─── cmd handlers ───
+// ─── 子命令处理器 ───
 
 // TODO: subagent 事件累积到 state.events，当前 exportSession 未消费。
 // 预留用于未来子 agent trace 合并（将子 agent 的 span 关联到主 trace）。
@@ -385,9 +378,8 @@ async function exportSession(state, stopReason) {
 
   const cwd = state.cwd || undefined;
 
-  // Load per-session intercept data once; buildTurnRecords looks up by
-  // response_id (= Anthropic message_id). Empty Map when preload didn't
-  // produce any files — merge logic safely no-ops in that case.
+  // 每个 session 只读取一次截获目录；以 response_id（即 Anthropic message_id）查找。
+  // preload 未产出文件时得到空 Map，后续合并自然无操作。
   const intercept = loadInterceptForSession(sessionId);
   const mergedResponseIds = new Set();
 
@@ -418,8 +410,7 @@ async function exportSession(state, stopReason) {
   const cleaned = allRecords.map((r) => applyHookContentPolicy(sanitizeObject(r) || r, runtimeConfig));
   writeJsonlRecords(defaultLogDir(), AGENT_ID, cleaned);
 
-  // Cleanup intercept files: delete what we merged + drop stragglers from
-  // earlier turns. Failure is silent — host process must not be impacted.
+  // JSONL 落盘后删除已合并文件并清理旧孤儿；清理失败不影响宿主。
   reapInterceptFiles(intercept, mergedResponseIds);
   reapStaleIntercept(sessionId);
 }
@@ -432,9 +423,7 @@ function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, turnStop
   let stepRound = 0;
   let runningHash = prevHash;
   let prevInputMsgs = [];
-  // response_ids whose intercept record we actually merged into emitted
-  // events. exportSession uses this set to delete the corresponding
-  // intercept files after JSONL is flushed.
+  // 记录实际合并成功的 response_id；只有 JSONL 写完后 exportSession 才删除对应文件。
   const mergedResponseIds = new Set();
 
   const traceId = generateTraceId();
@@ -450,8 +439,7 @@ function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, turnStop
     ...RESOURCE_BASE_FIELD_PATCH,
     'user.id': userId,
     ...(cwd ? { 'agent.claude-code.cwd': cwd } : {}),
-    // SPAN_ATTRIBUTES first so structural/pipeline fields (e.g. resourceAttributes)
-    // win over caller-supplied attributes; aligns with qoder's Object.assign order.
+    // 先展开调用方属性，使后面的结构/管道字段（如 resourceAttributes）拥有更高覆盖优先级。
     ...SPAN_ATTRIBUTES,
     ...RESOURCE_ATTRIBUTE_FIELDS,
   };
@@ -470,7 +458,7 @@ function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, turnStop
     });
   }
 
-  // Phase 1: 为每个 llm_call 创建 step + 生成 LLM 事件
+  // 阶段 1：为每个 llm_call 创建 step 并生成 LLM 事件。
   const toolIdToStep = new Map(); // tool_use_id → { stepId, stepSpanId }
   const llmCalls = turn.llmCalls || [];
 
@@ -486,7 +474,7 @@ function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, turnStop
       toolIdToStep.set(toolId, { stepId: currentStepId, stepSpanId: currentStepSpanId });
     }
 
-    // input messages delta/full hash
+    // 计算输入消息增量与全量 hash。
     const inputMsgs = convertInputMessages(ev.input_messages, ev.protocol || 'anthropic');
     let currentFullHash;
     let delta;
@@ -501,14 +489,13 @@ function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, turnStop
       logFull = shouldLogFullMessages(runningHash, delta, currentFullHash);
     }
 
-    // Look up preload-captured data once per LLM call. ev.message_id matches
-    // the SSE message_start `message.id` the preload script extracted.
+    // 每个 LLM 调用查一次 preload 数据；ev.message_id 对应 SSE message_start.message.id。
     const interceptData = intercept && ev.message_id
       ? intercept.get(ev.message_id)
       : undefined;
     if (interceptData) mergedResponseIds.add(ev.message_id);
 
-    // llm.request
+    // 构造 llm.request。
     const reqRecord = {
       time_unix_nano: isoToUnixNanos(ev.request_start_time),
       'event.id': crypto.randomUUID(),
@@ -540,7 +527,7 @@ function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, turnStop
     const outputTokens = ev.output_tokens || 0;
     const totalTokens = inputTokens + outputTokens;
 
-    // llm.response
+    // 构造 llm.response。
     const respRecord = {
       time_unix_nano: isoToUnixNanos(ev.timestamp),
       'event.id': crypto.randomUUID(),
@@ -571,7 +558,7 @@ function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, turnStop
     prevInputMsgs = ev._input_is_delta ? [] : inputMsgs;
   }
 
-  // Phase 2: 为每个 tool 生成 tool.call + tool.result，归属到声明方 LLM 的 step
+  // 阶段 2：为每个 tool 生成 tool.call 和 tool.result，并归入声明该工具的 LLM step。
   for (const ev of llmCalls) {
     for (const toolId of (ev.declaredToolIds || [])) {
       const owner = toolIdToStep.get(toolId);
@@ -591,7 +578,7 @@ function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, turnStop
 
       const toolSpanId = generateSpanId();
 
-      // tool.call
+      // 构造 tool.call。
       records.push({
         time_unix_nano: isoToUnixNanos(timestamps.call),
         'event.id': crypto.randomUUID(),
@@ -605,7 +592,7 @@ function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, turnStop
         'gen_ai.tool.call.arguments': toJsonValue(toolBlock.input || {}),
       });
 
-      // tool.result (only if we have a result timestamp)
+      // 仅在拥有结果时间戳时构造 tool.result。
       if (timestamps.result) {
         const resultRecord = {
           time_unix_nano: isoToUnixNanos(timestamps.result),
@@ -645,7 +632,7 @@ function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, turnStop
   return { records, hash: runningHash, mergedResponseIds };
 }
 
-// ─── dispatcher ───
+// ─── 子命令分派 ───
 
 const DISPATCH = {
   'stop': cmdStop,

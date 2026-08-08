@@ -1,21 +1,20 @@
 #!/usr/bin/env bash
+# 通过 PATH 定位 Bash；严格模式使失败命令、未定义变量和管道中间失败可被检测。
 set -euo pipefail
 
 # ============================================================================
-# Qoder Work Hook Script — delegates to shared hook-processor.mjs
+# Qoder Work Hook 入口：委托给 qoderwork-hook-processor.mjs。
 # ============================================================================
-# Usage:
+# 调用方式：
 #   qoderwork-loongsuite-pilot-hook.sh
 #
-#   Writes to logs/qoder-work/history/qoder-work-*.jsonl.
+#   processor 将结果写入 logs/qoder-work/history/qoder-work-*.jsonl。
 #
-# Installation:
-#   HookManager copies this script + hook-processor.mjs to
-#   ~/.loongsuite-pilot/hooks/ and injects the command into
-#   ~/.qoderwork/settings.json.
+# 安装器将本脚本与 processor 复制到 ~/.loongsuite-pilot/hooks，HookManager 再把命令
+# 注入 ~/.qoderwork/settings.json。stdin 由宿主提供，stdout 不承载正式遥测数据。
 # ============================================================================
 
-# Skip immediately when stdin is a terminal (no payload)
+# 人工执行时 stdin 是终端且没有 payload，立即成功退出。
 [[ -t 0 ]] && exit 0
 
 AGENT_ID="${1:-qoder-work}"
@@ -23,7 +22,7 @@ AGENT_ID="${1:-qoder-work}"
 HOOKS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROCESSOR="$HOOKS_DIR/qoderwork-hook-processor.mjs"
 
-# Fail silently if the processor is missing
+# processor 缺失时保持 fail-open，不能阻塞 Qoder Work。
 [[ -f "$PROCESSOR" ]] || exit 0
 
 MIN_NODE_MAJOR=18
@@ -55,7 +54,7 @@ NODE_PIN_FILE="$HOME/.loongsuite-pilot/node-bin"
 
 NODE_BIN=""
 
-# 1. Try pinned node
+# 1. 优先使用安装器固定的 Node 路径。
 if [[ -f "$NODE_PIN_FILE" ]]; then
   pinned="$(cat "$NODE_PIN_FILE" 2>/dev/null | tr -d '[:space:]')"
   if [[ -n "$pinned" ]] && node_is_suitable "$pinned"; then
@@ -63,7 +62,7 @@ if [[ -f "$NODE_PIN_FILE" ]]; then
   fi
 fi
 
-# 2. Fallback search (read-only — does NOT update pin)
+# 2. 只读搜索常见 Node 安装位置，不在并发 Hook 中回写 pin。
 if [[ -z "$NODE_BIN" ]]; then
   nvm_candidates=("$HOME/.nvm/versions/node"/*/bin/node)
   candidates=()

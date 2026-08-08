@@ -1,10 +1,9 @@
 /**
- * L1 env contract — only 8 user envs (9 with optional E2E_SLS_ENDPOINT).
- * Everything else gets a hardcoded default applied at runtime, hiding the
- * legacy SSH-era flags from L1 users.
+ * L1 E2E 环境变量契约：用户只需提供 8 个变量，可选 `E2E_SLS_ENDPOINT` 后为 9 个；
+ * 其余旧 SSH 时代开关在运行时使用固定默认值，降低本地测试配置复杂度。
  *
- * L1 is the CLI/headless layer. Qoder CLI is reported as qoder-cli; qoder is
- * still used as the deploy id because the CLI hook shares agents.d/qoder.json.
+ * L1 是 CLI/headless 层。报告中 Qoder CLI 使用 `qoder-cli`，部署 ID 仍为 `qoder`，
+ * 因为 CLI Hook 与桌面端共享 `agents.d/qoder.json`。本模块只校验/合并对象，不读写文件。
  */
 
 const COMMON_REQUIRED = [
@@ -27,6 +26,7 @@ export const L1_REQUIRED_BY_SCENARIO = {
 
 export const L1_SCENARIOS = Object.keys(L1_REQUIRED_BY_SCENARIO);
 
+/** 按场景检查必需 E2E 环境变量；未知场景或缺失值直接抛错阻止误运行。 */
 export function assertL1Env(scenario, env) {
   const required = L1_REQUIRED_BY_SCENARIO[scenario];
   if (required === undefined) {
@@ -51,13 +51,14 @@ const DEFAULTS = {
   E2E_PROPAGATE_SLS_INSTALL: '1',
   E2E_JSONL_VALIDATE: '1',
   E2E_REQUIRED_DEPLOY_AGENTS: 'claude-code,codex,qoder,cursor,qwen-code-cli,opencode',
-  // cursor-cli excluded: headless `cursor-agent -p` only fires sessionStart/afterAgentThought/sessionEnd
-  // (no beforeSubmitPrompt/afterAgentResponse/stop), so the hook assembler produces no JSONL turn record.
+  // 排除 cursor-cli：headless cursor-agent -p 只触发 sessionStart/afterAgentThought/sessionEnd；
+  // 它不触发 beforeSubmitPrompt/afterAgentResponse/stop，因此 Hook assembler 无法生成 JSONL turn 记录。
   E2E_REQUIRED_JSONL_AGENTS: 'claude-code,codex,qoder-cli,qwen-code-cli,opencode',
   E2E_SLS_ENDPOINT: 'cn-hangzhou.log.aliyuncs.com',
   E2E_EXPAND_MOCK_PORT_BASE: '19100',
 };
 
+/** 只为未设置变量写入 L1 固定默认值，并归一化兼容开关，保持用户显式值优先。 */
 export function applyL1Defaults(env) {
   for (const [k, v] of Object.entries(DEFAULTS)) {
     if (!env[k] || !String(env[k]).trim()) env[k] = v;

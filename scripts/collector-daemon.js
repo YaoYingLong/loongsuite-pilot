@@ -1,7 +1,11 @@
 'use strict';
 
+// 本文件是系统服务长期指向的稳定 CommonJS 启动垫片，不随 `current` 指针切换而搬迁。
 // Collector 进程的稳定启动垫片。系统服务始终启动此文件，再由它根据版本指针
 // 动态加载真正的 Collector 入口，因此升级时只需切换指针，无需修改服务配置。
+// 它优先读取 current，入口缺失时回退 previous；动态 import 在 ESM 模块加载阶段失败时，
+// 会原子写入 `logs/last-startup-crash.json` 并设置非零退出码，让 Updater 能区分模块加载崩溃。
+// CommonJS 的 `require` 在旧/新版本切换之间保持最小依赖面，实际业务入口仍为 ESM。
 const fs = require('fs');
 const path = require('path');
 // 将本地路径转换为 file URL，确保 CommonJS 脚本能在 Windows 和 POSIX 上动态加载 ESM。

@@ -1,5 +1,12 @@
 #!/usr/bin/env node
 
+/**
+ * OTLP Trace 离线校验命令。开发者或 CI 直接执行本文件，它读取 Collector debug JSONL，
+ * 按 `docs/trace-validation-rules.json` 重建 trace 并检查层级、属性、时间、Schema 和语义。
+ * 输入来自命令行路径或默认数据目录，输出可写文本/JSON 报告；任一 error 级检查失败时
+ * 以退出码 1 结束，warn 不会单独令命令失败。本脚本只读采集数据，不启动 Collector。
+ */
+
 import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -11,12 +18,17 @@ const TAG = '[validate-trace]';
 const OTLP_DEBUG_DIR = path.join(homedir(), '.loongsuite-pilot', 'logs', 'otlp-debug');
 const VALID_SPAN_KINDS = ['ENTRY', 'AGENT', 'STEP', 'LLM', 'TOOL', 'CHAIN', 'RETRIEVER', 'RERANKER', 'EMBEDDING', 'TASK'];
 const KNOWN_SUBAGENT_TOOLS = new Set(['Agent']);
-// TODO: remove 'tool_calls' once all producers are migrated to singular 'tool_call'
+// TODO：所有生产端迁移到单数 `tool_call` 后，删除旧复数别名 `tool_calls`。
 const VALID_FINISH_REASONS = new Set(['stop', 'length', 'content_filter', 'tool_call', 'tool_calls', 'error', 'end_turn', 'max_tokens']);
 const VALID_PART_TYPES = new Set(['text', 'tool_call', 'tool_call_response', 'reasoning']);
 
-// ─── CLI ─────────────────────────────────────────────────────────────────────
+// ─── 命令行参数（CLI） ───────────────────────────────────────────────────────────
 
+/**
+ * 使用 Node `parseArgs` 解析并校验互斥输入、输出格式和严重级别等命令行参数。
+ * @returns {Record<string, string|boolean>} 已应用默认值的 values 对象。
+ * 参数不完整或非法时直接以退出码 2 结束，表示使用方式错误而非 Trace 校验失败。
+ */
 function parseCli() {
   const { values } = parseArgs({
     options: {
@@ -46,8 +58,12 @@ function parseCli() {
   return values;
 }
 
-// ─── File Discovery ──────────────────────────────────────────────────────────
+// ─── 输入文件发现 ────────────────────────────────────────────────────────────
 
+/**
+ * 在默认 `otlp-debug` 目录按 mtime 找出最新 JSONL。
+ * @returns {string} 最新文件绝对路径；目录不可读/没有文件时以退出码 2 结束。
+ */
 function findLatestJsonl() {
   let files;
   try {
@@ -68,8 +84,13 @@ function findLatestJsonl() {
   return path.join(OTLP_DEBUG_DIR, files[0]);
 }
 
-// ─── JSONL Reader ────────────────────────────────────────────────────────────
+// ─── JSONL 读取 ──────────────────────────────────────────────────────────────
 
+/**
+ * 同步读取 debug JSONL，跳过空行、失败持久化元数据和单行坏 JSON。
+ * @param {string} filePath 输入文件。
+ * @returns {object[]} 至少一个有效 span；文件错误或全无有效记录时退出码 2。
+ */
 function readSpans(filePath) {
   let content;
   try {
@@ -96,8 +117,13 @@ function readSpans(filePath) {
   return spans;
 }
 
-// ─── Rules Loader ────────────────────────────────────────────────────────────
+// ─── 校验规则加载 ────────────────────────────────────────────────────────────
 
+/**
+ * 加载校验规则 JSON。规则是此脚本与语义约定生成器之间的契约。
+ * @param {string} rulesPath 规则路径。
+ * @returns {object} 已解析规则；读取/JSON 错误时以退出码 2 结束。
+ */
 function loadRules(rulesPath) {
   try {
     return JSON.parse(readFileSync(rulesPath, 'utf8'));
@@ -107,8 +133,15 @@ function loadRules(rulesPath) {
   }
 }
 
-// ─── Trace Tree Builder ─────────────────────────────────────────────────────
+// ─── Trace 树构建 ────────────────────────────────────────────────────────────
 
+/**
+ * 按 traceId 分组扁平 spans，并建立 spanId 索引、父子映射和内容采集标志。
+ * 为每个 span 增加仅供校验使用的 `_kind` 临时字段，不会写回源 JSONL。
+ * @param {object[]} spans debug 文件中的扁平 span。
+ * @param {string|undefined} traceIdFilter 可选单 trace 过滤器。
+ * @returns {object[]} 每个元素表示一棵可供后续规则遍历的 trace。
+ */
 function buildTraces(spans, traceIdFilter) {
   const grouped = new Map();
   for (const span of spans) {
@@ -144,15 +177,17 @@ function buildTraces(spans, traceIdFilter) {
   return traces;
 }
 
-// ─── Check Result Helpers ───────────────────────────────────────────────────
+// ─── 检查结果辅助函数 ────────────────────────────────────────────────────────
 
+// 以下四个纯函数统一检查结果结构，便于报告、去重和严重级别过滤共享同一 Schema。
 function pass(id, detail) { return { id, status: 'pass', ...(detail ? { detail } : {}) }; }
 function error(id, detail, spanId, spanName) { return { id, status: 'error', detail, ...(spanId ? { spanId } : {}), ...(spanName ? { spanName } : {}) }; }
 function warn(id, detail, spanId, spanName) { return { id, status: 'warn', detail, ...(spanId ? { spanId } : {}), ...(spanName ? { spanName } : {}) }; }
 function skipped(id, reason) { return { id, status: 'skipped', detail: reason || 'captureMessageContent not enabled' }; }
 
-// ─── 5a. Structure Validation ───────────────────────────────────────────────
+// ─── 5a. 结构校验 ────────────────────────────────────────────────────────────
 
+/** 检查 ENTRY/AGENT/STEP/LLM/TOOL 数量、父子层级和允许的子 Span，返回检查结果数组。 */
 function validateStructure(trace) {
   const checks = [];
   const { spans, spanMap, childrenMap } = trace;
@@ -269,8 +304,9 @@ function validateStructure(trace) {
   return checks;
 }
 
-// ─── 5b. Attribute Validation ───────────────────────────────────────────────
+// ─── 5b. 属性校验 ────────────────────────────────────────────────────────────
 
+/** 同步地校验 validateAttributes 对应的规则并返回结构化检查结果，不修改输入记录。 */
 function validateAttributes(trace, rules) {
   const checks = [];
   const { spans, hasMessageContent } = trace;
@@ -345,13 +381,15 @@ function validateAttributes(trace, rules) {
   return checks;
 }
 
+/** 从命名空间属性键提取末段，用于生成更紧凑的诊断文本。 */
 function shortKey(key) {
   const parts = key.split('.');
   return parts[parts.length - 1];
 }
 
-// ─── 5c. Time Validation ────────────────────────────────────────────────────
+// ─── 5c. 时间校验 ────────────────────────────────────────────────────────────
 
+/** 同步地校验 validateTime 对应的规则并返回结构化检查结果，不修改输入记录。 */
 function validateTime(trace, rules) {
   const checks = [];
   const { spans, childrenMap } = trace;
@@ -448,8 +486,9 @@ function validateTime(trace, rules) {
   return checks;
 }
 
-// ─── 5d. Schema/Format Validation ───────────────────────────────────────────
+// ─── 5d. Schema 与格式校验 ──────────────────────────────────────────────────
 
+/** 同步地校验 validateSchema 对应的规则并返回结构化检查结果，不修改输入记录。 */
 function validateSchema(trace, rules) {
   const checks = [];
   const { spans, hasMessageContent } = trace;
@@ -533,6 +572,12 @@ function validateSchema(trace, rules) {
   return checks;
 }
 
+/**
+ * 校验单个可能包含 JSON 字符串的消息属性，并把问题追加到共享 checks。
+ * @param {object} attrs Span 属性。
+ * @param {string} key 要检查的属性键。
+ * @param {string} ruleId 报告规则 ID。
+ */
 function validateMessageField(attrs, key, ruleId, span, checks) {
   const raw = attrs[key];
   if (raw === undefined || raw === null) return;
@@ -584,8 +629,9 @@ function validateMessageField(attrs, key, ruleId, span, checks) {
   }
 }
 
-// ─── 5e. Semantic Validation ────────────────────────────────────────────────
+// ─── 5e. 语义校验 ────────────────────────────────────────────────────────────
 
+/** 同步地校验 validateSemantic 对应的规则并返回结构化检查结果，不修改输入记录。 */
 function validateSemantic(trace, rules) {
   const checks = [];
   const { spans, childrenMap, hasMessageContent } = trace;
@@ -790,7 +836,7 @@ function validateSemantic(trace, rules) {
     if (allOk) checks.push(pass('semantic.llm_has_input_output'));
   }
 
-  // tool_response_role: input.messages with tool_call_response parts must have role=tool
+  // tool_response_role：含 tool_call_response part 的输入消息必须使用 role=tool。
   if (!hasMessageContent) {
     checks.push(skipped('semantic.tool_response_role'));
   } else {
@@ -817,7 +863,7 @@ function validateSemantic(trace, rules) {
     if (allRolesOk) checks.push(pass('semantic.tool_response_role'));
   }
 
-  // tool_has_arguments: TOOL spans should have gen_ai.tool.call.arguments
+  // tool_has_arguments：TOOL span 应包含 gen_ai.tool.call.arguments。
   {
     const toolSpans = spans.filter(s => s._kind === 'TOOL');
     let allHaveArgs = true;
@@ -834,7 +880,7 @@ function validateSemantic(trace, rules) {
     if (toolSpans.length === 0) checks.push(pass('semantic.tool_has_arguments'));
   }
 
-  // last_step_no_tool_call: last STEP's LLM output should not contain tool_call
+  // last_step_no_tool_call：最后一个 STEP 的 LLM 输出不应再包含 tool_call。
   if (!hasMessageContent) {
     checks.push(skipped('semantic.last_step_no_tool_call'));
   } else {
@@ -880,8 +926,9 @@ function validateSemantic(trace, rules) {
   return checks;
 }
 
-// ─── Report Formatters ──────────────────────────────────────────────────────
+// ─── 报告格式化 ──────────────────────────────────────────────────────────────
 
+/** 内部函数同步地构建 buildReport 对应的配置或脚本文本；只有调用方执行返回值时才产生外部副作用。 */
 function buildReport(traces, inputFile, rules, severityFilter) {
   const traceReports = [];
   let totalSpans = 0;
@@ -950,6 +997,7 @@ function buildReport(traces, inputFile, rules, severityFilter) {
   };
 }
 
+/** 以规则 ID、Span ID 和状态为键移除重复检查，保留第一次结果。 */
 function deduplicateChecks(checks) {
   const seen = new Map();
   const result = [];
@@ -970,6 +1018,7 @@ function deduplicateChecks(checks) {
   return result;
 }
 
+/** 根据 CLI severity 阈值保留 error 或 error+warn，同时保留上下文所需结果。 */
 function filterBySeverity(checks, severity) {
   const levels = { error: 0, warn: 1, info: 2 };
   const statusToLevel = { error: 0, warn: 1, pass: 2, skipped: 2 };
@@ -977,6 +1026,7 @@ function filterBySeverity(checks, severity) {
   return checks.filter(c => (statusToLevel[c.status] ?? 2) <= minLevel || c.status === 'pass' || c.status === 'skipped');
 }
 
+/** 同步地将结构化结果格式化为 formatText 对应的输出文本，不执行文件 I/O。 */
 function formatText(report) {
   const lines = [];
   const mc = report.meta.captureMessageContent ? 'enabled' : 'disabled';
@@ -1013,14 +1063,16 @@ function formatText(report) {
   return lines.join('\n');
 }
 
+/** 将报告压缩为单行/少量行统计，适合 CI 日志。 */
 function formatSummary(report) {
   const ck = report.summary.checks;
   const icon = ck.error > 0 ? '❌' : '✅';
   return `${icon} ${report.summary.traces} traces, ${report.summary.spans} spans, ${ck.error} errors, ${ck.warn} warnings, ${ck.skipped} skipped`;
 }
 
-// ─── Main ───────────────────────────────────────────────────────────────────
+// ─── 主流程 ────────────────────────────────────────────────────────────────────
 
+/** 作为 validate-trace.mjs 的命令入口，编排参数、I/O 和退出码；顶层错误由文件末尾统一处理。 */
 function main() {
   const opts = parseCli();
 

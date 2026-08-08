@@ -5,7 +5,7 @@
  * transcript-parser.mjs — Claude Code 原生 transcript JSONL 解析。
  *
  * Claude Code 在 ~/.claude/projects/<hash>/<sessionId>.jsonl 里存全部对话历史。
- * 同一 LLM 调用可能写入多条 assistant 记录(streaming chunks),共享 message.id;
+ * 同一 LLM 调用可能写入多条 assistant 流式分块记录，共享 message.id；
  * 我们按 id 分组、合并、去重,提取每次 LLM 调用的 token usage、stop_reason、output content。
  *
  * v2 重构:
@@ -23,7 +23,7 @@
 import fs from 'node:fs';
 import crypto from 'node:crypto';
 
-export const MAX_TRANSCRIPT_BYTES = 50 * 1024 * 1024; // 50 MB safety limit
+export const MAX_TRANSCRIPT_BYTES = 50 * 1024 * 1024; // 50 MB 安全读取上限。
 const MISSING_PROMPT_ID = '__missing_prompt_id__';
 
 function isMetaRecord(record) {
@@ -70,8 +70,7 @@ function normalizeRequestStart(candidate, responseTs) {
   const candidateMs = parseTimestampMs(candidate);
   const responseMs = parseTimestampMs(responseTs);
   if (candidateMs !== null && responseMs !== null && candidateMs > responseMs) {
-    // Defense against transcript anomalies: a request start later than its own
-    // response is impossible and would produce a negative-duration OTLP span.
+    // 防御 transcript 异常：请求开始晚于自身响应不可能成立，并会生成负时长 OTLP span。
     return responseTs;
   }
   return candidate;
@@ -135,12 +134,12 @@ export function parseClaudeTranscript(transcriptPath, byteOffset = 0) {
     return { turns: [], nextOffset: byteOffset };
   }
 
-  // Phase 1: 收集 assistant 分组 + 顺序的对话记录 + 时间戳
-  const assistantGroups = new Map(); // message.id → group
+  // 阶段 1：收集 assistant 分组、顺序对话记录和时间戳。
+  const assistantGroups = new Map(); // message.id -> 分组对象。
   const conversationRecords = []; // [{ type:'user'|'assistant', ... }]
-  const toolResultTimestamps = new Map(); // tool_use_id → ISO8601 timestamp
-  const toolResultContents = new Map(); // tool_use_id → result content
-  const toolResultErrors = new Map(); // tool_use_id → boolean (is_error)
+  const toolResultTimestamps = new Map(); // tool_use_id -> ISO 8601 时间戳。
+  const toolResultContents = new Map(); // tool_use_id -> 结果内容。
+  const toolResultErrors = new Map(); // tool_use_id -> 是否错误的布尔值（is_error）。
   let currentPromptId = null; // 当前 turn 的 promptId(从 user record 提取)
 
   for (const line of content.split('\n')) {
@@ -235,13 +234,13 @@ export function parseClaudeTranscript(transcriptPath, byteOffset = 0) {
     return { turns: [], nextOffset: fileSize };
   }
 
-  // Phase 2: 每组内 content blocks 去重(streaming chunks 会重复)
+  // 阶段 2：对每组内的 content blocks 去重，因为流式分块可能重复。
   for (const group of assistantGroups.values()) {
     group.mergedContent = deduplicateContentBlocks(group.chunks);
     delete group.chunks;
   }
 
-  // Phase 3: 构建 llm_call 事件(带时间戳 + tool 归属信息)
+  // 阶段 3：构建带时间戳和 tool 归属信息的 llm_call 事件。
   const llmCalls = [];
   const conversationHistory = [];
   let prevCount = 0;
@@ -329,7 +328,7 @@ export function parseClaudeTranscript(transcriptPath, byteOffset = 0) {
     }
   }
 
-  // Phase 4: 按 promptId 切分 turns
+  // 阶段 4：按 promptId 切分各轮对话。
   const turns = splitIntoTurns(conversationRecords, llmCalls);
 
   return { turns, nextOffset: fileSize };
@@ -373,7 +372,7 @@ function splitIntoTurns(conversationRecords, llmCalls) {
   }
 
   if (promptIdOrder.length === 0) {
-    // 无 promptId (所有 user record 都是系统注入的),fallback 为单 turn
+    // 没有 promptId（所有 user record 都是系统注入）时，回退为单轮对话。
     const firstTs = llmCalls[0]?.timestamp || null;
     return [{
       prompt: '',
@@ -427,7 +426,7 @@ function splitIntoTurns(conversationRecords, llmCalls) {
 }
 
 /**
- * Streaming chunks 内容块去重:
+ * 流式分块的内容去重：
  *   - text:取最长一份(streaming 中后到的更完整)
  *   - thinking:同上
  *   - tool_use:按 id 去重

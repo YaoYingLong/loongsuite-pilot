@@ -1,15 +1,23 @@
+// E2E Agent matrix 加载与 Bash 生成库。它读取 `agent-matrix.json`，按 host profile 和环境变量
+// 选择 CLI 安装策略，再生成安装、版本探测和逐 Agent probe 脚本。
+// JSON 缺失/格式错误会同步抛出；返回的 Bash 只有被 L1/Docker runner 执行时才安装程序或写配置。
+// `Buffer` 用于 base64 安全传递多行脚本，路径通过 `fileURLToPath(import.meta.url)` 兼容 ESM/Windows。
+
 import { Buffer } from 'node:buffer';
 import { readFileSync } from 'node:fs';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { shellSingleQuoteBash } from './propagate-sls-install.mjs';
 
+// ESM 没有 CommonJS 的 `__dirname`，这里从当前模块 URL 还原本地目录。
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+/** 返回仓库内默认 agent-matrix.json 的绝对路径；环境变量可在加载阶段覆盖。 */
 export function defaultAgentMatrixPath() {
   return path.join(__dirname, '..', 'agent-matrix.json');
 }
 
+/** 导出函数同步地读取 loadAgentMatrix 所需的本地数据；读取失败按该脚本的 fail-open/退出码约定处理。 */
 export function loadAgentMatrix(env = process.env) {
   const p = env.E2E_AGENT_MATRIX_PATH?.trim() || defaultAgentMatrixPath();
   const raw = readFileSync(p, 'utf8');
@@ -74,12 +82,14 @@ export function resolveEnsureInstallSh(agent, env = process.env) {
   return String(agent.ensureInstallSh ?? '').trim();
 }
 
+/** 内部函数同步地构建 buildCodexEnsureInstallSh 对应的配置或脚本文本；只有调用方执行返回值时才产生外部副作用。 */
 function buildCodexEnsureInstallSh(bin, env) {
   if (bin !== 'codex') return null;
   const spec = env.E2E_CODEX_NPM_SPEC?.trim() || '@openai/codex';
   return `npm install -g ${shellSingleQuoteBash(spec)} || echo '[e2e-ensure] npm install codex failed'`;
 }
 
+/** 内部函数同步地构建 buildEnsureSummaryScript 对应的配置或脚本文本；只有调用方执行返回值时才产生外部副作用。 */
 function buildEnsureSummaryScript(matrix) {
   const lines = [
     'echo "[e2e-ensure] summary:"',
@@ -194,7 +204,7 @@ export function buildEnsureAgentClisScript(matrix, env = process.env) {
       lines.push('    done');
       lines.push('  else');
       lines.push(
-        '    # official: legacy AppImage `cursor` on PATH does not count — need Cursor Agent CLI that actually runs.',
+        '    # 官方判定：PATH 中旧 AppImage 提供的 cursor 不算 Cursor Agent CLI，必须找到可实际运行的 Agent CLI。',
       );
       lines.push(
         '    for _cp in "$HOME/.local/bin/agent" "$HOME/.local/bin/cursor-agent" "$(command -v agent 2>/dev/null)" "$(command -v cursor-agent 2>/dev/null)"; do',
@@ -307,7 +317,7 @@ export function buildEnsureAgentClisScript(matrix, env = process.env) {
 }
 
 /**
- * Parse E2E_PROBE_SKIP_AGENTS: comma-separated list of agent binary names to skip.
+ * 解析 E2E_PROBE_SKIP_AGENTS：其中是用逗号分隔、需要跳过的 Agent 可执行文件名。
  * @param {NodeJS.ProcessEnv} [env]
  * @returns {Set<string>}
  */
@@ -318,7 +328,7 @@ export function resolveProbeSkipAgents(env = process.env) {
 }
 
 /**
- * One isolated bash -s per agent (stdin from decoded pipe, not SSH session).
+ * 每个 Agent 使用独立的 bash -s；标准输入来自解码管道，而不是 SSH session。
  * @param {{ agents: object[] }} matrix
  * @param {NodeJS.ProcessEnv} [env]
  */

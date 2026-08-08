@@ -1,3 +1,13 @@
+/**
+ * 声明式 Agent 定义加载器。
+ *
+ * 安装探测和 DeploymentManager 都通过本类读取安装包 `agents.d/*.json` 与用户
+ * `<dataDir>/agents.d.local/*.json`；本地同 ID 定义覆盖内置定义。加载时递归展开
+ * `$PILOT_DIR`、`$PILOT_DATA`、`~`，并在 Windows 映射脚本后缀。单文件 JSON 或骨架
+ * 校验失败只跳过该 Agent，具体部署模式的专属字段由相应 Strategy 再验证。
+ */
+
+
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import type { AgentDefinition } from '../types/index.js';
@@ -32,6 +42,7 @@ export class AgentDefLoader {
   private readonly pilotDir: string;
   private readonly dataDir: string;
 
+  /** 保存四个路径参数；构造时不访问目录。 */
   constructor(opts: AgentDefLoaderOptions) {
     this.builtinDir = opts.builtinDir;
     this.localDir = opts.localDir;
@@ -39,6 +50,7 @@ export class AgentDefLoader {
     this.dataDir = opts.dataDir;
   }
 
+  /** 并行语义上分来源加载，随后按 ID 让本地声明覆盖内置声明。 */
   async load(): Promise<AgentDefinition[]> {
     // 两个目录分别读取，目录不存在或个别文件无效都不会阻断另一来源的加载。
     const builtin = await this.loadFromDir(this.builtinDir);
@@ -62,6 +74,7 @@ export class AgentDefLoader {
     return result;
   }
 
+  /** 读取一个目录的 JSON 文件；目录或单文件错误均按来源内 fail-open。 */
   private async loadFromDir(dir: string): Promise<AgentDefinition[]> {
     let entries: string[];
     try {
@@ -94,6 +107,7 @@ export class AgentDefLoader {
     return defs;
   }
 
+  /** 只校验跨 Strategy 共用的骨架字段和 deployMode，返回 TypeScript 类型守卫。 */
   private validate(def: unknown, filePath: string): def is AgentDefinition {
     // 此处只验证所有下游共同依赖的骨架字段，不替代各部署策略对专属配置的校验。
     if (!def || typeof def !== 'object') {
@@ -124,6 +138,7 @@ export class AgentDefLoader {
     return result;
   }
 
+  /** 递归解析字符串、数组和普通对象中的占位符。 */
   private resolveValue(value: unknown): unknown {
     if (typeof value === 'string') {
       return this.resolveString(value);
@@ -137,6 +152,7 @@ export class AgentDefLoader {
     return value;
   }
 
+  /** 展开 Pilot/用户路径；Windows 额外规范斜杠并把命令入口 `.sh` 映射成 `.ps1`。 */
   private resolveString(s: string): string {
     // 先替换项目级占位符，再展开开头的 ~，使声明文件不依赖具体安装用户和绝对路径。
     let result = s

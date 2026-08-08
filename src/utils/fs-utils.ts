@@ -1,3 +1,11 @@
+/**
+ * 配置、checkpoint、Hook 状态和诊断日志共用的文件系统工具。
+ *
+ * 查询/辅助日志函数多采用 fail-open，返回 false/null 或吞掉异常；`writeJsonFile` 则把最终
+ * 写入失败抛给调用者，防止上层误认为关键状态已经持久化。异步函数均返回 Promise。
+ */
+
+// 同步 fs 仅用于构造阶段读取安装版本；常规 I/O 使用下方 promises API。
 import * as fs from 'node:fs';
 import { promises as fsp } from 'node:fs';
 import * as os from 'node:os';
@@ -95,25 +103,29 @@ export async function writeJsonFile(
 }
 
 /**
- * Removes stale `.tmp` files left behind by interrupted atomic writes (e.g. process
- * killed mid-rename). Call once at startup for directories that use writeJsonFile.
+ * 清理由原子写入中断（例如进程在 rename 前退出）留下的 `.tmp` 文件。
  *
- * Cleanup is **age-based**, not pid-based: a fresh `.tmp` (any pid) may belong to a
- * concurrent live process — e.g. two daemon instances overlapping during a restart.
- * Deleting it would break that process's `rename(tmp, path)` with ENOENT, failing
- * the collection cycle. Only remove tmp files older than `maxAgeMs` (a tmp that old
- * is definitely not mid-rename, since rename is instantaneous).
+ * 清理按文件年龄而不是 PID：重启时两个 daemon 可能短暂重叠，新临时文件可能属于另一个
+ * 存活进程。误删会让对方 rename 报 ENOENT，因此只删除超过 `maxAgeMs` 的文件。
+ *
+ * @param dir 使用原子 JSON 写入的目录。
+ * @param maxAgeMs 最小保留时间，默认 60 秒。
  */
 export async function cleanStaleTmpFiles(dir: string, maxAgeMs = 60_000): Promise<void> {
   const now = Date.now();
   try {
+    // 异步读取指定目录 dir 下的所有文件 / 文件夹名称列表
     const entries = await fsp.readdir(dir);
     for (const f of entries) {
+      // 如果文件名不满足 *.数字.数字.tmp 格式，跳过当前循环，不执行后续处理
       if (!/\.(\d+)\.\d+\.tmp$/.test(f)) continue;
       const full = nodePath.join(dir, f);
       try {
+        // 异步获取 full 路径对应文件 / 目录的元信息（文件状态）
         const st = await fsp.stat(full);
+        // 最后修改时间戳小于1分钟，跳过继续
         if (now - st.mtimeMs < maxAgeMs) continue;
+        //  删除最后修改时间戳大于1分钟的文件（不能删文件夹）
         await fsp.unlink(full).catch(() => {});
       } catch {}
     }
@@ -121,7 +133,9 @@ export async function cleanStaleTmpFiles(dir: string, maxAgeMs = 60_000): Promis
 }
 
 /**
- * Appends a line (with trailing newline) to a file, creating parent dirs as needed.
+ * 向文件追加一行，并按需创建父目录。
+ *
+ * 该 API 用于辅助日志，采用 best-effort；失败会被吞掉，不适合关键状态持久化。
  */
 export async function appendLine(path: string, line: string): Promise<void> {
   try {
@@ -142,6 +156,7 @@ export async function ensureDir(path: string): Promise<void> {
     return;
   }
   try {
+    // recursive: true的作用就是自动创建多级父目录以及目录已存在不会抛异常
     await fsp.mkdir(path, { recursive: true });
   } catch {}
 }
@@ -161,19 +176,23 @@ export function resolveHome(filepath: string): string {
 }
 
 /**
- * Reads the installed package version from the dataDir's `current` pointer,
- * falling back to the local package.json, then to 'unknown'.
+ * 从 `dataDir/current` 指针读取已安装版本。
+ *
+ * 读取顺序为当前版本目录的 `VERSION`、源码树 `package.json`、最终 `unknown`。本函数同步
+ * 执行，适合在 logger/flusher 构造阶段立即生成稳定版本标签。
  */
 export function readInstalledVersion(dataDir: string): string {
   try {
+    // current 文件保存版本目录名，而不是完整路径。
     const currentFile = nodePath.join(dataDir, 'current');
     const name = fs.readFileSync(currentFile, 'utf-8').trim();
     const versionFile = nodePath.join(dataDir, 'versions', name, 'VERSION');
     const content = fs.readFileSync(versionFile, 'utf-8');
     const match = content.match(/^version=(.+)$/m);
     if (match) return match[1];
-  } catch { /* ignore */ }
+  } catch { /* 安装指针缺失或损坏时继续尝试源码 package.json。 */ }
   try {
+    // `import.meta.url` 指向当前 ESM 模块，向上两级回到包根目录。
     const localPkg = nodePath.join(nodePath.dirname(new URL(import.meta.url).pathname), '..', '..', 'package.json');
     const raw = fs.readFileSync(localPkg, 'utf-8');
     return JSON.parse(raw).version ?? 'unknown';
@@ -183,7 +202,7 @@ export function readInstalledVersion(dataDir: string): string {
 }
 
 /**
- * Local calendar date as `YYYY-MM-DD`.
+ * 返回本地日历日期 `YYYY-MM-DD`，供按天轮转的日志文件名使用。
  */
 export function getTodayDateString(): string {
   const d = new Date();

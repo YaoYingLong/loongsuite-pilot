@@ -1,3 +1,8 @@
+// 远程/L1 E2E 的 Agent 凭据和代理配置脚本生成器。
+// 导出函数把环境变量安全转义为 Bash 片段，用于 Codex、Claude、OpenCode 等 CLI 的临时测试配置；
+// 它们返回字符串而不直接执行命令，真正的子进程和远端写入由场景 runner 负责。
+// 任何 secret 只应进入测试进程环境，不应写入日志；调用方负责提供所需变量。
+
 import { Buffer } from 'node:buffer';
 import { shellSingleQuoteBash } from './propagate-sls-install.mjs';
 
@@ -38,9 +43,9 @@ export function buildRemoteClaudeBailianExportsSh(env = process.env) {
 }
 
 /**
- * Export API keys on the remote probe script (SSH does not forward local shell vars).
- * Codex: `CODEX_OPENAI_API_KEY` from `E2E_CODEX_OPENAI_API_KEY` (fallback `E2E_OPENAI_API_KEY` for legacy).
- * Claude: 百炼 (`E2E_CLAUDE_BAILIAN`) overrides plain `E2E_ANTHROPIC_API_KEY` for `ANTHROPIC_*` on remote.
+ * 在远端 probe 脚本中导出 API key，因为 SSH 不会转发本地 Shell 变量。
+ * Codex：CODEX_OPENAI_API_KEY 取自 E2E_CODEX_OPENAI_API_KEY，旧配置回退到 E2E_OPENAI_API_KEY。
+ * Claude：百炼 E2E_CLAUDE_BAILIAN 会覆盖普通 E2E_ANTHROPIC_API_KEY，并生成远端 ANTHROPIC_*。
  *
  * @param {NodeJS.ProcessEnv} env
  * @returns {string}
@@ -92,9 +97,9 @@ export function buildRemoteSecretExportsSh(env = process.env) {
     lines.push(`export E2E_QWEN_MODEL=${shellSingleQuoteBash(qwenModel)}`);
   }
 
-  // OpenCode uses an OpenCode Zen key (from https://opencode.ai/workspace) via OPENCODE_API_KEY.
-  // Zen is its own provider (model = opencode/<model>); OpenCode resolves the gateway endpoint from
-  // models.dev, so NO OPENAI_BASE_URL is needed. Never reuse the 百炼/Dashscope key — Zen rejects it.
+  // OpenCode 通过 OPENCODE_API_KEY 使用来自 https://opencode.ai/workspace 的 OpenCode Zen key。
+  // Zen 是独立 Provider（model = opencode/<model>）；OpenCode 会从 models.dev 解析网关端点，
+  // 因此不需要 OPENAI_BASE_URL。不要复用百炼/Dashscope key，Zen 会拒绝该凭据。
   const opencodeKey = env.E2E_OPENCODE_API_KEY?.trim();
   if (opencodeKey) {
     const opencodeModel = env.E2E_OPENCODE_MODEL?.trim() || 'opencode/big-pickle';
@@ -120,9 +125,9 @@ export function buildRemoteSecretExportsSh(env = process.env) {
 }
 
 /**
- * Remote bash: write ~/.codex/config.toml from env-driven template (no secrets in file; use env_key).
- * Default env_key is CODEX_OPENAI_API_KEY (matches export from E2E_CODEX_OPENAI_API_KEY / E2E_OPENAI_API_KEY fallback).
- * Enable with E2E_WRITE_REMOTE_CODEX_CONFIG=1.
+ * 远端 Bash：根据环境变量模板写 ~/.codex/config.toml；文件不含 secret，而是使用 env_key。
+ * 默认 env_key 为 CODEX_OPENAI_API_KEY，与 E2E_CODEX_OPENAI_API_KEY/E2E_OPENAI_API_KEY 回退导出一致。
+ * 设置 E2E_WRITE_REMOTE_CODEX_CONFIG=1 启用。
  *
  * @param {NodeJS.ProcessEnv} env
  * @returns {string}
@@ -155,7 +160,7 @@ shell_snapshot = false
   const b64 = Buffer.from(`${toml}\n`, 'utf8').toString('base64');
   const forceReplace = env.E2E_WRITE_REMOTE_CODEX_CONFIG_REPLACE?.trim() === '1' ? '1' : '0';
 
-  /** Runs on remote; merges Dashscope block when OTel Codex hooks exist (avoids wiping SLS-related config). */
+  /** 在远端运行；存在 OTel Codex Hook 时合并 Dashscope 配置块，避免覆盖 SLS 相关配置。 */
   const mergeNode = [
     "'use strict';",
     "const fs = require('fs');",
@@ -234,8 +239,8 @@ shell_snapshot = false
 }
 
 /**
- * API key for ~/.config/claude-code-proxy/config.json (OpenAI-compatible backend shape).
- * **Only** `E2E_CLAUDE_PROXY_API_KEY` — stock `claude` CLI does not read this file; use with a real claude-code-proxy process.
+ * ~/.config/claude-code-proxy/config.json 使用的 API key，结构面向 OpenAI 兼容后端。
+ * 只接受 E2E_CLAUDE_PROXY_API_KEY；原生 claude CLI 不读取此文件，必须配合真实 claude-code-proxy 进程。
  *
  * @param {NodeJS.ProcessEnv} env
  * @returns {string}
@@ -245,8 +250,8 @@ export function resolveE2eClaudeProxyApiKey(env = process.env) {
 }
 
 /**
- * Skip Claude Code interactive onboarding (headless / CI).
- * Enable with E2E_WRITE_REMOTE_CLAUDE_ONBOARDING_SKIP=1.
+ * 在 headless/CI 环境跳过 Claude Code 交互式 onboarding。
+ * 设置 E2E_WRITE_REMOTE_CLAUDE_ONBOARDING_SKIP=1 启用。
  *
  * @param {NodeJS.ProcessEnv} env
  * @returns {string}
@@ -262,8 +267,8 @@ export function buildRemoteClaudeOnboardingSkipSh(env = process.env) {
 }
 
 /**
- * Write ~/.config/claude-code-proxy/config.json. Enable with E2E_WRITE_REMOTE_CLAUDE_PROXY_CONFIG=1 + E2E_CLAUDE_PROXY_API_KEY.
- * For **official `claude` + 百炼**, prefer **`E2E_CLAUDE_BAILIAN=1`** (…/apps/anthropic) instead of this file alone.
+ * 写入 ~/.config/claude-code-proxy/config.json；同时设置 E2E_WRITE_REMOTE_CLAUDE_PROXY_CONFIG=1 和 E2E_CLAUDE_PROXY_API_KEY 才会启用。
+ * 对原生 claude + 百炼，应优先设置 E2E_CLAUDE_BAILIAN=1（…/apps/anthropic），不要只依赖此文件。
  *
  * @param {NodeJS.ProcessEnv} env
  * @returns {string}

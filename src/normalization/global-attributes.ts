@@ -1,3 +1,10 @@
+/**
+ * Trace 专用全局属性的解析、清洗与动态文件缓存。
+ *
+ * ConfigLoader 合并 config 与 `OTEL_SPAN_ATTRIBUTES` 形成启动基线；OtlpTraceFlusher 每批调用
+ * Provider 读取可变 `span-attributes.json`。这些属性只进入 Span 副本，不污染日志型输出。
+ */
+
 import * as fs from 'node:fs';
 import { createLogger } from '../utils/logger.js';
 
@@ -93,6 +100,7 @@ export class GlobalAttributesProvider {
 
   constructor(baseline: Record<string, string>, filePath: string) {
     this.baseline = sanitizeAttributes(baseline);
+    // 通常是 `<dataDir>/span-attributes.json`，由 CLI 原子更新。
     this.filePath = filePath;
     this.cachedMerged = { ...this.baseline };
   }
@@ -133,6 +141,7 @@ export class GlobalAttributesProvider {
   }
 
   private readFileAttrs(): { ok: boolean; attrs: Record<string, string> } {
+    // 同步读取使一次 resolve() 得到单一快照，文件很小且只在 mtime 改变后执行。
     let raw: string;
     try {
       raw = fs.readFileSync(this.filePath, 'utf-8');

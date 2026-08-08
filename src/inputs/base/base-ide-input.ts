@@ -1,23 +1,25 @@
+/**
+ * IDE history/DiskKV 快照轮询基类。
+ *
+ * SnapshotStore 以“文件+源时间+Agent”去重并保留 pending/processed 状态。子类扫描原始
+ * CodeGenerationEvent 并转换；只有成功构建的事件才标记 processed，停止时强制 flush 快照。
+ */
+
 import { CollectionMethod } from '../../types/index.js';
 import type { AgentActivityEntry, CodeGenerationEvent } from '../../types/index.js';
 import { SnapshotStore } from '../../checkpoints/snapshot-store.js';
 import { BaseInput, type InputOptions } from './base-input.js';
 
 export interface IdeInputOptions extends InputOptions {
-  /** Path to the IDE data root (e.g. ~/Library/Application Support/Qoder). */
+  /** IDE 数据根，例如 Qoder Application Support。 */
   dataRoot: string;
-  /** Path to the snapshot store JSON file. */
+  /** 独立 SnapshotStore JSON 路径。 */
   snapshotStorePath: string;
   snapshotRetentionMs?: number;
 }
 
 /**
- * Base input for IDE history-snapshot polling.
- * Periodically scans IDE local DiskKV / history files, uses SnapshotStore for dedup.
- *
- * Subclass must implement:
- *   - scanHistoryEntries(): discover raw code generation events from IDE storage
- *   - buildEntry(): convert a raw event into an AgentActivityEntry
+ * IDE 快照轮询的抽象生命周期。
  */
 export abstract class BaseIdeInput extends BaseInput {
   readonly collectionMethod = CollectionMethod.IdeSnapshotPolling;
@@ -25,6 +27,7 @@ export abstract class BaseIdeInput extends BaseInput {
   protected readonly dataRoot: string;
   protected readonly snapshotStore: SnapshotStore;
 
+  /** 构造独立 SnapshotStore；实际文件读取延迟到 onStart。 */
   constructor(opts: IdeInputOptions) {
     super(opts);
     this.dataRoot = opts.dataRoot;
@@ -34,14 +37,17 @@ export abstract class BaseIdeInput extends BaseInput {
     );
   }
 
+  /** 启动前恢复去重快照。 */
   protected override async onStart(): Promise<void> {
     await this.snapshotStore.load();
   }
 
+  /** 停止时等待快照原子落盘。 */
   protected override async onStop(): Promise<void> {
     await this.snapshotStore.flush();
   }
 
+  /** 按建议起点扫描、去重、转换并持久化快照。 */
   protected async collect(): Promise<AgentActivityEntry[]> {
     const sinceTs = this.snapshotStore.getSuggestedSinceTimestamp();
     const rawEvents = await this.scanHistoryEntries(sinceTs);
@@ -51,6 +57,7 @@ export abstract class BaseIdeInput extends BaseInput {
       const key = this.buildSnapshotKey(event);
       if (!this.snapshotStore.shouldProcess(key)) continue;
 
+      // 先标 pending；构建抛错时不标 processed，保留后续恢复可能。
       this.snapshotStore.markPending(key, event.sourceTimestamp);
       try {
         const entry = await this.buildEntry(event);
@@ -68,17 +75,16 @@ export abstract class BaseIdeInput extends BaseInput {
   }
 
   /**
-   * Scan IDE local storage for raw code generation events since the given timestamp.
-   * Override in subclass.
+   * 扫描 `sinceTs` 之后的 IDE 原始活动。
    */
   protected abstract scanHistoryEntries(sinceTs: number): Promise<CodeGenerationEvent[]>;
 
   /**
-   * Convert a raw code generation event into a normalized AgentActivityEntry.
-   * Return null to skip the event.
+   * 把原始活动转为标准事件；返回 null 表示跳过且不会标 processed。
    */
   protected abstract buildEntry(event: CodeGenerationEvent): Promise<AgentActivityEntry | null>;
 
+  /** 构造同一 Agent/文件/源时间的稳定去重 key。 */
   protected buildSnapshotKey(event: CodeGenerationEvent): string {
     return `${event.filePath}@@${event.sourceTimestamp}@@${event.agentType}`;
   }

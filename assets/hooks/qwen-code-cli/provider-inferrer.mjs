@@ -2,22 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * provider-inferrer.mjs — Infer gen_ai.provider.name from a qwen-code session.
+ * 从 Qwen Code 会话推断 `gen_ai.provider.name`。
  *
- * qwen-code reports the model name on every assistant record (e.g. "qwen3.6-plus",
- * "claude-3-5-sonnet", "gpt-4o") and the auth_type on api_response telemetry
- * records (e.g. "openai", "anthropic"). We derive the provider primarily from
- * the model name (most specific), falling back to auth_type, then a default.
- *
- * Provider names follow the loongsuite-pilot event_t schema enumeration:
- *   anthropic / openai / qwen / gcp.gemini / deepseek / x_ai
- * (Mirrors src/normalization/entry-builder.ts inferProviderName).
+ * assistant 通常带模型名，api_response telemetry 带 auth_type；模型更具体，故优先模型，
+ * 再用 auth_type，最后回退 qwen。枚举与 entry-builder 的 inferProviderName 保持一致。
+ * 本模块是无副作用纯函数，不读配置、文件或网络。
  */
 
 /**
- * @param {string|undefined} model    Model name from assistant.model
- * @param {string|undefined} authType auth_type from system.ui_telemetry record
- * @returns {string}                  Provider enum value
+ * @param {string|undefined} model assistant.model 中的模型名。
+ * @param {string|undefined} authType system.ui_telemetry 的 auth_type。
+ * @returns {string} 标准 provider 枚举值。
  */
 export function inferProvider(model, authType) {
   const m = (model || '').toLowerCase();
@@ -34,9 +29,6 @@ export function inferProvider(model, authType) {
   if (a === 'gemini')    return 'gcp.gemini';
   if (a === 'qwen')      return 'qwen';
 
-  // qwen-code's default endpoint is DashScope (Alibaba's qwen service);
-  // when we have neither a recognized model nor auth_type, qwen is the
-  // safest fallback (and downstream entry-builder will also infer this
-  // from the agentType="qwen-code-cli").
+  // 默认端点是 DashScope；模型与 auth_type 都未知时回退 qwen，与下游按 agentType 推断一致。
   return 'qwen';
 }

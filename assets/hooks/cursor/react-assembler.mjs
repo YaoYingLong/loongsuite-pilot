@@ -1,9 +1,12 @@
 /**
- * react-assembler.mjs — Cursor turn assembler with subagent nesting.
+ * 支持子 Agent 嵌套的 Cursor turn/ReAct 组装器。
  *
- * Called by the processor on parent stop. Reads journal events, scans
- * transcript subagents/ directory for child conversation_ids, builds
- * parent ReAct steps and nested child agent steps.
+ * `cursor-hook-processor.mjs` 在父会话 stop 时调用：读取 journal 快照，扫描 transcript 同级
+ * `subagents/` 目录取得子 conversation_id，把父事件按 thought/tool/response 切成 ReAct step，
+ * 再把子 step 与父 Subagent 工具调用关联。输出是标准记录和本轮已消费会话 ID 集合，调用方
+ * 据此压缩 journal。函数同步读取 transcript，但不直接写文件；内容策略在记录构造阶段应用。
+ *
+ * 并行 subagent 的顺序匹配存在已知歧义，代码中的 TODO 明确保留，不能假设已精确关联。
  */
 
 import crypto from 'node:crypto';
@@ -20,12 +23,12 @@ import {
   parseMaybeJson,
 } from '../agent-event-normalizer.mjs';
 
-// ─── Public API ───
+// ─── 对外 API ───
 
 /**
- * @param {object[]} journalEvents - All events from the journal
- * @param {object}   options       - { runtimeConfig }
- * @returns {{ records: object[], consumedConversationIds: Set<string> }}
+ * @param {object[]} journalEvents journal 中的全部事件快照。
+ * @param {object} options 运行时配置、stop 会话、transcript 路径与 Cursor 变体。
+ * @returns {{records: object[], consumedConversationIds: Set<string>}} 标准记录及可清理会话集合。
  */
 export function assembleTurn(journalEvents, options = {}) {
   const runtimeConfig = options.runtimeConfig || {};
@@ -33,8 +36,7 @@ export function assembleTurn(journalEvents, options = {}) {
   const transcriptPath = options.transcriptPath;
   const variant = options.variant || 'cursor';
 
-  // On Windows fallback: try to extract correct user text from transcript
-  // (transcript-assembler may have failed, but user prompt is still recoverable)
+  // Windows 主 transcript assembler 失败后，仍尝试单独恢复正确 UTF-8 user 文本。
   let transcriptUserPrompt = null;
   if (process.platform === 'win32' && transcriptPath) {
     try {
@@ -55,7 +57,7 @@ export function assembleTurn(journalEvents, options = {}) {
     } catch {}
   }
 
-  // Find the prompt for THIS stop's conversation
+  // 必须定位本次 stop 对应会话的 prompt，不能误取并发会话。
   const promptEvent = stopConversationId
     ? journalEvents.find(e => e.hook_event === 'beforeSubmitPrompt' && e.conversation_id === stopConversationId)
     : journalEvents.find(e => e.hook_event === 'beforeSubmitPrompt');
@@ -75,7 +77,7 @@ export function assembleTurn(journalEvents, options = {}) {
   );
   const model = resolveModel(responseEvent?.model || promptEvent?.model);
 
-  // Filter to parent session events only (keep Subagent/Task tool calls + subagentStart/Stop)
+  // 先筛出父会话事件；保留 Subagent/Task 调用及子会话生命周期元事件。
   const parentEvents = journalEvents
     .filter(e => e.conversation_id === parentConvId)
     .filter(e => e.hook_event !== 'sessionStart')
@@ -91,8 +93,7 @@ export function assembleTurn(journalEvents, options = {}) {
 
   const records = [];
 
-  // User-hook: user prompt is not an LLM call — emit as "other" so converter
-  // merges messages_delta into ENTRY span without generating a standalone LLM span.
+  // user prompt 不是 LLM 调用：输出 `other`，让 converter 合入 ENTRY span 而非单独生成 LLM span。
   const userPrompt = transcriptUserPrompt || promptEvent.prompt;
   if (userPrompt) {
     records.push(applyPolicy({
@@ -109,16 +110,16 @@ export function assembleTurn(journalEvents, options = {}) {
     }, runtimeConfig));
   }
 
-  // ─── Phase 2: Child session nesting ───
-  // Scan transcript subagents/ directory for child conversation_ids
+  // ─── 阶段 2：嵌套子会话 ───
+  // 扫描 transcript 的 subagents/ 目录取得子 conversation_id。
   const childConvIds = scanSubagentDir(transcriptPath || stopEvent?.transcript_path);
 
-  // Build one-to-one mapping: parent Subagent call → child session
+  // 建立“父 Subagent 工具调用 -> 子会话”的一对一映射。
   const parentSubagentCalls = parentEvents
     .filter(e => e.hook_event === 'preToolUse' && isSubagentTool(e.tool_name))
     .sort((a, b) => tsMs(a) - tsMs(b));
 
-  // Collect child sessions with events, sorted by first event time
+  // 收集确有事件的子会话，并按首事件时间排序。
   const childSessions = [];
   for (const childConvId of childConvIds) {
     const childEvents = journalEvents
@@ -130,20 +131,15 @@ export function assembleTurn(journalEvents, options = {}) {
   }
   childSessions.sort((a, b) => tsMs(a.childEvents[0]) - tsMs(b.childEvents[0]));
 
-  // One-to-one assignment by order (consume each parent call once)
+  // 依时间顺序一对一分配，每个父调用最多消费一次。
   const assignedCalls = new Set();
   const childLinks = [];
 
   for (const child of childSessions) {
     const childFirstTs = tsMs(child.childEvents[0]);
     let matched = null;
-    // TODO(shelved): Reverse iteration (i = length-1 → 0) with early break
-    // would more accurately match the closest preceding parent call when
-    // multiple subagent calls exist in the same turn. Current forward scan
-    // assigns the last qualifying call, which is usually correct for
-    // sequential subagents but may mis-match truly parallel subagents.
-    // Deferred until a regression test covering the parallel-subagent edge
-    // case is added.
+    // TODO（暂缓）：同一 turn 有多个子 Agent 时，倒序并提前终止会更接近“最近的前置父调用”。
+    // 当前正向扫描通常适用于串行子 Agent，但可能错配真正并行的子 Agent；需先补回归测试。
     for (const sa of parentSubagentCalls) {
       if (assignedCalls.has(sa.tool_use_id)) continue;
       if (tsMs(sa) <= childFirstTs) {
@@ -158,9 +154,8 @@ export function assembleTurn(journalEvents, options = {}) {
     }
   }
 
-  // Pre-collect subagent results: tool_use_id → { resultText, durationMs, endTs }
-  // This allows buildParentSteps to include Subagent result in next step's input
-  const subagentResults = new Map(); // tool_use_id → result info
+  // 预收集子 Agent 结果，使父 step 可把它作为下一步工具输入上下文。
+  const subagentResults = new Map(); // tool_use_id -> 结果信息。
   for (const link of childLinks) {
     if (!link.parentToolCallId) continue;
     const { childEvents, parentToolCallId, parentCallEvent } = link;
@@ -178,7 +173,7 @@ export function assembleTurn(journalEvents, options = {}) {
     });
   }
 
-  // Build parent ReAct steps (with subagentResults for input enrichment)
+  // 先构造父 ReAct step，并用子 Agent 结果补充输入。
   const stepRecords = buildParentSteps(parentEvents, {
     turnId, traceId, model, userId, baseFields, runtimeConfig,
     userPrompt: userPrompt || promptEvent.prompt,
@@ -187,7 +182,7 @@ export function assembleTurn(journalEvents, options = {}) {
   });
   records.push(...stepRecords);
 
-  // Build child steps
+  // 再构造每个已关联子会话的 step。
   for (const link of childLinks) {
     const { childConvId, childEvents, parentToolCallId } = link;
     const childConvShort = childConvId.slice(0, 8);
@@ -212,13 +207,13 @@ export function assembleTurn(journalEvents, options = {}) {
     records.push(...childStepRecords);
   }
 
-  // Consumed conversation ids: parent + all child sessions from transcript dir + time-based
+  // 已消费集合包含父会话及 transcript/时间窗识别到的全部子会话。
   const consumedConversationIds = new Set();
   consumedConversationIds.add(parentConvId);
   for (const cid of childConvIds) {
     consumedConversationIds.add(cid);
   }
-  // Also consume any other non-prompt conversations in the time window
+  // 同一时间窗内没有独立 prompt 的其他会话也视为本父 turn 子事件。
   const parentPromptTs = tsMs(promptEvent);
   const parentStopTs = stopEvent ? tsMs(stopEvent) : Infinity;
   const conversationIdsWithPrompt = new Set();
@@ -241,7 +236,7 @@ export function assembleTurn(journalEvents, options = {}) {
   return { records, consumedConversationIds };
 }
 
-// ─── Transcript Directory Scanning ───
+// ─── Transcript 子目录扫描 ───
 
 function scanSubagentDir(transcriptPath) {
   if (!transcriptPath || String(transcriptPath) === 'None') return [];
@@ -257,7 +252,7 @@ function scanSubagentDir(transcriptPath) {
   }
 }
 
-// ─── Step Building ───
+// ─── Step 构造 ───
 
 function buildParentSteps(events, ctx) {
   const records = [];
@@ -266,12 +261,10 @@ function buildParentSteps(events, ctx) {
   let currentStepHasTools = false;
   let currentLlmResponse = null;
   let previousToolResults = [];
-  // Track last event timestamp for computing next step's LLM start time
-  let lastStepEndTs = ctx.promptEventTs; // first step starts at prompt time
+  // 保存最近事件时间，用于估算下一 step 的 LLM 开始。
+  let lastStepEndTs = ctx.promptEventTs; // 第一个 step 从 prompt 时间开始。
 
-  // Cumulative input messages within this turn — represents the full user/tool
-  // message context sent to the LLM at each llm.request. Subagents have no
-  // user prompt seeded (ctx.userPrompt is null for child sessions).
+  // turn 内累计输入表示每次 llm.request 实际看到的完整 user/tool 上下文；子会话不预置 user prompt。
   const cumulativeInputMessages = [];
   if (ctx.userPrompt) {
     cumulativeInputMessages.push({
@@ -280,7 +273,7 @@ function buildParentSteps(events, ctx) {
     });
   }
 
-  // Buffer for tools that arrive before any thought
+  // 工具 Hook 可能早于 thought 到达，先缓冲直到能确定所属 step。
   let pendingToolRecords = [];
   let pendingToolCalls = [];
   let pendingToolResults = [];
@@ -302,9 +295,8 @@ function buildParentSteps(events, ctx) {
     appendToolCallParts(currentLlmResponse, toolCalls);
     applyToolCallResponseTiming(currentLlmResponse, toolCalls);
 
-    // Guard: if LLM request start >= response end (buffered-tool scenario),
-    // pull request start back to the earliest tool.call start - 1ms. This
-    // keeps the LLM span visible without pretending the response ended later.
+    // 缓冲工具场景若 request start >= response end，就回拨到最早 tool.call 前 1ms；
+    // 这样保持 LLM span 可见，又不伪造更晚的响应结束时间。
     const llmReq = findLastItem(records, r =>
       r['event.name'] === 'llm.request' && r['gen_ai.step.id'] === currentStepId
     );
@@ -356,16 +348,14 @@ function buildParentSteps(events, ctx) {
   }
 
   function openNewStep(ev, isFirst, userPrompt) {
-    // Flush previous response
+    // 新 step 打开前先输出上一个尚未落盘的 response。
     finalizeCurrentLlmResponse();
     stepRound++;
     currentStepId = `${ctx.stepPrefix || ctx.turnId}:s${stepRound}`;
     currentStepHasTools = false;
     stepToolCalls.set(currentStepId, []);
 
-    // Compute delta for this step:
-    //   s1: user prompt (if any) — already pre-seeded in cumulative.
-    //   s2+: tool results from previous step — append to cumulative.
+    // 计算本 step delta：s1 是预置 user prompt；s2+ 是前一步工具结果，并追加到累计上下文。
     const deltaMessages = buildDeltaMessages(isFirst, userPrompt, previousToolResults, cumulativeInputMessages);
 
     const { timestamp: reqTs, source: reqTsSource } = llmRequestStartTime(ev, lastStepEndTs);
@@ -378,10 +368,7 @@ function buildParentSteps(events, ctx) {
     previousToolResults = [];
   }
 
-  /**
-   * Open an implicit step for buffered tools (no thought/response triggered it).
-   * Used by the composer-2.5-fast path and the buffered-tools-only fallback.
-   */
+  /** 为没有 thought/response 触发器的缓冲工具打开隐式 step。 */
   function openImplicitStep(reqTs, reqTsSource) {
     const isFirstStep = stepRound === 0;
     stepRound++;
@@ -419,8 +406,7 @@ function buildParentSteps(events, ctx) {
     }
 
     else if (ev.hook_event === 'afterAgentResponse') {
-      // composer-2.5-fast path: no afterAgentThought, tools buffered, no step opened yet.
-      // First open s1 for the buffered tools (so afterAgentResponse can claim s2 below).
+      // composer-2.5-fast 没有 afterAgentThought：先为缓冲工具打开 s1，随后 response 可归入 s2。
       if (currentStepId === null && pendingToolRecords.length > 0) {
         const { timestamp: reqTs, source: reqTsSource } = llmRequestStartTime(ev, lastStepEndTs);
         openImplicitStep(reqTs, reqTsSource);
@@ -453,7 +439,7 @@ function buildParentSteps(events, ctx) {
           toolInput: ev.tool_input,
           observedAt: ev._journal_ts,
         });
-        // If Subagent with known result, also buffer the synthesized tool.result
+        // Subagent 已有结果时，同时缓冲合成的 tool.result。
         if (isSubagentTool(ev.tool_name) && ctx.subagentResults?.has(ev.tool_use_id)) {
           const sr = ctx.subagentResults.get(ev.tool_use_id);
           pendingToolRecords.push(buildSubagentResult(ev, sr, ctx, '__pending__'));
@@ -461,7 +447,7 @@ function buildParentSteps(events, ctx) {
           if (ev.tool_use_id) synthesizedSubagentIds.add(ev.tool_use_id);
         }
       } else {
-        // For Subagent tools with known result, use child start time as tool.call time
+        // Subagent 已知结果时，用子会话开始时间作为父 tool.call 时间。
         let toolObservedAt = ev._journal_ts;
         if (isSubagentTool(ev.tool_name) && ctx.subagentResults?.has(ev.tool_use_id)) {
           const sr = ctx.subagentResults.get(ev.tool_use_id);
@@ -500,19 +486,19 @@ function buildParentSteps(events, ctx) {
         applyToolDurationToCall(records, currentStepId, ev);
         records.push(buildToolResult(ev, ctx, currentStepId));
         previousToolResults.push({ toolName: ev.tool_name, toolUseId: ev.tool_use_id, result: ev.tool_output, error: ev.error_message });
-        // Track step end time
+        // 更新 step 结束时间上界。
         lastStepEndTs = ev._journal_ts;
       }
     }
   }
 
-  // Buffered tools with no thought/response (entire turn was tools-only)
+  // 整个 turn 只有工具、没有 thought/response 时，为剩余缓冲工具补隐式 step。
   if (pendingToolRecords.length > 0) {
     const reqTs = lastStepEndTs || ctx.promptEventTs;
     openImplicitStep(reqTs);
   }
 
-  // Flush last response
+  // 循环结束后输出最后一条尚未落盘的 response。
   finalizeCurrentLlmResponse();
 
   assignFinishReasons(records);
@@ -520,7 +506,7 @@ function buildParentSteps(events, ctx) {
   return records;
 }
 
-// ─── Record Builders ───
+// ─── 标准记录构造器 ───
 
 function buildLlmRequestWithTs(reqTs, ev, ctx, stepId, deltaMessages, fullMessages, timeSource) {
   const ts = reqTs ? timestampToUnixNanos(reqTs) : eventTs(ev);
@@ -544,12 +530,12 @@ function buildLlmRequestWithTs(reqTs, ev, ctx, stepId, deltaMessages, fullMessag
   }, ctx.runtimeConfig);
 }
 
-/** Deep clone messages so later mutations to cumulative array don't affect emitted records. */
+/** 深拷贝消息，避免后续修改累计数组反向改变已输出记录。 */
 function cloneMessages(messages) {
   return JSON.parse(JSON.stringify(messages));
 }
 
-/** Build a tool-role message from collected tool results (used as delta input on s2+ steps). */
+/** 把工具结果构造成 tool role 消息，作为 s2+ 的增量输入。 */
 function toolResultsToMessage(toolResults) {
   const parts = toolResults.map(tr => ({
     type: 'tool_call_response',
@@ -560,13 +546,9 @@ function toolResultsToMessage(toolResults) {
 }
 
 /**
- * Build per-step delta messages and update cumulative input.
- *
- * - isFirst step: delta includes the user prompt (already pre-seeded in cumulative).
- * - s2+ steps: delta includes a tool-role message from the previous step's results,
- *   which is also appended to cumulativeInputMessages.
- *
- * Callers are responsible for resetting previousToolResults after this call.
+ * 构造每个 step 的增量消息并更新累计输入。
+ * 首 step 的 delta 是已预置 user prompt；s2+ 是前一步 tool role 结果，并追加到累计消息。
+ * 调用者须在调用后自行清空 previousToolResults。
  */
 function buildDeltaMessages(isFirst, userPrompt, previousToolResults, cumulativeInputMessages) {
   const deltaMessages = [];
@@ -704,7 +686,7 @@ function buildSubagentResult(preToolUseEvent, subagentResult, ctx, stepId) {
   }, ctx.runtimeConfig);
 }
 
-// ─── tool_call parts synthesis ───
+// ─── tool_call part 合成 ───
 
 function appendToolCallParts(llmResponse, toolCalls) {
   if (!toolCalls || toolCalls.length === 0) return;
@@ -735,9 +717,8 @@ function applyToolCallResponseTiming(llmResponse, toolCalls) {
   const reasoningObservedAt = llmResponse['agent.cursor.reasoning_observed_at'];
   const reasoningObservedAtMs = Date.parse(reasoningObservedAt);
 
-  // LLM end = first tool.call time, but only when tool arrived AFTER thought.
-  // Buffered scenario (tool before thought): keep afterAgentThought time as LLM end,
-  // because the LLM was still streaming when the tool hook fired.
+  // 工具晚于 thought 时，首个 tool.call 即 LLM 结束；工具先到的缓冲场景保留 thought 时间，
+  // 因为工具 Hook 触发时模型仍可能在流式输出。
   const isBuffered = Number.isFinite(reasoningObservedAtMs) && firstToolCall.observedAtMs < reasoningObservedAtMs;
   if (!isBuffered) {
     llmResponse.time_unix_nano = timestampToUnixNanos(firstToolCall.observedAt);
@@ -768,14 +749,13 @@ function applyToolDurationToCall(records, stepId, resultEvent) {
   );
   if (!call) return;
 
-  // Keep tool.call time as preToolUse._journal_ts (unchanged).
-  // Only record duration as metadata.
+  // tool.call 时间保持 preToolUse._journal_ts，不回推；duration 仅作为元数据。
   if (resultEvent.duration_ms != null) {
     call['gen_ai.tool.call.duration'] = resultEvent.duration_ms;
   }
 }
 
-// ─── finish_reasons ───
+// ─── finish_reasons 推断 ───
 
 function assignFinishReasons(records) {
   const stepsWithTools = new Set();
@@ -802,7 +782,7 @@ function assignFinishReasons(records) {
   }
 }
 
-// ─── LLM Timing ───
+// ─── LLM 时间推断 ───
 
 function llmRequestStartTime(ev, fallbackTs) {
   if (ev?.hook_event === 'afterAgentThought' && ev.duration_ms != null) {
@@ -824,7 +804,7 @@ function durationStartMs(ev) {
   return endMs - durationMs;
 }
 
-// ─── Helpers ───
+// ─── 辅助函数 ───
 
 function appendPart(llmResponse, partType, text) {
   const msgs = llmResponse['gen_ai.output.messages'];

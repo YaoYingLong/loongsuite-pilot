@@ -1,3 +1,16 @@
+/**
+ * Collector 唯一的顶层业务编排器。
+ *
+ * `src/index.ts` 创建本类。`start()` 依次准备目录和 checkpoint、构建输出链、部署
+ * Agent 能力、注册 Input/发现条目，再启动保留、Watchdog、Pipeline、指标和状态栏
+ * 等后台服务。Input 产生的标准事件经 InputManager 进入一个或多个 Flusher。
+ * `stop()` 按依赖逆序停止资源、排空 Input Promise 队列、flush/shutdown 输出并保存
+ * 状态；SIGINT/SIGTERM 由主入口转交到这里。部署和多数可选后台服务采用 best-effort，
+ * 核心目录/状态初始化失败则向上抛出，触发启动崩溃 breadcrumb。
+ */
+
+
+
 import { EventEmitter } from 'node:events';
 import { ClientType } from '../types/index.js';
 import type { AnalyticsConfig, AgentDetectionEntry } from '../types/index.js';
@@ -14,7 +27,7 @@ import { resolveHome, ensureDir, directoryExists, readJsonFile, writeJsonFile, f
 import * as path from 'node:path';
 import * as fsSync from 'node:fs';
 
-// Flushers
+// 数据输出器。
 import { BaseFlusher } from '../flushers/base-flusher.js';
 import { SlsFlusher } from '../flushers/sls-flusher.js';
 import { JsonlFlusher } from '../flushers/jsonl-flusher.js';
@@ -22,7 +35,7 @@ import { HttpFlusher } from '../flushers/http-flusher.js';
 import { MultiFlusher } from '../flushers/multi-flusher.js';
 import { buildOtlpTraceConfig } from './config-loader.js';
 
-// Concrete inputs
+// 具体 Agent Input 实现。
 import { QoderSqliteInput } from '../inputs/qoder-sqlite/qoder-sqlite-input.js';
 import { QoderCnSqliteInput } from '../inputs/qoder-cn-sqlite/qoder-cn-sqlite-input.js';
 import { QoderCnInput } from '../inputs/qoder-cn/qoder-cn-input.js';
@@ -67,15 +80,15 @@ const logger = createLogger('Orchestrator');
 const DEFAULT_DATA_DIR = '~/.loongsuite-pilot';
 
 /**
- * Central orchestrator — the entry point that wires all sub-systems together.
+ * 连接全部子系统的中央编排器。
  *
- * Startup sequence:
- *   1. Load configuration & state
- *   2. Build flushers (SLS + JSONL + HTTP)
- *   3. Install hooks into agent config files
- *   4. Register all inputs
- *   5. Start AgentDiscoveryService (fs.watch + polling)
- *   6. Emit 'started'
+ * 当前启动主线：目录/checkpoint -> 输出链 -> InputManager/上游关联 ->
+ * DeploymentManager -> LocalWorker -> Input 注册 -> 动态发现 -> 保留/Watchdog/Pipeline/
+ * Metrics/状态栏 -> started。Hook 部署由 DeploymentManager 完成，下面保留的
+ * `installHooks()` 是未被 start() 调用的历史兼容代码，不能用于推导当前生产行为。
+ *
+ * 继承 EventEmitter 后，外部可监听 starting/started/stopped，内部发现服务也通过事件
+ * 报告 Input 生命周期；事件回调仍运行在同一个 Node.js 事件循环中，不是新线程。
  */
 export class Orchestrator extends EventEmitter {
   private static readonly LISTENER_AGENT_MAP: Record<string, string> = {
@@ -128,12 +141,20 @@ export class Orchestrator extends EventEmitter {
   private globalAttributesProvider!: GlobalAttributesProvider;
   private isRunning = false;
 
+  /** @param config ConfigLoader 已归一化的完整配置；构造阶段只解析 dataDir。 */
   constructor(config: AnalyticsConfig) {
     super();
     this.config = config;
+    // 默认地址~/.loongsuite-pilot
     this.dataDir = resolveHome(config.dataDir || DEFAULT_DATA_DIR);
   }
 
+  /**
+   * 按依赖顺序启动 Collector 全部子系统。重复调用只记录警告。
+   *
+   * 必需目录、StateStore 或核心初始化异常会向主入口传播并写 startup breadcrumb；
+   * Agent 部署、单输出器和 macOS 状态栏等可选能力在各自边界内 best-effort。
+   */
   async start(): Promise<void> {
     if (this.isRunning) {
       logger.warn('already running');
@@ -141,18 +162,23 @@ export class Orchestrator extends EventEmitter {
     }
 
     logger.info('starting orchestrator');
+    // 触发事件
     this.emit('starting');
 
-    // 1. Ensure data directories
+    // 1. 准备数据目录。
+    // 创建~/.loongsuite-pilot目录，如果目录不存在的话
     await ensureDir(this.dataDir);
+    // 创建~/.loongsuite-pilot/logs
     await ensureDir(path.join(this.dataDir, 'logs'));
+    // 删除 logs 根目录下超过 60 秒的原子写临时文件，避免异常退出留下的 `.tmp` 持续堆积。
     await cleanStaleTmpFiles(path.join(this.dataDir, 'logs'));
 
-    // 2. Load state & agent-control config
+    // 2. 恢复 Input checkpoint 与 Agent 准入配置。
     this.stateStore = new StateStore(path.join(this.dataDir, 'logs', 'input-state.json'));
     await this.stateStore.load();
 
     this.agentControlManager = new AgentControlManager(
+      // ~/.loongsuite-pilot/agent-control.json
       path.join(this.dataDir, 'agent-control.json'),
     );
     await this.agentControlManager.load();
@@ -162,10 +188,12 @@ export class Orchestrator extends EventEmitter {
       this.config.globalSpanAttributes ?? {},
       path.join(this.dataDir, 'span-attributes.json'),
     );
+    // 写数据的，otlp、jsonl等
     this.flusher = await this.buildFlusher();
 
     // 4. 构建 InputManager 与告警模块。ConfigLoader 已把多来源配置整理完毕，
     // InputManager 在所有 Agent 数据分发前统一执行 userId 注入、内容策略和敏感信息脱敏。
+    // 读取安装的版本号
     const version = readInstalledVersion(this.dataDir);
     this.alarmManager = new AlarmManager({ ip: resolveLocalIp(), version, userId: this.config.userId });
 
@@ -179,7 +207,9 @@ export class Orchestrator extends EventEmitter {
     // 可选的上游 Trace 关联：从 acp-correlate 读取 trace_id/parent_span_id，
     // 让本项目采集的 Agent Span 能挂到调用方的上游 Span 下。
     if (this.config.upstreamLink?.enabled) {
+      //  ~/.loongsuite-pilot/acp-correlate
       const correlateDir = path.join(this.dataDir, 'acp-correlate');
+      // 目录如果不存在，则创建目录
       await ensureDir(correlateDir);
       const store = new CorrelationStore(correlateDir);
       const traceLinker = new TraceLinker(store);
@@ -191,7 +221,7 @@ export class Orchestrator extends EventEmitter {
       logger.info('upstream trace linking enabled', { correlateDir, ttlMs: this.config.upstreamLink.ttlMs });
     }
 
-    // 5. Deploy agent collection capabilities (hooks + plugins, best-effort)
+    // 5. 以 best-effort 部署 Hook、插件及 Worker 包。
     const pilotDir = this.resolvePilotDir();
     this.deploymentManager = new DeploymentManager({
       dataDir: this.dataDir,
@@ -206,13 +236,13 @@ export class Orchestrator extends EventEmitter {
     });
     await this.localWorkerActivationService.start();
 
-    // 6. Register inputs & build detection entries
+    // 6. 注册具体 Input 并构造发现条目。
     const detectionEntries = await this.registerAllInputs();
 
-    // 7. Build deployment detection entries for dynamic discovery
+    // 7. 为运行期新安装的 Agent 构造动态部署条目。
     const deployDetectionEntries = this.buildDeployDetectionEntries();
 
-    // 8. Start AgentDiscoveryService (input entries + deploy detection entries)
+    // 8. 启动 Input 与部署条目共用的 AgentDiscoveryService。
     this.agentDiscoveryService = new AgentDiscoveryService([...detectionEntries, ...deployDetectionEntries]);
     this.agentDiscoveryService.on('agent:started', (id: string) => {
       logger.info('agent detected and started', { id });
@@ -227,11 +257,11 @@ export class Orchestrator extends EventEmitter {
     });
     await this.agentDiscoveryService.start();
 
-    // 9. Start log retention service
+    // 9. 启动本地日志保留服务。
     this.logRetentionService = new LogRetentionService(this.dataDir, this.config.retention);
     this.logRetentionService.start();
 
-    // 10. Start hook watchdog (periodically restores hooks overwritten by other tools)
+    // 10. 启动 Hook Watchdog，周期恢复被其他工具覆盖的配置。
     const hookWatchdogTargets = [
       ...HookWatchdog.defaultTargets(),
       ...this.buildHookWatchdogTargets(),
@@ -243,7 +273,7 @@ export class Orchestrator extends EventEmitter {
     this.hookWatchdog = new HookWatchdog(this.config.hookWatchdog, hookWatchdogTargets, interceptTargets);
     this.hookWatchdog.start();
 
-    // 11. Start updater watchdog only when resolved auto-update is enabled.
+    // 11. 仅在最终自动更新配置启用时启动 Updater Watchdog。
     if (this.config.autoUpdate?.enabled) {
       this.updaterWatchdog = new UpdaterWatchdog({
         enabled: true,
@@ -253,7 +283,7 @@ export class Orchestrator extends EventEmitter {
       this.updaterWatchdog.start();
     }
 
-    // 12. Start pipeline subsystem (disabled by default)
+    // 12. 按配置启动独立 Pipeline 子系统，默认关闭。
     if (this.config.pipeline.enabled) {
       this.pipelineManager = new PipelineManager({
         configDir: path.join(this.dataDir, 'configs', 'local'),
@@ -267,7 +297,7 @@ export class Orchestrator extends EventEmitter {
       logger.info('pipeline subsystem disabled, skipping');
     }
 
-    // 13. Start metrics writer (L1 + L2 every 10min, alarms every 30s → local JSONL + remote via sender.ts)
+    // 13. 启动 MetricsWriter：周期快照、告警、本地 JSONL 与可选远端 sender。
     const slsFlusher = this.getSlsFlusher();
     if (slsFlusher) slsFlusher.setAlarmManager(this.alarmManager);
     this.metricsWriter = new MetricsWriter({
@@ -283,7 +313,7 @@ export class Orchestrator extends EventEmitter {
     });
     await this.metricsWriter.start();
 
-    // 14. Start status bar support (runtime.json + metrics summary + native app)
+    // 14. 启动 runtime.json、指标摘要和可选 macOS 原生状态栏 App。
     if (this.config.statusBar.enabled) {
       const packageVersion = this.readPackageVersion();
 
@@ -311,6 +341,11 @@ export class Orchestrator extends EventEmitter {
     this.legacySlsFailedLogCleanupService.start();
   }
 
+  /**
+   * 按依赖大致逆序停止后台服务、Worker、发现器和 Input，随后 shutdown Flusher 并保存
+   * checkpoint。InputManager.stopAll() 会排空已发事件队列，因此输出器最后关闭。
+   * 重复调用在 isRunning=false 时直接返回。
+   */
   async stop(): Promise<void> {
     if (!this.isRunning) return;
     logger.info('stopping orchestrator');
@@ -339,32 +374,36 @@ export class Orchestrator extends EventEmitter {
     logger.info('orchestrator stopped');
   }
 
+  /** 返回启动后创建的 InputManager；start 前调用属于无效生命周期。 */
   getInputManager(): InputManager {
     return this.inputManager;
   }
 
+  /** 返回 Agent 准入管理器。 */
   getAgentControlManager(): AgentControlManager {
     return this.agentControlManager;
   }
 
+  /** 返回动态发现服务。 */
   getAgentDiscoveryService(): AgentDiscoveryService {
     return this.agentDiscoveryService;
   }
 
+  /** 返回声明式部署管理器。 */
   getDeploymentManager(): DeploymentManager {
     return this.deploymentManager;
   }
 
   /**
-   * Set a fallback user id (typically resolved asynchronously).
+   * 设置异步解析得到的回退 user id；显式配置 userId 仍由 InputManager 优先使用。
    */
   setUserId(userId: string): void {
     this.inputManager?.setUserId(userId);
   }
 
   /**
-   * Build detection entries for agent definitions that haven't been deployed yet.
-   * When a new agent is discovered at runtime, triggers deploySingle().
+   * 为 Agent 声明构造 deploy:<id> 动态发现条目。路径出现且准入允许时调用 deploySingle，
+   * 路径消失不卸载已有配置。
    */
   private buildDeployDetectionEntries(): AgentDetectionEntry[] {
     const defs = this.deploymentManager.getDefinitions();
@@ -395,6 +434,7 @@ export class Orchestrator extends EventEmitter {
     return entries;
   }
 
+  /** 把当前 hook 声明转换为 Watchdog marker 目标，修复动作复用 deploySingle。 */
   private buildHookWatchdogTargets(): PluginCheckTarget[] {
     const defs = this.deploymentManager.getDefinitions();
     const targets: PluginCheckTarget[] = [];
@@ -416,14 +456,10 @@ export class Orchestrator extends EventEmitter {
   }
 
   /**
-   * Self-heal targets for plugin-inject agents (e.g. opencode, qwen-code-cli).
+   * 为 plugin-inject Agent 构造自愈目标，例如 OpenCode、Qwen Code CLI。
    *
-   * Unlike hook agents, these write a plugin spec into the agent's own config
-   * file (not a shared settings.json), so they use the intercept mechanism:
-   * an arbitrary check/repair pair rather than the hook-array-shaped
-   * PluginCheckTarget. The intercept runner also gives us cooldown + a daily
-   * repair cap, which bounds config rewrites (relevant because re-injecting
-   * into a JSONC config strips comments).
+   * 它们把 spec 写入各自配置而非共享 Hook 数组，因此使用任意 check/repair 的 intercept
+   * 机制，并复用冷却和每日上限，限制可能移除 JSONC 注释的配置重写次数。
    */
   private buildPluginInjectInterceptTargets(): InterceptCheckTarget[] {
     const defs = this.deploymentManager.getDefinitions();
@@ -438,14 +474,12 @@ export class Orchestrator extends EventEmitter {
         id: `plugin-inject:${def.id}`,
         enabled: () => this.isAgentGatedEnabled(def.id),
         precondition: async () => {
-          // Only self-heal when the plugin asset is actually deployed AND the
-          // agent is present. Otherwise repair would inject a spec pointing at
-          // a missing file, or fail repeatedly when no config file exists.
+          // 仅在插件资产存在且 Agent 已安装时自愈，避免写入悬空 spec 或持续失败。
           if (pluginFile && !(await fileExists(pluginFile))) return false;
           return detectAgent(def.detection);
         },
         check: async () => {
-          // Healthy == spec still present in the agent's config file.
+          // needsRedeploy=false 表示配置中的 spec 仍然健康。
           return !(await this.deploymentManager.needsRedeploy(def));
         },
         repair: async () => {
@@ -461,9 +495,8 @@ export class Orchestrator extends EventEmitter {
   }
 
   /**
-   * Resolve a plugin spec to a local file path for existence checks.
-   * Returns null for non-file specs (e.g. npm package names), which skips the
-   * plugin-file precondition gate.
+   * 将 file:// 或绝对 plugin spec 解析为本地路径。npm 包名等返回 null，从而跳过文件
+   * 存在性前置门控。
    */
   private resolvePluginSpecPath(spec: string): string | null {
     const resolved = spec.replace(/\$PILOT_DATA/g, this.dataDir);
@@ -471,6 +504,11 @@ export class Orchestrator extends EventEmitter {
     return path.isAbsolute(resolved) ? resolved : null;
   }
 
+  /**
+   * 按配置创建并启动 SLS、JSONL、HTTP、OTLP Trace 输出。每个可选输出启动失败只告警；
+   * 没有任何可用输出时强制创建 JSONL fallback。单个结果直接返回，多结果包装为
+   * MultiFlusher。
+   */
   private async buildFlusher(): Promise<BaseFlusher> {
     const flushers: BaseFlusher[] = [];
     const cfg = this.config.flushers;
@@ -485,6 +523,7 @@ export class Orchestrator extends EventEmitter {
 
     if (cfg.jsonl?.enabled) {
       const r = new JsonlFlusher(cfg.jsonl);
+      // 其实就是创建的输出目录
       await r.start().catch(err => logger.warn('jsonl flusher start failed', { error: String(err) }));
       flushers.push(r);
     }
@@ -529,8 +568,10 @@ export class Orchestrator extends EventEmitter {
   }
 
   /**
-   * Install hook scripts into agent configuration files.
-   * Only installs if the target agent is present on disk.
+   * 历史 Hook 安装实现：检测 Cursor/Qoder 后直接用 HookManager 写配置。
+   *
+   * 当前 `start()` 不调用本方法；生产主链已迁移到 `DeploymentManager.deployAll()`。
+   * 保留它仅为兼容和历史阅读，新增 Agent 不应接入这里。
    */
   private async installHooks(): Promise<void> {
     const hookManager = new HookManager(
@@ -538,7 +579,7 @@ export class Orchestrator extends EventEmitter {
       path.join(this.dataDir, 'logs'),
     );
 
-    // --- Cursor hooks ---
+    // 历史 Cursor Hook 分支。
     const cursorDir = resolveHome('~/.cursor');
     if (await directoryExists(cursorDir)) {
       const cursorHooksPath = resolveHome('~/.cursor/hooks.json');
@@ -567,7 +608,7 @@ export class Orchestrator extends EventEmitter {
       }
     }
 
-    // --- Qoder CLI hooks ---
+    // 历史 Qoder CLI Hook 分支。
     const qoderCliAvailable = await QoderCliInput.checkAvailability();
     if (qoderCliAvailable) {
       const defs = HookManager.buildQoderCliHooks(this.dataDir);
@@ -637,7 +678,7 @@ export class Orchestrator extends EventEmitter {
     const entries: AgentDetectionEntry[] = [];
     const listenerCfg = this.config.listeners;
 
-    // Qoder trace input mutual exclusion closure (used by sqlite/hook/session guards below)
+    // Qoder Trace 的互斥闭包，供下面 SQLite/Hook/Session 门控复用。
     const qoderTraceEnabled = () =>
       this.isAgentGatedEnabled(Orchestrator.LISTENER_AGENT_MAP['qoder-trace']) &&
       this.agentControlManager.resolveEnabled(
@@ -645,7 +686,7 @@ export class Orchestrator extends EventEmitter {
         listenerCfg['qoder-trace']?.enabled ?? true,
       );
 
-    // --- Qoder (SQLite token usage polling, fallback when trace is disabled) ---
+    // Qoder SQLite token 轮询：Trace 关闭时的回退。
     const qoderSqliteInput = new QoderSqliteInput({ stateStore: this.stateStore });
     this.inputManager.registerInput(qoderSqliteInput);
     entries.push(
@@ -662,12 +703,13 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Qoder Work CN Trace (multi-source merge, supersedes hook/log/sqlite) ---
+    // Qoder Work Trace：国际版多源合并 Input；启用后取代对应 Hook/Log/SQLite 来源。
     const qoderWorkTraceInput = new QoderWorkTraceInput({
       stateStore: this.stateStore,
       logDir: path.join(this.dataDir, 'logs', 'qoder-work', 'history'),
     });
     this.inputManager.registerInput(qoderWorkTraceInput);
+    // 该闭包同时提供给 Trace 自身及与它互斥的回退 Input，保证一次判断使用同一门禁规则。
     const qoderWorkTraceEnabled = () => this.isAgentGatedEnabled(Orchestrator.LISTENER_AGENT_MAP['qoder-work-trace']) &&
       this.agentControlManager.resolveEnabled(
         'qoder-work-trace',
@@ -682,7 +724,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // QoderCN trace input mutual exclusion closure
+    // Qoder CN Trace 互斥闭包。
     const qoderCnTraceEnabled = () =>
       this.isAgentGatedEnabled(Orchestrator.LISTENER_AGENT_MAP['qoder-cn-trace']) &&
       this.agentControlManager.resolveEnabled(
@@ -690,7 +732,7 @@ export class Orchestrator extends EventEmitter {
         listenerCfg['qoder-cn-trace']?.enabled ?? true,
       );
 
-    // --- QoderCN (SQLite token usage polling, fallback when trace is disabled) ---
+    // Qoder CN SQLite token 轮询：Trace 关闭时回退。
     const qoderCnSqliteInput = new QoderCnSqliteInput({ stateStore: this.stateStore });
     this.inputManager.registerInput(qoderCnSqliteInput);
     entries.push(
@@ -707,7 +749,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- QoderCN (IDE snapshot — file history + ai_tracker) — disabled when qoder-cn-trace is enabled ---
+    // Qoder CN IDE 快照（文件历史 + ai_tracker）；qoder-cn-trace 启用时关闭。
     const qoderCnInput = new QoderCnInput({ stateStore: this.stateStore });
     this.inputManager.registerInput(qoderCnInput);
     entries.push(
@@ -724,7 +766,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- QoderCN Trace (multi-source merge, supersedes sqlite/ide) ---
+    // Qoder CN Trace：多源合并，取代 SQLite/IDE。
     const qoderCnLogDir = path.join(this.dataDir, 'logs', 'qoder-cn', 'history');
     const qoderCnTraceInput = new QoderCnTraceInput({
       stateStore: this.stateStore,
@@ -740,7 +782,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Qoder Work (Hook JSONL) — disabled when CN trace is active ---
+    // Qoder Work Hook JSONL；CN Trace 活跃时关闭。
     const qoderWorkLogDir = path.join(this.dataDir, 'logs', 'qoder-work', 'history');
     const qoderWorkInput = new QoderWorkInput({
       stateStore: this.stateStore,
@@ -761,7 +803,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Qoder Work (SDK Log tail) — disabled when CN trace is active ---
+    // Qoder Work SDK Log tail；CN Trace 活跃时关闭。
     const qoderWorkLogInput = new QoderWorkLogInput({ stateStore: this.stateStore });
     this.inputManager.registerInput(qoderWorkLogInput);
     entries.push(
@@ -778,7 +820,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Qoder Work (SQLite agents.db) — disabled when CN trace is active ---
+    // Qoder Work SQLite agents.db；CN Trace 活跃时关闭。
     const qoderWorkSqliteInput = new QoderWorkSqliteInput({ stateStore: this.stateStore });
     this.inputManager.registerInput(qoderWorkSqliteInput);
     entries.push(
@@ -795,18 +837,19 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Qoder Work CN ---
+    // Qoder Work CN 系列 Input。
     const qoderWorkCNDataRoot = resolveQoderWorkRoot('cn');
     const qoderWorkCNLogDir = path.join(this.dataDir, 'logs', 'qoder-work-cn', 'history');
     const qoderWorkCNDetectionPath = resolveHome('~/.qoderworkcn');
 
-    // --- Qoder Work CN (Trace: SDK Log + SQLite aggregation) ---
+    // Qoder Work CN Trace：SDK Log 与 SQLite 聚合。
     const qoderWorkCNTraceInput = new QoderWorkCNTraceInput({
       stateStore: this.stateStore,
       agentType: ClientType.QoderWorkCN,
       dataRoot: qoderWorkCNDataRoot,
     });
     this.inputManager.registerInput(qoderWorkCNTraceInput);
+    // CN Trace 开关也被 Hook/Log/SQLite 回退源复用，Trace 活跃时这些来源必须关闭。
     const qoderWorkCNTraceEnabled = () =>
       this.isAgentGatedEnabled(Orchestrator.LISTENER_AGENT_MAP['qoder-work-cn-trace']) &&
       this.agentControlManager.resolveEnabled(
@@ -822,7 +865,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Qoder Work CN (Hook JSONL) — disabled when CN trace is active ---
+    // Qoder Work CN Hook JSONL；CN Trace 活跃时关闭。
     const qoderWorkCNHookInput = new QoderWorkInput({
       stateStore: this.stateStore,
       agentType: ClientType.QoderWorkCN,
@@ -843,7 +886,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Qoder Work CN (SDK Log tail) — disabled when CN trace is active ---
+    // Qoder Work CN SDK Log tail；CN Trace 活跃时关闭。
     const qoderWorkCNLogInput = new QoderWorkLogInput({
       stateStore: this.stateStore,
       agentType: ClientType.QoderWorkCN,
@@ -864,7 +907,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Qoder Work CN (SQLite agents.db) — disabled when CN trace is active ---
+    // Qoder Work CN SQLite agents.db；CN Trace 活跃时关闭。
     const qoderWorkCNSqliteInput = new QoderWorkSqliteInput({
       stateStore: this.stateStore,
       agentType: ClientType.QoderWorkCN,
@@ -885,7 +928,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Qoder Trace (multi-source merge, supersedes hook/session/sqlite) ---
+    // Qoder Trace：多源合并，取代 Hook/Session/SQLite。
     const qoderCliLogDir = path.join(this.dataDir, 'logs', 'qoder', 'history');
     const qoderTraceInput = new QoderTraceInput({
       stateStore: this.stateStore,
@@ -901,7 +944,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Qoder CLI (Hook JSONL) — disabled when qoder-trace is enabled ---
+    // Qoder CLI Hook JSONL；qoder-trace 启用时关闭。
     const qoderCliInput = new QoderCliInput({
       stateStore: this.stateStore,
       logDir: qoderCliLogDir,
@@ -921,7 +964,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Qoder CLI (Native session segments) — disabled when qoder-trace is enabled ---
+    // Qoder CLI 原生 session segments；qoder-trace 启用时关闭。
     const qoderCliSessionInput = new QoderCliSessionInput({ stateStore: this.stateStore });
     this.inputManager.registerInput(qoderCliSessionInput);
     entries.push(
@@ -938,7 +981,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Cursor Hook (Hook JSONL) ---
+    // Cursor Hook 生成的 JSONL。
     const cursorHookLogDir = path.join(this.dataDir, 'logs', 'cursor', 'history');
     const cursorHookInput = new CursorHookInput({
       stateStore: this.stateStore,
@@ -958,7 +1001,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Claude Code Log (OTel plugin JSONL) ---
+    // Claude Code OTel 插件 JSONL。
     const claudeCodeLogDir = this.resolveClaudeCodeLogDir();
     const claudeCodeLogInput = new ClaudeCodeLogInput({
       stateStore: this.stateStore,
@@ -978,12 +1021,9 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Kiro CLI Log (sqlite transcript + hook JSONL) ---
+    // Kiro CLI 日志：SQLite 会话记录与 Hook JSONL。
     const kiroCliLogDir = this.resolveKiroCliLogDir();
-    // Eagerly create the log dir so kiro-cli-log's availability check
-    // (directoryExists) passes on first boot. Without this, the input
-    // never starts because the dir is only created later by the
-    // delayedCollect subprocess — a chicken-egg problem.
+    // 首次启动先建目录，否则 availability 检查失败，而目录又要等 delayedCollect 才创建。
     await ensureDir(kiroCliLogDir);
     const kiroCliLogInput = new KiroCliLogInput({
       stateStore: this.stateStore,
@@ -1003,7 +1043,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Kiro CLI Session (delayed sidecar scan, runs hook processor delayedCollect) ---
+    // Kiro CLI Session：延迟 sidecar 扫描并运行 Hook processor delayedCollect。
     const kiroCliHookProcessorPath = path.join(
       this.dataDir,
       'hooks',
@@ -1030,7 +1070,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Codex rollout transcript (completed and interrupted turns) ---
+    // Codex rollout transcript：统一处理正常结束与中断 turn。
     const codexTranscriptInput = new CodexTranscriptInput({
       stateStore: this.stateStore,
     });
@@ -1048,11 +1088,8 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- OpenCode Log (event_t plugin JSONL) ---
-    // Plugin-inject agents (opencode, qwen-code-cli) don't create their log dirs
-    // during hook deployment (unlike cursor/claude/codex whose shell hooks mkdir -p).
-    // Pre-create here so fs.watch in AgentDiscoveryService succeeds immediately,
-    // avoiding a 5-minute polling fallback delay after fresh install with --purge.
+    // OpenCode event_t 插件 JSONL。plugin-inject 部署不创建日志目录，需在此预建，
+    // 使 fs.watch 立即成功并避免首次安装退回 5 分钟轮询。
     const opencodeLogDir = path.join(this.dataDir, 'logs', 'opencode');
     await ensureDir(opencodeLogDir);
     const opencodeLogInput = new OpenCodeLogInput({
@@ -1073,7 +1110,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Pi Coding Agent Log (Pi extension JSONL) ---
+    // Pi Coding Agent 扩展写出的 JSONL。
     const piCodingAgentLogDir = path.join(this.dataDir, 'logs', 'pi-coding-agent');
     await ensurePiCodingAgentLogDir(piCodingAgentLogDir);
     const piCodingAgentLogInput = new PiCodingAgentLogInput({
@@ -1094,9 +1131,9 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Qwen Code CLI Log (transcript-driven hook JSONL) ---
+    // Qwen Code CLI transcript 驱动的 Hook JSONL。
     const qwenCodeCliLogDir = path.join(this.dataDir, 'logs', 'qwen-code-cli');
-    // Pre-create log dir so fs.watch in AgentDiscoveryService succeeds immediately.
+    // 预建目录使 AgentDiscoveryService 的 fs.watch 立即生效。
     await ensureDir(qwenCodeCliLogDir);
     const qwenCodeCliLogInput = new QwenCodeCliLogInput({
       stateStore: this.stateStore,
@@ -1116,7 +1153,7 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // --- Wukong (CLI API polling) ---
+    // Wukong 本地 CLI API 轮询。
     const wukongInput = new WukongInput({ stateStore: this.stateStore });
     this.inputManager.registerInput(wukongInput);
     entries.push(
@@ -1135,6 +1172,7 @@ export class Orchestrator extends EventEmitter {
     return entries;
   }
 
+  /** 从 Claude OTel 配置读取 log_dir，失败或缺失时回退到 Pilot 日志目录。 */
   private resolveClaudeCodeLogDir(): string {
     try {
       const configPath = path.join(os.homedir(), '.claude', 'otel-config.json');
@@ -1151,6 +1189,7 @@ export class Orchestrator extends EventEmitter {
     return path.join(this.dataDir, 'logs', 'claude-code');
   }
 
+  /** 返回 Kiro CLI 在 Pilot 数据目录中的固定日志路径。 */
   private resolveKiroCliLogDir(): string {
     return path.join(this.dataDir, 'logs', 'kiro-cli');
   }
@@ -1169,8 +1208,7 @@ export class Orchestrator extends EventEmitter {
   }
 
   /**
-   * Resolve the package installation directory by reading the `current` pointer file.
-   * Falls back to dataDir if the versioned layout is not in use.
+   * 从当前 Pilot 目录的 VERSION 读取 package version；读取失败返回 unknown。
    */
   private readPackageVersion(): string {
     try {
@@ -1182,11 +1220,15 @@ export class Orchestrator extends EventEmitter {
         if (match) return match[1].trim();
       }
     } catch {
-      // ignore
+      // 版本只用于状态展示，读取失败不影响采集主流程。
     }
     return 'unknown';
   }
 
+  /**
+   * 解析实际 Pilot 包目录：current 版本目录 -> 旧 package 目录 -> dataDir。
+   * 这样源码、旧布局与多版本安装均能找到 agents.d 和 VERSION。
+   */
   private resolvePilotDir(): string {
     try {
       const currentFile = path.join(this.dataDir, 'current');
@@ -1199,7 +1241,7 @@ export class Orchestrator extends EventEmitter {
         }
       }
     } catch {
-      // current file doesn't exist — legacy or dev layout
+      // current 不存在时继续尝试旧布局或源码开发布局。
     }
 
     const legacyPackageDir = path.join(this.dataDir, 'package');
@@ -1210,6 +1252,7 @@ export class Orchestrator extends EventEmitter {
     return this.dataDir;
   }
 
+  /** 聚合 Input/SLS 计数和空闲时间，生成 MetricsWriter 的 DataflowSnapshot。 */
   private buildDataflowSnapshot(): DataflowSnapshot {
     const inputCounters = this.inputManager.getInputCounters();
     const activeIds = this.inputManager.getActiveInputIds();
@@ -1221,7 +1264,7 @@ export class Orchestrator extends EventEmitter {
       receivedBytesTotal += counter.inBytes;
     }
 
-    // Aggregate flusher runner stats
+    // 所有 SLS endpoint 聚合成一个 flusher runner 汇总。
     const flusherRunner = {
       inEntries: 0, inBytes: 0, outEntries: 0, outFailed: 0,
       totalDelayMs: 0, lastFlushTime: '', startTime: '',
@@ -1229,7 +1272,7 @@ export class Orchestrator extends EventEmitter {
 
     const flushers = new Map<string, { inEntries: number; inBytes: number; outEntries: number; outFailed: number; totalDelayMs: number; lastFlushTime: string; startTime: string; flusherName: string; mode: string; endpoint: string; project: string; logstore: string }>();
 
-    // Get SLS flusher counters if available
+    // 仅 SLS 当前暴露 endpoint 级计数；其他 Flusher 不进入该 Map。
     const slsFlusher = this.getSlsFlusher();
     if (slsFlusher) {
       for (const [epName, counter] of slsFlusher.getEndpointCounters()) {
@@ -1270,6 +1313,7 @@ export class Orchestrator extends EventEmitter {
     };
   }
 
+  /** 从单 Flusher 或 MultiFlusher 中查找首个 SlsFlusher。 */
   private getSlsFlusher(): SlsFlusher | null {
     if (this.flusher instanceof SlsFlusher) return this.flusher;
     if (this.flusher instanceof MultiFlusher) {
@@ -1280,6 +1324,7 @@ export class Orchestrator extends EventEmitter {
     return null;
   }
 
+  /** 返回已初始化的告警管理器。 */
   getAlarmManager(): AlarmManager {
     return this.alarmManager;
   }

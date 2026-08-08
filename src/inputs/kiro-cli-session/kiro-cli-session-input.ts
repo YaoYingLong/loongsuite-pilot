@@ -2,44 +2,26 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * KiroCliSessionInput — delayed sidecar scan scheduler for Kiro CLI.
+ * Kiro CLI sidecar 文件的延迟采集调度器。
  *
- * Background
- *   Kiro CLI's interactive sessions write timing data into a sidecar JSON file
- *   (`~/.kiro/sessions/cli/<session_id>.json` → `user_turn_metadatas[]`)
- *   asynchronously after the stop hook fires. A naive synchronous read in the
- *   stop hook frequently observes `user_turn_metadatas: []` or missing turns,
- *   resulting in step records with `time_unix_nano=0`.
+ * 背景：Kiro CLI 在 Stop Hook 返回后，才异步把耗时信息写入
+ * `~/.kiro/sessions/cli/<session_id>.json` 的 `user_turn_metadatas[]`。如果 Hook 当场同步读取，
+ * 经常只能看到空数组或缺失的 turn，最终使 step 的 `time_unix_nano` 变成 0。
  *
- * Strategy
- *   The stop hook no longer reads anything: it just enqueues a "pending stop"
- *   record (cwd + offsets + assistant_response + userId) into
- *   `$PILOT_DATA/state/kiro-cli/pending-stops/ready/`, then sends SIGUSR1 to
- *   the daemon (PID read from `$PILOT_DATA/loongsuite-pilot.pid`) and returns
- *   `{}` immediately so kiro-cli never blocks on us.
+ * 解决方式：Stop Hook 不解析会话，只把 cwd、offset、assistant_response、userId 等信息写为
+ * `$PILOT_DATA/state/kiro-cli/pending-stops/ready/` 下的一条待处理记录，然后向守护进程发送
+ * `SIGUSR1` 并立即返回 `{}`，因此不会阻塞 Kiro CLI。
  *
- *   On SIGUSR1, this input schedules a collect() after `MATURE_DELAY_MS`
- *   (default 10s) — enough time for the sidecar's `user_turn_metadatas[]` to
- *   be fully flushed. The collect cycle atomically claims each mature pending
- *   record (rename ready/ → inflight/) and spawns
- *   `node kiro-cli-hook-processor.mjs delayedCollect <pending-file>`. The
- *   subprocess reads the (now-mature) sidecar, builds full timing-aware
- *   records, and appends them to the daily hook-jsonl, picked up by
- *   KiroCliLogInput via the standard hook-jsonl pipeline.
+ * 收到信号后，本 Input 等待 `matureDelayMs`（默认 10 秒）再触发 `collect()`，让 sidecar 有时间
+ * 完整落盘。采集周期通过 `rename ready/ -> inflight/` 原子认领记录，并创建 Node.js 子进程执行
+ * `kiro-cli-hook-processor.mjs delayedCollect <pending-file>`。子进程读取成熟的 sidecar、构造带
+ * 正确耗时的记录并追加到每日 Hook JSONL，随后由 `KiroCliLogInput` 走标准输入管道读取。
  *
- *   A low-frequency poll (default 60s) runs as fallback in case the SIGUSR1
- *   signal is lost (e.g. PID file stale, daemon restarted without updating it).
+ * BaseInput 的低频轮询（默认 60 秒）是信号丢失时的兜底。超过 `maxAgeMs`（默认 5 分钟）的记录
+ * 会携带 `--allow-fallback` 强制处理，以当前可得的耗时信息输出，避免永久滞留。
  *
- *   Records older than `MAX_AGE_MS` (default 5 min) are processed with
- *   `--allow-fallback`, accepting whatever timing is available rather than
- *   discarding indefinitely.
- *
- *   On startup, any inflight markers left over from a previous run are
- *   recovered (renamed back to ready/) so we don't lose pending work.
- *
- *   This input itself never emits entries — it returns an empty array from
- *   collect(). All visible records flow out through KiroCliLogInput's
- *   standard pipeline once the subprocess finishes writing the JSONL.
+ * 启动时会把上次崩溃遗留的 inflight 文件退回 ready，停止时移除进程级信号监听器并清除定时器。
+ * 注意本类本身始终返回空事件数组，真正的事件输出发生在子进程写 JSONL 后的 `KiroCliLogInput`。
  */
 
 import { spawn } from 'node:child_process';
@@ -56,17 +38,17 @@ const DEFAULT_SUBPROCESS_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_CONCURRENT_PROCESSES = 4;
 
 export interface KiroCliSessionInputOptions extends InputOptions {
-  /** Absolute path to the hook processor mjs (e.g. <pilotDir>/hooks/kiro-cli-hook-processor.mjs). */
+  /** Hook 处理器 `.mjs` 的绝对路径，例如 `<pilotDir>/hooks/kiro-cli-hook-processor.mjs`。 */
   hookProcessorPath: string;
-  /** Root data directory (e.g. ~/.loongsuite-pilot). */
+  /** Pilot 数据根目录，例如 `~/.loongsuite-pilot`。 */
   dataDir: string;
-  /** ms a pending record must age before being processed (default 10s). */
+  /** 待处理记录至少等待多少毫秒才可认领，默认 10 秒。 */
   matureDelayMs?: number;
-  /** ms after which we force --allow-fallback (default 5 min). */
+  /** 等待超过多少毫秒后强制启用 `--allow-fallback`，默认 5 分钟。 */
   maxAgeMs?: number;
-  /** subprocess wall-clock budget per pending file. */
+  /** 每个待处理文件允许子进程运行的最长毫秒数。 */
   subprocessTimeoutMs?: number;
-  /** how many pending files we'll spawn in parallel per cycle. */
+  /** 单次采集周期最多并行处理的待处理文件数。 */
   maxConcurrent?: number;
 }
 
@@ -86,6 +68,12 @@ interface PendingItem {
   record: PendingRecord;
 }
 
+/**
+ * 协调 Kiro Stop Hook 与延迟 sidecar 解析子进程的 Input。
+ *
+ * Orchestrator 创建并启动此类；`BaseInput` 负责轮询串行化和停止等待，本类另外监听进程级
+ * `SIGUSR1`。ready/inflight 目录组成一个轻量文件队列，原子重命名保证同一任务不会被并发领取。
+ */
 export class KiroCliSessionInput extends BaseInput {
   readonly id = 'kiro-cli-session';
   readonly agentType = ClientType.KiroCli;
@@ -102,6 +90,10 @@ export class KiroCliSessionInput extends BaseInput {
   private pendingCollectTimer: ReturnType<typeof setTimeout> | null = null;
   private signalHandler: (() => void) | null = null;
 
+  /**
+   * 保存目录、延迟、超时与并发配置；此时不创建目录、不注册信号，也不启动子进程。
+   * @param opts Input 通用依赖以及 Hook 处理器和数据目录配置。
+   */
   constructor(opts: KiroCliSessionInputOptions) {
     super({
       stateStore: opts.stateStore,
@@ -118,10 +110,15 @@ export class KiroCliSessionInput extends BaseInput {
     this.maxConcurrent = opts.maxConcurrent ?? DEFAULT_MAX_CONCURRENT_PROCESSES;
   }
 
+  /** 返回发现服务可监听的待处理队列根目录，不会访问文件系统。 */
   static getWatchPaths(dataDir = resolveHome('~/.loongsuite-pilot')): string[] {
     return [path.join(dataDir, 'state', 'kiro-cli', 'pending-stops')];
   }
 
+  /**
+   * 检查延迟采集所需的 Hook 处理器是否可访问。
+   * @returns 文件可访问时为 `true`；不存在或无权限时为 `false`，不向上抛出该检查错误。
+   */
   static async checkAvailability(
     hookProcessorPath: string,
   ): Promise<boolean> {
@@ -133,25 +130,23 @@ export class KiroCliSessionInput extends BaseInput {
     }
   }
 
+  /**
+   * BaseInput 启动阶段回调：创建队列目录、恢复崩溃任务并注册 `SIGUSR1` 监听器。
+   * @throws 目录创建或恢复操作失败时错误会交给 `BaseInput.start()` 处理。
+   */
   protected override async onStart(): Promise<void> {
     await this.ensureDirs();
-    // Recover any inflight markers from a crashed previous run.
+    // 上次进程崩溃时可能来不及完成 inflight 任务；先退回 ready，保证可以重试。
     const recovered = await this.recoverInflight();
     if (recovered > 0) {
       this.logger.info('recovered inflight pending-stops', { count: recovered });
     }
-    // Register SIGUSR1 handler: stop hook sends this signal after enqueueing
-    // a pending record. We debounce with a single timer so rapid-fire signals
-    // don't stack multiple collect() calls.
-    // Use requestCollection() (not collect() directly) to go through runCycle
-    // serialization — ensures poll and signal don't run concurrently, and
-    // onStop()'s cyclePromise await covers signal-triggered cycles too.
+    // Stop Hook 入队后发送 SIGUSR1。每次信号都重置同一个定时器，避免密集信号堆积多次 collect()。
+    // 必须调用 requestCollection() 而非直接调用 collect()，这样信号和轮询都会经过 BaseInput 的
+    // runCycle 串行化；停止流程也能等待信号触发的采集周期结束。
     //
-    // Signal contract: SIGUSR1 is process-global — Node fires ALL registered
-    // listeners on every signal. We only register here (and detach on stop),
-    // so there's no contention today. If a future component also needs
-    // SIGUSR1, it will fire on every kiro stop event too; at that point
-    // switch to a targeted IPC channel (e.g. named pipe / file flag) instead.
+    // SIGUSR1 属于进程全局信号，Node.js 会调用全部同名监听器。目前只有本类使用；如果将来还有
+    // 组件需要 SIGUSR1，应改用命名管道或标记文件等定向 IPC，避免每次 Kiro 事件误触发其他组件。
     this.signalHandler = () => {
       if (this.pendingCollectTimer) clearTimeout(this.pendingCollectTimer);
       this.pendingCollectTimer = setTimeout(() => {
@@ -162,6 +157,7 @@ export class KiroCliSessionInput extends BaseInput {
     process.on('SIGUSR1', this.signalHandler);
   }
 
+  /** 停止阶段移除进程信号监听器并取消尚未触发的延迟采集定时器。 */
   protected override async onStop(): Promise<void> {
     if (this.signalHandler) {
       process.off('SIGUSR1', this.signalHandler);
@@ -173,10 +169,12 @@ export class KiroCliSessionInput extends BaseInput {
     }
   }
 
+  /**
+   * 找出已经成熟的 ready 记录，并在并发上限内交给子进程处理。
+   * @returns 始终为空数组；子进程写出的 JSONL 之后由 `KiroCliLogInput` 发出。
+   */
   protected async collect(): Promise<AgentActivityEntry[]> {
-    // Guard against signal-triggered collect after stop() — requestCollection()
-    // checks this.running internally, but the timer callback could fire in the
-    // window between stop() clearing _running and the timer being cleared.
+    // 防止停止过程中的竞态：定时器可能恰好在 running 置为 false 与 clearTimeout 之间触发。
     if (!this.running) return [];
     await this.ensureDirs();
     const items = await this.listReady();
@@ -193,14 +191,15 @@ export class KiroCliSessionInput extends BaseInput {
     if (due.length === 0) return [];
 
     await Promise.all(due.map((item) => this.processOne(item, now)));
-    // This input never emits entries; downstream visibility comes from
-    // KiroCliLogInput reading the daily-jsonl appended by the subprocess.
+    // 本 Input 不直接发事件；下游可见数据来自 KiroCliLogInput 对子进程追加 JSONL 的读取。
     return [];
   }
 
+  /** 原子认领一个任务，按处理器状态删除或退回任务；异常时保留任务以供后续轮询重试。 */
   private async processOne(item: PendingItem, nowMs: number): Promise<void> {
     const claimed = await this.claim(item.readyPath);
-    if (!claimed) return; // someone else (or restart cleanup) took it
+    // rename 失败通常说明另一个周期或恢复流程已经取得该文件，本周期无需重复处理。
+    if (!claimed) return;
 
     const stopMs = item.record.stopUnixMs ?? item.record.enqueueMs ?? nowMs;
     const allowFallback = nowMs - stopMs >= this.maxAgeMs;
@@ -214,8 +213,7 @@ export class KiroCliSessionInput extends BaseInput {
       } else if (status === 'timing_pending') {
         await this.releaseInflight(claimed);
       } else {
-        // Unknown status — release so we retry next cycle, but cap retries
-        // via stop age (eventually --allow-fallback kicks in).
+        // 未知状态也退回队列；任务达到 maxAgeMs 后会自动启用 fallback，避免无期限重试。
         await this.releaseInflight(claimed);
       }
     } catch (err) {
@@ -223,12 +221,15 @@ export class KiroCliSessionInput extends BaseInput {
         file: claimed,
         error: String(err),
       });
-      // Release for retry; if it keeps failing, MAX_AGE_MS branch will
-      // force fallback emission eventually.
+      // 子进程失败时退回队列；持续失败的老任务最终会通过 maxAgeMs 分支强制 fallback。
       await this.releaseInflight(claimed);
     }
   }
 
+  /**
+   * 创建独立 Node.js 子进程执行 Hook 处理器，并把其 stdout 中的状态解析为字符串。
+   * @throws 启动失败、超时或非零退出码时拒绝 Promise；调用方负责记录并重新排队。
+   */
   private spawnProcessor(args: string[]): Promise<string> {
     return new Promise((resolve, reject) => {
       const child = spawn(process.execPath, [this.hookProcessorPath, ...args], {
@@ -242,7 +243,7 @@ export class KiroCliSessionInput extends BaseInput {
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
-        try { child.kill('SIGKILL'); } catch { /* ignore */ }
+        try { child.kill('SIGKILL'); } catch { /* 忽略终止阶段的二次错误。 */ }
         reject(new Error(`delayedCollect timeout after ${this.subprocessTimeoutMs}ms`));
       }, this.subprocessTimeoutMs);
 
@@ -267,6 +268,7 @@ export class KiroCliSessionInput extends BaseInput {
     });
   }
 
+  /** 读取并解析 ready 目录，删除无法解析的坏 JSON，再按入队时间从早到晚排序。 */
   private async listReady(): Promise<PendingItem[]> {
     let names: string[];
     try {
@@ -283,14 +285,15 @@ export class KiroCliSessionInput extends BaseInput {
         const record = JSON.parse(raw) as PendingRecord;
         items.push({ readyPath, record });
       } catch {
-        // Corrupt record — discard so it doesn't keep poisoning the queue.
-        try { await fs.unlink(readyPath); } catch { /* ignore */ }
+        // 损坏记录无法恢复；删除它，避免每个轮询周期都被同一个文件干扰。
+        try { await fs.unlink(readyPath); } catch { /* 删除失败时忽略，后续周期仍会重试。 */ }
       }
     }
     items.sort((a, b) => (a.record.enqueueMs ?? 0) - (b.record.enqueueMs ?? 0));
     return items;
   }
 
+  /** 通过同一文件系统内的原子 rename 把 ready 任务认领为 inflight。 */
   private async claim(readyPath: string): Promise<string | null> {
     const base = path.basename(readyPath);
     const inflightPath = path.join(this.inflightDir, base);
@@ -302,20 +305,23 @@ export class KiroCliSessionInput extends BaseInput {
     }
   }
 
+  /** 任务成功或确认无数据后删除 inflight 标记；删除失败按 fail-open 处理。 */
   private async discardInflight(inflightPath: string): Promise<void> {
-    try { await fs.unlink(inflightPath); } catch { /* ignore */ }
+    try { await fs.unlink(inflightPath); } catch { /* 清理失败按 fail-open 处理。 */ }
   }
 
+  /** 把可重试任务移回 ready；若无法回移则删除残留，避免队列卡死。 */
   private async releaseInflight(inflightPath: string): Promise<void> {
     const base = path.basename(inflightPath);
     const readyPath = path.join(this.readyDir, base);
     try {
       await fs.rename(inflightPath, readyPath);
     } catch {
-      try { await fs.unlink(inflightPath); } catch { /* ignore */ }
+      try { await fs.unlink(inflightPath); } catch { /* 回移和删除均失败时等待后续恢复。 */ }
     }
   }
 
+  /** 启动时将崩溃遗留的 inflight 文件恢复到 ready，并返回成功恢复的数量。 */
   private async recoverInflight(): Promise<number> {
     let names: string[];
     try {
@@ -332,36 +338,34 @@ export class KiroCliSessionInput extends BaseInput {
         await fs.rename(inflightPath, readyPath);
         n++;
       } catch {
-        try { await fs.unlink(inflightPath); } catch { /* ignore */ }
+        try { await fs.unlink(inflightPath); } catch { /* 无法恢复的残留留待下次启动处理。 */ }
       }
     }
     return n;
   }
 
+  /** 递归创建 ready 和 inflight 目录；目录已存在时不会报错。 */
   private async ensureDirs(): Promise<void> {
     await fs.mkdir(this.readyDir, { recursive: true });
     await fs.mkdir(this.inflightDir, { recursive: true });
   }
 }
 
+/** 从 Hook 处理器的多行 stdout 中找出第一条含字符串 `status` 的 JSON 对象。 */
 function parseStatus(stdout: string): string {
-  // Hook processor dispatcher writes `{status:<s>}\n` from the subcommand itself,
-  // then its `finally` block unconditionally appends a trailing `{}` as the
-  // fail-open default for every hook event. Reading the *last* line therefore
-  // yielded `{}` (no `status` field) and every cycle was mis-classified as
-  // 'unknown' → released back to ready/. Scan lines and pick the first real
-  // status-bearing object.
+  // 子命令先写 `{status:<s>}\n`，dispatcher 的 finally 又固定追加 fail-open 默认值 `{}`。
+  // 因此不能只取最后一行，否则所有任务都会被误判为 unknown 并反复退回 ready。
   const lines = stdout.split('\n').filter((l) => l.trim().length > 0);
   for (const line of lines) {
     try {
       const obj = JSON.parse(line);
       if (obj && typeof obj.status === 'string') return obj.status;
     } catch {
-      // ignore parse error — keep scanning
+      // stdout 可能混有普通日志或不完整 JSON；忽略当前行并继续寻找真正的状态对象。
     }
   }
   return 'unknown';
 }
 
-// Re-export to satisfy `directoryExists` import if needed elsewhere.
+// 重新导出通用目录检查函数，供已有外部调用者继续从本模块导入。
 export { directoryExists };

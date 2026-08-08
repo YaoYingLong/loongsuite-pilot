@@ -1,8 +1,9 @@
 /**
- * source-event.mjs — Convert Cursor hook stdin payload to internal event.
+ * 把 Cursor Hook stdin payload 转为 journal 内部事件。
  *
- * Sanitizes tool_use_id (strips \n suffix), extracts fields by hook event type,
- * and produces a flat internal event object for the event journal.
+ * `cursor-hook-processor.mjs` 在 JSON 校验后调用 `toInternalEvent()`。本模块按 Hook 类型选择
+ * 有意义字段、把数字字符串转成有限 Number，并清理 `tool_use_id` 尾部换行，最后返回便于
+ * JSONL 追加的扁平对象。它不读写文件，也不抛出主动异常；未映射字段不会进入 journal。
  */
 
 export function sanitizeToolCallId(raw) {
@@ -12,6 +13,7 @@ export function sanitizeToolCallId(raw) {
 }
 
 export function toInternalEvent(payload) {
+  // 不同 Cursor 版本使用过三种字段名，按新到旧顺序兼容读取。
   const hookEvent = payload.hook_event_name || payload.hookEvent || payload.hookEventName || 'unknown';
   const conversationId = payload.conversation_id || payload.session_id || '';
   const sessionId = payload.session_id || payload.conversation_id || '';
@@ -115,7 +117,7 @@ export function toInternalEvent(payload) {
       break;
   }
 
-  // common metadata
+  // 最后附加所有事件都需要的公共元数据。
   event.cursor_version = payload.cursor_version || undefined;
   event.user_email = payload.user_email || undefined;
   event.workspace_roots = payload.workspace_roots || undefined;

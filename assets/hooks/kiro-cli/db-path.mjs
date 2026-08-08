@@ -13,6 +13,7 @@
  *        Windows %APPDATA%/kiro-cli/data.sqlite3
  *
  * resolveDbDir() 返回不含 data.sqlite3 的目录；resolveDbPath() 返回完整文件路径。
+ * 本模块只计算路径，不检查或创建文件；调用者 transcript-parser 再以只读方式打开数据库。
  */
 
 import os from 'node:os';

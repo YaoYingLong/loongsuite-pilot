@@ -1,12 +1,13 @@
 /**
- * event-journal.mjs — Cursor append-only event journal.
+ * Cursor 只追加事件 journal 及并发压缩工具。
  *
- * All Cursor hook events (parent + child sessions + subagent meta) are appended
- * to a single JSONL file. On parent stop, the processor reads the full journal,
- * assembles the turn, then rewrites the journal with only uncompleted events.
+ * 父会话、子会话和 subagent 元事件都会由不同 Hook 子进程追加到同一 JSONL。父 stop 时
+ * processor 读取快照、组装完成 turn，然后仅保留未完成事件重写 journal。追加与重写共用
+ * `event-journal.lock` 独占锁，防止 stop 压缩覆盖并发新事件；重写还会把快照之后追加的记录
+ * 合并回来。锁等待最多 3 秒，2 秒以上锁视为可能由崩溃进程遗留并尝试回收。
  *
- * Append-only writes are serialized with rewrite via a lock file so stop-time
- * journal compaction cannot overwrite events appended by parallel hook processes.
+ * 本模块使用同步 I/O，因为每个 Hook 都是短生命周期独立进程，必须在返回宿主前完成状态提交。
+ * 写入异常向 processor 抛出，由其记录错误并 fail-open；损坏的旧 JSONL 行会被跳过。
  */
 
 import fs from 'node:fs';
@@ -56,6 +57,7 @@ export function rewriteJournal(remainingEvents, snapshotEvents = null) {
       return;
     }
 
+    // 同目录临时文件 + rename，确保其他进程只看到旧版或完整新版 journal。
     const tmp = JOURNAL_FILE + `.${process.pid}.tmp`;
     try {
       const content = finalEvents.map(e => JSON.stringify(e)).join('\n') + '\n';
@@ -92,10 +94,8 @@ function mergeConcurrentAppends(remainingEvents, snapshotEvents) {
 }
 
 /**
- * Stable dedup key for journal events.
- * Uses semantic fields instead of JSON.stringify to avoid sensitivity to
- * property serialization order (which varies across V8 versions) and
- * reduces overhead for large payloads (e.g. tool_output).
+ * 为 journal 事件生成稳定去重键。
+ * 使用语义字段而非 JSON.stringify，避免 V8 版本间属性顺序差异，也避免复制大型 tool_output。
  */
 function stableEventKey(event) {
   return [
@@ -115,7 +115,7 @@ function parseJournalContent(content) {
     try {
       events.push(JSON.parse(trimmed));
     } catch {
-      // skip corrupted lines
+      // 跳过损坏行；保留其余可恢复事件。
     }
   }
   return events;

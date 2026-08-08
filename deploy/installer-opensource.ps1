@@ -1,6 +1,6 @@
-﻿# installer-opensource.ps1 — Open-source installer for loongsuite-pilot (Windows)
+﻿# installer-opensource.ps1：loongsuite-pilot Windows 开源版安装器。
 #
-# Install (first time):
+# 首次安装：
 #   irm https://loongcollector-community-edition.oss-cn-shanghai.aliyuncs.com/loongsuite-pilot/installer.ps1 | iex
 #   .\installer-opensource.ps1 install `
 #     -SlsEndpoint "https://cn-hangzhou.log.aliyuncs.com" `
@@ -9,16 +9,23 @@
 #     -SlsAkId "your-ak-id" `
 #     -SlsAkSecret "your-ak-secret"
 #
-# Install a specific version:
+# 安装指定版本：
 #   .\installer-opensource.ps1 install -Version 1.2.0
 #
-# Upgrade (preserve config, auto-rollback on failure):
+# 升级；按设计保留配置，失败时自动回滚：
 #   .\installer-opensource.ps1 upgrade
 #
-# Uninstall:
+# 卸载：
 #   .\installer-opensource.ps1 uninstall
 #   .\installer-opensource.ps1 uninstall -Purge
 
+# 本脚本是 loongsuite-pilot 开源版 Windows 安装器。它与 Bash 安装器保持相同的
+# versions/current/previous 和配置合并语义，但使用 zip、Expand-Archive、PowerShell shim
+# 与 Task Scheduler。安装会下载解压、执行 Agent probe、安装 npm 生产依赖、运行 postinstall、
+# 写入 config 并安装稳定运维 CLI；升级健康检查失败时回滚，卸载清理 Agent Hook/插件配置。
+# 网络、文件系统、npm 和 Scheduled Task 都是外部副作用，未捕获错误会返回非零退出码。
+
+# CmdletBinding 启用标准参数绑定；ValidateSet 会在业务逻辑前拒绝未知子命令。
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
@@ -53,7 +60,7 @@ $ErrorActionPreference = "Stop"
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 # ============================================================
-# Constants
+# 常量
 # ============================================================
 $PACKAGE_NAME = "loongsuite-pilot"
 $DEFAULT_DATA_DIR = Join-Path $env:USERPROFILE ".loongsuite-pilot"
@@ -62,7 +69,7 @@ $PERMANENT_DIR = Join-Path $DEFAULT_DATA_DIR "package"
 $_OSS_BASE_URL = "https://loongcollector-community-edition.oss-cn-shanghai.aliyuncs.com/loongsuite-pilot"
 
 # ============================================================
-# Defaults
+# 默认值
 # ============================================================
 if (-not $DataDir) { $DataDir = $DEFAULT_DATA_DIR }
 if (-not $PackageUrl -and $env:LOONGSUITE_PILOT_PACKAGE_URL) {
@@ -70,7 +77,7 @@ if (-not $PackageUrl -and $env:LOONGSUITE_PILOT_PACKAGE_URL) {
 }
 
 # ============================================================
-# Validate mask options
+# 校验脱敏参数组合。
 # ============================================================
 if ($MaskMode) {
     if ($MaskMode -notin @("all", "none", "custom")) {
@@ -88,7 +95,7 @@ if ($MaskTypes -and $MaskMode -ne "custom") {
 }
 
 # ============================================================
-# Resolve package URL
+# 解析显式版本或 latest 对应的发布包 URL。
 # ============================================================
 if (-not $PackageUrl) {
     if ($Version) {
@@ -99,8 +106,9 @@ if (-not $PackageUrl) {
 }
 
 # ============================================================
-# Language detection
+# 提示语言检测
 # ============================================================
+# 根据显式参数和系统 UI culture 选择中英文提示。
 function Detect-Lang {
     if ($Lang) { return $Lang }
     if ($env:LOONGSUITE_PILOT_LANG) { return $env:LOONGSUITE_PILOT_LANG }
@@ -113,14 +121,16 @@ function Detect-Lang {
 
 $LANG_MODE = Detect-Lang
 
+# 按当前语言从中英文文本中选择一个写到标准输出。
 function Msg {
     param([string]$zh, [string]$en)
     if ($LANG_MODE -eq "zh") { Write-Host $zh } else { Write-Host $en }
 }
 
 # ============================================================
-# Node.js resolution
+# Node.js 解析
 # ============================================================
+# 执行候选 node --version，确认存在且主版本不低于 18。
 function Test-NodeSuitable {
     param([string]$bin)
     if (-not (Test-Path $bin)) { return $false }
@@ -132,6 +142,7 @@ function Test-NodeSuitable {
     } catch { return $false }
 }
 
+# 按 node-bin、nvm-windows、fnm、Volta、Program Files 和 PATH 解析可用 Node，并更新 pin。
 function Resolve-Node {
     $candidates = @()
 
@@ -159,11 +170,11 @@ function Resolve-Node {
     $voltaNode = Join-Path $env:USERPROFILE ".volta\bin\node.exe"
     $candidates += $voltaNode
 
-    # Common install paths
+    # 常见安装路径。
     $candidates += "C:\Program Files\nodejs\node.exe"
     $candidates += "C:\Program Files (x86)\nodejs\node.exe"
 
-    # PATH lookup
+    # 最后查询 PATH。
     $pathNode = Get-Command node -ErrorAction SilentlyContinue
     if ($pathNode) { $candidates += $pathNode.Source }
 
@@ -176,11 +187,12 @@ function Resolve-Node {
 }
 
 # ============================================================
-# Check dependencies
+# 依赖检查
 # ============================================================
 $script:NODE_BIN = ""
 $script:NPM_BIN = ""
 
+# 验证 Node、npm 和 Windows 环境前置条件，缺失时抛错终止安装。
 function Check-Deps {
     Msg "==> 检查依赖..." "==> Checking dependencies..."
 
@@ -199,11 +211,11 @@ function Check-Deps {
         exit 1
     }
 
-    # Pin node binary path
+    # 固定 Node 绝对路径，供 Hook 和后台任务复用。
     if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
     Set-Content -Path (Join-Path $DataDir "node-bin") -Value $script:NODE_BIN
 
-    # Derive npm
+    # 从同一 Node 安装目录解析 npm，避免 PATH 指向另一版本。
     $npmPath = Join-Path (Split-Path $script:NODE_BIN) "npm.cmd"
     if (Test-Path $npmPath) {
         $script:NPM_BIN = $npmPath
@@ -227,10 +239,11 @@ function Check-Deps {
 }
 
 # ============================================================
-# Download and extract package
+# 下载并解压发布包
 # ============================================================
 $script:INSTALL_SRC = ""
 
+# 下载或复制 zip 到临时目录，Expand-Archive 后定位 package.json 所在包根。
 function Download-AndExtract {
     $tmpDir = Join-Path $env:TEMP "loongsuite-pilot-install-$(Get-Random)"
     New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
@@ -278,10 +291,11 @@ function Download-AndExtract {
 }
 
 # ============================================================
-# Agent probe
+# Agent 探测
 # ============================================================
 $script:PROBE_RESULT = "[]"
 
+# 调用 cli-probe.cjs 探测本机 Agent，并解析其 JSON 输出。
 function Probe-Agents {
     Msg "==> 探测 AI Agent..." "==> Probing AI Agents..."
     $probeScript = Join-Path $script:INSTALL_SRC "dist\cli-probe.cjs"
@@ -305,10 +319,11 @@ function Probe-Agents {
 }
 
 # ============================================================
-# Agent selection
+# Agent 选择
 # ============================================================
 $script:SELECTED_AGENTS = $Agents
 
+# 解析 -Agents 或交互选择，返回写入配置的启用 Agent ID。
 function Select-Agents {
     if ($script:SELECTED_AGENTS) {
         Msg "    使用指定的 Agent: $($script:SELECTED_AGENTS)" "    Using specified agents: $($script:SELECTED_AGENTS)"
@@ -321,7 +336,7 @@ function Select-Agents {
     $ErrorActionPreference = $prevEAP
     if (-not $agentCount -or $agentCount -eq "0") { return }
 
-    # Non-interactive detection
+    # 非交互模式使用探测结果或显式列表。
     $isInteractive = [Environment]::UserInteractive -and $Host.UI.RawUI -ne $null
     if (-not $isInteractive) {
         $prevEAP = $ErrorActionPreference; $ErrorActionPreference = "Continue"
@@ -337,7 +352,7 @@ process.stdout.write(detected.join(','));
         return
     }
 
-    # Interactive menu
+    # 交互模式显示可选 Agent 菜单。
     $prevEAP = $ErrorActionPreference; $ErrorActionPreference = "Continue"
     $script:PROBE_RESULT | & $script:NODE_BIN -e @'
 const r = JSON.parse(require('fs').readFileSync(0,'utf-8'));
@@ -388,8 +403,9 @@ process.stdout.write(ids.join(','));
 }
 
 # ============================================================
-# Prompt for userId
+# 询问事件 userId
 # ============================================================
+# 处理 Prompt-UserId 的交互输入；非交互模式使用调用参数或安全默认值。
 function Prompt-UserId {
     if ($UserId) { return }
     $isInteractive = [Environment]::UserInteractive -and $Host.UI.RawUI -ne $null
@@ -424,8 +440,9 @@ try { const c=JSON.parse(require('fs').readFileSync(process.argv[1],'utf-8')); p
 }
 
 # ============================================================
-# Confirm config overwrite
+# 确认配置覆盖
 # ============================================================
+# 处理 Confirm-ConfigOverwrite 的交互输入；非交互模式使用调用参数或安全默认值。
 function Confirm-ConfigOverwrite {
     $configFile = Join-Path $DataDir "config.json"
     if (-not (Test-Path $configFile)) { return }
@@ -487,8 +504,9 @@ for (const c of changed) { console.log(c.label + ': ' + c.oldVal + ' -> ' + c.ne
 }
 
 # ============================================================
-# Deploy bootstrap scripts
+# 部署稳定启动垫片
 # ============================================================
+# 从新版本复制稳定 Collector/Updater daemon 到缓存 bin，使 Task action 不依赖版本目录。
 function Deploy-BootstrapScripts {
     $srcDir = Join-Path $script:PERMANENT_DIR "scripts"
     $bootDir = Join-Path $env:USERPROFILE ".loongsuite-pilot\bin"
@@ -497,8 +515,9 @@ function Deploy-BootstrapScripts {
 }
 
 # ============================================================
-# Deploy package to versions/ directory
+# 部署包到不可变 versions 目录
 # ============================================================
+# 复制到不可变 versions 目录、安装生产依赖并原子更新 current/previous。
 function Deploy-Package {
     param([string]$src)
     $cacheDir = Join-Path $env:USERPROFILE ".loongsuite-pilot"
@@ -569,6 +588,9 @@ function Deploy-Package {
 
     Msg "==> 部署 hook 脚本..." "==> Deploying hook scripts..."
     $postinstallScript = Join-Path $script:PERMANENT_DIR "scripts\postinstall.js"
+    # `$DataDir` 参数不会自动写入子进程环境变量 LOONGSUITE_PILOT_DATA_DIR。
+    # 因此自定义 -DataDir 时，postinstall 的 Hook/Plugin/Skill 实际落点需后续核实；
+    # 未确认前不能假定它与 config.json 中 dataDir 一致。
     if (Test-Path $postinstallScript) {
         $prevEAP = $ErrorActionPreference; $ErrorActionPreference = "Continue"
         & $script:NODE_BIN $postinstallScript
@@ -579,8 +601,9 @@ function Deploy-Package {
 }
 
 # ============================================================
-# Migrate legacy layout
+# 迁移旧单目录布局
 # ============================================================
+# 把旧 package 单目录迁入 versions，并建立 current 指针，保持升级兼容。
 function Migrate-LegacyLayout {
     $cacheDir = Join-Path $env:USERPROFILE ".loongsuite-pilot"
     $currentFile = Join-Path $cacheDir "current"
@@ -615,14 +638,15 @@ function Migrate-LegacyLayout {
 }
 
 # ============================================================
-# Write config.json
+# 合并并写入 config.json
 # ============================================================
+# 合并旧 config.json 与本次参数，通过临时文件原子替换并保留未涉及字段。
 function Write-Config {
     $configFile = Join-Path $DataDir "config.json"
     Msg "==> 写入配置文件 $configFile ..." "==> Writing config to $configFile ..."
     if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
 
-    # Bundle all params as JSON to avoid PowerShell dropping empty-string args to native commands
+    # 把参数打包为 JSON，避免 PowerShell 调原生命令时丢失空字符串参数。
     $cfgArgs = [ordered]@{
         configPath        = $configFile
         dataDir           = $DataDir
@@ -721,21 +745,22 @@ fs.writeFileSync(opts.configPath, JSON.stringify(config, null, 2) + '\n');
 }
 
 # ============================================================
-# Install loongsuite-pilot command (batch wrapper)
+# 安装 loongsuite-pilot PowerShell 与 cmd 命令入口
 # ============================================================
+# 安装 PowerShell CLI 和 cmd shim 到用户 PATH，并刷新用户级 PATH 设置。
 function Install-Command {
     Msg "==> 安装服务管理脚本..." "==> Installing service management script..."
     $binDir = Join-Path $env:USERPROFILE ".local\bin"
     if (-not (Test-Path $binDir)) { New-Item -ItemType Directory -Path $binDir -Force | Out-Null }
 
-    # Copy the PowerShell service management script
+    # 复制 PowerShell 服务管理脚本。
     $ps1File = Join-Path $binDir "loongsuite-pilot.ps1"
     $ps1Src = Join-Path $script:PERMANENT_DIR "scripts\loongsuite-pilot.ps1"
     if (Test-Path $ps1Src) {
         Copy-Item $ps1Src $ps1File -Force
     }
 
-    # Create a .cmd shim that forwards to the PowerShell script
+    # 创建转发到 PowerShell 脚本的 .cmd shim。
     $cmdFile = Join-Path $binDir "loongsuite-pilot.cmd"
     $cmdContent = @'
 @echo off
@@ -744,7 +769,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0loongsuite-pilot.p
     Set-Content -Path $cmdFile -Value $cmdContent -Encoding ASCII
     Msg "    ✅ 已安装: $cmdFile" "    ✅ Installed: $cmdFile"
 
-    # Add to user PATH if not already there
+    # 尚未存在时加入用户级 PATH。
     $userPath = [Environment]::GetEnvironmentVariable("Path", "User")
     if ($userPath -notlike "*$binDir*") {
         [Environment]::SetEnvironmentVariable("Path", "$binDir;$userPath", "User")
@@ -755,8 +780,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0loongsuite-pilot.p
 }
 
 # ============================================================
-# Version helpers
+# 版本辅助函数
 # ============================================================
+# 读取并返回/展示 Get-InstalledVersion 对应信息，不改变服务运行状态。
 function Get-InstalledVersion {
     $cacheDir = Join-Path $env:USERPROFILE ".loongsuite-pilot"
     $currentFile = Join-Path $cacheDir "current"
@@ -783,6 +809,7 @@ function Get-InstalledVersion {
     return ""
 }
 
+# 读取并返回/展示 Get-VersionFromDir 对应信息，不改变服务运行状态。
 function Get-VersionFromDir {
     param([string]$dir)
     $vf = Join-Path $dir "VERSION"
@@ -795,6 +822,7 @@ function Get-VersionFromDir {
     return ""
 }
 
+# 读取并返回/展示 Get-CommitFromDir 对应信息，不改变服务运行状态。
 function Get-CommitFromDir {
     param([string]$dir)
     $vf = Join-Path $dir "VERSION"
@@ -807,6 +835,7 @@ function Get-CommitFromDir {
     return ""
 }
 
+# 读取并返回/展示 Show-VersionInfo 对应信息，不改变服务运行状态。
 function Show-VersionInfo {
     param([string]$dir)
     $vf = Join-Path $dir "VERSION"
@@ -824,8 +853,9 @@ function Show-VersionInfo {
 }
 
 # ============================================================
-# Print summary
+# 打印安装摘要
 # ============================================================
+# 读取并返回/展示 Print-Summary 对应信息，不改变服务运行状态。
 function Print-Summary {
     param([string]$action)
     $configFile = Join-Path $DataDir "config.json"
@@ -855,8 +885,9 @@ function Print-Summary {
 }
 
 # ============================================================
-# Stop service by PID file
+# 通过已安装 CLI/PID 停止服务
 # ============================================================
+# best-effort 调用已安装 CLI stop，为升级/卸载释放文件和 Scheduled Task。
 function Stop-PilotService {
     $pidFile = Join-Path $DataDir "loongsuite-pilot.pid"
     if (Test-Path $pidFile) {
@@ -880,7 +911,7 @@ function Stop-PilotService {
         Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
     }
 
-    # Also try the loongsuite-pilot command (use .ps1 directly to avoid cmd.exe popup)
+    # 同时尝试直接调用 loongsuite-pilot.ps1，避免 cmd.exe 窗口弹出。
     $ps1Path = Join-Path $env:USERPROFILE ".local\bin\loongsuite-pilot.ps1"
     if (Test-Path $ps1Path) {
         $prevEAP = $ErrorActionPreference; $ErrorActionPreference = "Continue"
@@ -890,8 +921,9 @@ function Stop-PilotService {
 }
 
 # ============================================================
-# GC old versions
+# 回收旧版本
 # ============================================================
+# 只保留 current/previous 指向版本，删除其余历史版本目录。
 function GC-OldVersions {
     $cacheDir = Join-Path $env:USERPROFILE ".loongsuite-pilot"
     $versionsDir = Join-Path $cacheDir "versions"
@@ -912,8 +944,9 @@ function GC-OldVersions {
 }
 
 # ============================================================
-# Remove hook configs
+# 清理 Hook 配置
 # ============================================================
+# 幂等清理 Remove-HookConfigs 对应的文件或 Agent 配置，目标不存在时继续。
 function Remove-HookConfigs {
     $HOOK_MARKER = ".loongsuite-pilot"
     $configs = @(
@@ -968,11 +1001,11 @@ try {
 }
 
 # ============================================================
-# Remove plugin-inject specs (OpenCode)
+# 清理 OpenCode plugin-inject spec
 # ============================================================
-# OpenCode uses deployMode "plugin-inject": a spec is written into its own
-# config file's plugin array, not a shared settings.json. Remove-HookConfigs
-# does not cover it, so clean it here to avoid a dangling spec.
+# OpenCode 使用 deployMode `plugin-inject`：spec 写入自身配置文件的 plugin 数组，而非共享
+# settings.json。Remove-HookConfigs 不覆盖该位置，因此在这里清理，避免留下悬空 spec。
+# 幂等清理 Remove-OpenCodePlugin 对应的文件或 Agent 配置，目标不存在时继续。
 function Remove-OpenCodePlugin {
     $configs = @(
         (Join-Path $env:USERPROFILE ".config\opencode\opencode.jsonc"),
@@ -1024,8 +1057,9 @@ try {
 }
 
 # ============================================================
-# Remove Pi Coding Agent extension injection
+# 清理 Pi Coding Agent extension 注入
 # ============================================================
+# 幂等清理 Remove-PiCodingAgentExtension 对应的文件或 Agent 配置，目标不存在时继续。
 function Remove-PiCodingAgentExtension {
     $cfg = Join-Path $env:USERPROFILE ".pi\agent\settings.json"
     if (-not (Test-Path $cfg)) { return }
@@ -1062,13 +1096,14 @@ try {
 }
 
 # ============================================================
-# Remove OTel plugin (Claude/Codex)
+# 清理 Claude/Codex 历史 OTel 插件
 # ============================================================
+# 幂等清理 Remove-OtelPlugin 对应的文件或 Agent 配置，目标不存在时继续。
 function Remove-OtelPlugin {
     $OTEL_CLAUDE_DIR = Join-Path $env:USERPROFILE ".cache\opentelemetry.instrumentation.claude"
     $OTEL_CODEX_DIR = Join-Path $env:USERPROFILE ".cache\opentelemetry.instrumentation.codex"
 
-    # Clean Claude settings.json hooks
+    # 清理 Claude settings.json Hook。
     $claudeSettings = Join-Path $env:USERPROFILE ".claude\settings.json"
     if ((Test-Path $claudeSettings) -and $script:NODE_BIN) {
         $content = Get-Content $claudeSettings -Raw -ErrorAction SilentlyContinue
@@ -1100,7 +1135,7 @@ try {
         }
     }
 
-    # Remove plugin directories
+    # 删除插件目录。
     foreach ($dir in @($OTEL_CLAUDE_DIR, $OTEL_CODEX_DIR)) {
         if (Test-Path $dir) {
             if ($Purge) {
@@ -1117,8 +1152,9 @@ try {
 }
 
 # ============================================================
-# CMD: install
+# 命令：install
 # ============================================================
+# 编排 Windows 首次安装：依赖、下载、探测、部署、配置、CLI 和启动健康检查。
 function Cmd-Install {
     Msg "==> 开始安装 $PACKAGE_NAME ..." "==> Installing $PACKAGE_NAME ..."
     Write-Host ""
@@ -1169,8 +1205,9 @@ function Cmd-Install {
 }
 
 # ============================================================
-# CMD: upgrade
+# 命令：upgrade
 # ============================================================
+# 停止服务部署新版本并启动验证；失败时调用 rollback 恢复旧版本。
 function Cmd-Upgrade {
     Msg "==> 开始升级 $PACKAGE_NAME ..." "==> Upgrading $PACKAGE_NAME ..."
     Write-Host ""
@@ -1251,8 +1288,9 @@ function Cmd-Upgrade {
 }
 
 # ============================================================
-# CMD: uninstall
+# 命令：uninstall
 # ============================================================
+# 停止/注销任务，清理 Agent 注入和命令入口，并按 Purge 处理数据目录。
 function Cmd-Uninstall {
     Msg "🗑️  开始卸载 $PACKAGE_NAME ..." "🗑️  Uninstalling $PACKAGE_NAME ..."
     Write-Host ""
@@ -1262,7 +1300,7 @@ function Cmd-Uninstall {
     Msg "    ✅ 服务已停止" "    ✅ Service stopped"
     Write-Host ""
 
-    # Remove Task Scheduler tasks
+    # 注销 Scheduled Task。
     $taskFolder = "\LoongsuitePilot"
     foreach ($taskName in @("LoongsuitePilot")) {
         $task = Get-ScheduledTask -TaskName $taskName -TaskPath $taskFolder -ErrorAction SilentlyContinue
@@ -1275,6 +1313,8 @@ function Cmd-Uninstall {
     }
     Msg "    ✅ 已移除计划任务" "    ✅ Removed scheduled tasks"
 
+    # 当前实现无条件删除默认安装根目录；默认 DataDir 也位于其中，因此不带 -Purge 时仍会丢失默认配置/日志。
+    # 只有把 DataDir 设置到该目录之外时，后面的“数据目录已保留”提示才与实际行为一致。
     Msg "==> 删除安装目录..." "==> Removing installation..."
     $installDir = Join-Path $env:USERPROFILE ".loongsuite-pilot"
     if (Test-Path $installDir) {
@@ -1323,7 +1363,7 @@ function Cmd-Uninstall {
 }
 
 # ============================================================
-# Main dispatcher
+# 主命令分派
 # ============================================================
 switch ($Command) {
     "install"   { Cmd-Install }

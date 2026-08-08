@@ -26,6 +26,7 @@
  *   - 自 db 读 key=cwd 的最新一行（updated_at > sinceUpdatedMs）
  *   - 返回 { steps, conversationId, continuationId, modelId, credits, nextUpdatedMs } | null
  *     steps: StepInfo[]（按 request_start_timestamp_ms 升序）
+ * 调用者是 delayedCollect 主流程；查询只读 SQLite，`node:sqlite` 不可用时由上层回退 session JSONL。
  */
 
 import { createRequire } from 'node:module';
@@ -72,7 +73,7 @@ export function hasNodeSqlite() {
  * @property {number} endTimeMs     stream_end_timestamp_ms
  * @property {ToolUseInfo[]} tools 该步声明的工具调用（仅 ToolUse 步）
  * @property {string} assistantText 最终文本内容（NotToolUse 步取 Response.content；
- *                                   ToolUse 步为 ""，由 caller 合成 tool_call 摘要）
+ *                                   ToolUse 步为 ""，由调用方合成 tool_call 摘要）
  * @property {string} userPrompt  该步 user turn 的原始 prompt（仅首轮 Prompt 型 entry 非空，
  *                                ToolUseResults 型为 ''）
  * @property {string[]} toolUseResults 该步 user turn 的 ToolUseResults 文本列表（仅后续轮有值）
@@ -334,10 +335,8 @@ export async function readTranscriptForCwd(cwd, opts = {}) {
   const parsed = parseConversationValue(value);
   if (parsed.steps.length === 0) return null;
 
-  // NOTE on sinceUpdatedMs: row-level WHERE clause already discards stale
-  // rows, and upstream `emitted-steps` state dedups individual steps when
-  // conversations_v2 merges multiple runs into one row. We deliberately do
-  // NOT add a step.endTimeMs > since filter here to keep the parser pure.
+  // sinceUpdatedMs 已在行级 WHERE 排除陈旧行；conversations_v2 把多次运行合并到一行时，
+  // 上层 emitted-steps 再逐 step 去重。这里有意不按 step.endTimeMs 二次过滤，保持解析纯粹。
   return {
     conversationId: parsed.conversationId,
     continuationId: parsed.continuationId,

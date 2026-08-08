@@ -1,3 +1,4 @@
+/** 从 Qoder 本地 SQLite 读取可关联的 token 用量样本，查询失败时 fail-open。 */
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -20,10 +21,14 @@ export interface SqliteTokenData {
 
 export interface SqliteTokenResult {
   rows: SqliteTokenData[];
-  /** The DB path that contained the session data, for caller-side variant detection. */
+  /** 实际命中该 session 的数据库路径，调用方据此区分 Desktop 与 IntelliJ 变体。 */
   matchedDbPath: string | null;
 }
 
+/**
+ * 依次查询本机所有可访问的 Qoder Desktop/JetBrains 数据库，返回首个包含目标 session 的结果。
+ * 单库查询失败只记录 debug 并继续下一个；均无数据时返回空数组和 null 路径。
+ */
 export async function readSqliteTokensForSession(sessionId: string): Promise<SqliteTokenResult> {
   const dbPaths = resolveAllQoderDbPaths();
   if (dbPaths.length === 0) return { rows: [], matchedDbPath: null };
@@ -86,20 +91,17 @@ export async function readSqliteTokensForSession(sessionId: string): Promise<Sql
   return { rows: [], matchedDbPath: null };
 }
 
-/**
- * Determine if a matched DB path belongs to the IntelliJ-specific database.
- * Normalizes path separators to handle Windows backslashes correctly.
- */
+/** 判断命中的数据库是否属于 IntelliJ 专用目录；先统一路径分隔符以兼容 Windows。 */
 export function isIdeaDbPath(dbPath: string | null): boolean {
   if (!dbPath) return false;
   const normalized = dbPath.replace(/\\/g, '/');
   return normalized.includes('.qoder/shared_client');
 }
 
+/** 返回当前平台上所有实际可访问的 Qoder Desktop 与 JetBrains 数据库路径。 */
 function resolveAllQoderDbPaths(): string[] {
-  // Qoder Desktop (Electron app) keeps SQLite under platform app-support.
-  // Qoder for JetBrains shares state through ~/.qoder/shared_client/.
-  // Both may coexist on the same machine with different sessions, so we return ALL accessible paths.
+  // Desktop Electron 版把 SQLite 放在平台应用数据目录；JetBrains 版使用 ~/.qoder/shared_client。
+  // 两者可能同时安装且 session 分属不同数据库，因此不能找到第一个文件后就停止。
   const appdata = process.env.APPDATA ?? path.join(os.homedir(), 'AppData', 'Roaming');
   const candidates = process.platform === 'darwin'
     ? [
@@ -128,6 +130,7 @@ function resolveAllQoderDbPaths(): string[] {
   return available;
 }
 
+/** 解析 token_info；输入和输出均为 0 时视为无有效 usage，返回 null。 */
 function parseTokenInfo(raw: string): { promptTokens: number; completionTokens: number; cachedTokens: number } | null {
   try {
     const obj = JSON.parse(raw);
@@ -141,6 +144,7 @@ function parseTokenInfo(raw: string): { promptTokens: number; completionTokens: 
   }
 }
 
+/** 从 chat_message.model_info JSON 中读取 model_key。 */
 function parseModelKey(raw: string | null | undefined): string | undefined {
   if (!raw) return undefined;
   try {
@@ -153,6 +157,7 @@ function parseModelKey(raw: string | null | undefined): string | undefined {
   }
 }
 
+/** model_info 缺失时，从关联 chat_record.extra.modelConfig.key 兼容读取模型。 */
 function parseRecordModelKey(raw: string | null | undefined): string | undefined {
   if (!raw) return undefined;
   try {
@@ -164,6 +169,9 @@ function parseRecordModelKey(raw: string | null | undefined): string | undefined
   }
 }
 
+/**
+ * 将 sqlite3 只读查询回调包装为 Promise。关闭失败仅记录 debug；查询失败会拒绝 Promise。
+ */
 function queryReadonly<T>(dbPath: string, sql: string, params: unknown[]): Promise<T[]> {
   return new Promise((resolve, reject) => {
     const db = new sqlite3.Database(dbPath, sqlite3.OPEN_READONLY, (openErr) => {

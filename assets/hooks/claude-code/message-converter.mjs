@@ -8,13 +8,14 @@
  * 删除了 convertSystemPrompt / convertToolDefinitions(Claude transcript 不含此数据)。
  *
  * 三种协议格式归一化:
- *   - Anthropic native (默认)
+ *   - Anthropic 原生格式（默认）
  *   - openai-chat
  *   - openai-responses
  *
  * 目标 schema:
  *   InputMessage:  { role, parts: [TextPart | ToolCallPart | ToolCallResponsePart | BlobPart | UriPart | ReasoningPart] }
  *   OutputMessage: { role, parts: [...], finish_reason }
+ * processor 在 buildTurnRecords 阶段调用这些纯函数；无法识别的块会被保守跳过，不执行 I/O。
  */
 
 const STOP_REASON_MAP = {
@@ -34,7 +35,7 @@ export function mapStopReason(raw) {
   return STOP_REASON_MAP[raw] || raw;
 }
 
-// ─── Anthropic content block ↔ MessagePart ───
+// ─── Anthropic content block 与 MessagePart 互转 ───
 
 export function convertAnthropicContentBlock(block) {
   if (!block || typeof block !== 'object') return null;

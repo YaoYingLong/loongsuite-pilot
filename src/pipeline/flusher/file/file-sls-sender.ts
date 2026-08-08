@@ -1,3 +1,10 @@
+/**
+ * 普通文件 Pipeline 专用的 SLS WebTracking 缓冲发送器。
+ *
+ * 日志按源 filePath 分 bucket，以便写 `__path__` tag；每轮最多并发 8 个 4000 条 batch。
+ * 64k 硬上限拒绝 enqueue，32k 高水位通知读取端减速。最终失败只落有界元数据，不保留 payload。
+ */
+
 import type { PipelineSlsFlusherConfig } from '../../types.js';
 import {
   postWebtracking,
@@ -10,6 +17,7 @@ import { estimateStringRecordBytes } from '../../../flushers/sls-failure-log-wri
 
 const logger = createLogger('FileSlsSender');
 
+/** 文件发送缓冲、并发和关闭等待的保护值。 */
 const DEFAULT_FLUSH_INTERVAL_MS = 2000;
 const DEFAULT_BATCH_SIZE = 4000;
 const MAX_BUFFER_SIZE = 64_000;
@@ -17,6 +25,7 @@ const HIGH_WATERMARK = 32_000;
 const FLUSH_CONCURRENCY = 8;
 const SHUTDOWN_WAIT_TIMEOUT_MS = 30_000;
 
+/** 按源文件分桶并发送原始行。 */
 export class FileSlsSender {
   private readonly transportConfig: SlsTransportConfig;
   private readonly failedLogDir: string;
@@ -28,12 +37,19 @@ export class FileSlsSender {
   private readonly batchSize: number;
   private readonly userAgent: string;
 
+  /**
+   * @param flusherConfig 目标 SLS 配置。
+   * @param configName Pipeline 名，同时作为 topic/失败日志 endpoint 名。
+   * @param failedLogDir 有界失败诊断目录。
+   * @param dataDir 用于构造版本 User-Agent。
+   */
   constructor(
     flusherConfig: PipelineSlsFlusherConfig,
     configName: string,
     failedLogDir: string,
     dataDir: string,
   ) {
+    // 允许配置省略协议，缺省按 HTTPS 处理。
     const endpoint = /^https?:\/\//.test(flusherConfig.Endpoint)
       ? flusherConfig.Endpoint
       : `https://${flusherConfig.Endpoint}`;
@@ -50,6 +66,7 @@ export class FileSlsSender {
     this.userAgent = buildUserAgent(dataDir);
   }
 
+  /** 幂等启动两秒周期 flush。 */
   start(): void {
     if (this.flushTimer) return;
     this.flushTimer = setInterval(
@@ -58,6 +75,10 @@ export class FileSlsSender {
     );
   }
 
+  /**
+   * 将文本行包装为 `{content}` 后加入对应 filePath bucket。
+   * @returns 达到 64k 硬上限时 false；调用方不得推进丢失的 pending 数据。
+   */
   enqueue(lines: string[], filePath: string): boolean {
     if (this.bufferSize() >= MAX_BUFFER_SIZE) {
       logger.warn('buffer full, rejecting enqueue', {
@@ -78,10 +99,12 @@ export class FileSlsSender {
     return true;
   }
 
+  /** 达到高水位时提示 FilePipeline 暂停继续读取。 */
   isBackpressured(): boolean {
     return this.bufferSize() >= HIGH_WATERMARK;
   }
 
+  /** 按 bucket 顺序处理，每波并行最多 8 个 batch；重入调用直接返回。 */
   async flush(): Promise<void> {
     if (this.flushing) return;
     this.flushing = true;
@@ -138,6 +161,7 @@ export class FileSlsSender {
             }
           }
 
+          // 不论成功失败都从内存删除本波；失败 payload 不做本地重放。
           bucket.splice(0, sliceEnd);
           if (hasFailure) failed = true;
 
@@ -157,11 +181,13 @@ export class FileSlsSender {
     }
   }
 
+  /** 清定时器、等待正在发送的波次、重试排空，最终余量只写失败元数据。 */
   async shutdown(): Promise<void> {
     if (this.flushTimer) {
       clearInterval(this.flushTimer);
       this.flushTimer = null;
     }
+    // 最多等待 30 秒，不让进程关闭永久卡在网络调用。
     const waitStart = Date.now();
     while (this.flushing && Date.now() - waitStart < SHUTDOWN_WAIT_TIMEOUT_MS) {
       await new Promise((r) => setTimeout(r, 100));
@@ -202,6 +228,7 @@ export class FileSlsSender {
     }
   }
 
+  /** O(bucket 数) 统计当前内存行数，供 backpressure 和诊断使用。 */
   bufferSize(): number {
     let size = 0;
     for (const [, bucket] of this.buckets) {

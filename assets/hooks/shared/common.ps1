@@ -1,5 +1,10 @@
-# Shared PowerShell utilities for loongsuite-pilot hook scripts.
-# Dot-source from each hook entrypoint:  . (Join-Path $ScriptDir "shared\common.ps1")
+# LoongSuite Pilot Windows Hook 的共享 PowerShell 工具。
+#
+# 入口脚本通过点源语法 `. (Join-Path $ScriptDir "shared\common.ps1")` 把这些函数加载到
+# 当前作用域。这里负责：验证 Node >= 18、按 pin/版本管理器/PATH 查找 node.exe、以原始字节
+# 读取 stdin、启动隐藏的 Node 子进程并转发标准流，以及写 fail-open 错误 JSONL。
+# 输入是宿主 Agent 的 stdin；输出是 processor stdout 和错误日志。函数不修改 node-bin，且
+# 遥测失败不得阻塞宿主。PowerShell 没有 shebang，因为文件只被点源而不直接执行。
 
 $script:MIN_NODE_MAJOR = 18
 
@@ -15,6 +20,7 @@ function Test-NodeSuitable {
 }
 
 function Resolve-NodeBin {
+    # 安装器写入的固定路径优先，保证运行时版本与安装验证一致。
     $pinFile = Join-Path $env:USERPROFILE ".loongsuite-pilot\node-bin"
     if (Test-Path $pinFile) {
         $pinned = (Get-Content $pinFile -ErrorAction SilentlyContinue).Trim()
@@ -49,12 +55,12 @@ function Read-StdinRawBytes {
     $rawBytes = $ms.ToArray()
     $ms.Dispose()
 
-    # Strip UTF-8 BOM (EF BB BF)
+    # 去掉 UTF-8 BOM（EF BB BF），否则 Node 端 JSON.parse 会把它视为非法首字符。
     if ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF) {
         $rawBytes = $rawBytes[3..($rawBytes.Length - 1)]
     }
 
-    # Fix UTF-8->GBK double-encoding on Chinese Windows
+    # 修复中文 Windows 上 UTF-8 -> GBK 的二次编码；严格 UTF-8 校验失败时保留原字节。
     if ($rawBytes.Length -gt 2) {
         try {
             $utf8    = [System.Text.Encoding]::UTF8
@@ -87,6 +93,7 @@ function Invoke-NodeProcessor {
         }
     }
 
+    # 使用 ProcessStartInfo 才能按字节写 stdin；PowerShell 文本管道会经过系统代码页转换。
     $psi = New-Object System.Diagnostics.ProcessStartInfo
     $psi.FileName = $NodeBin
     $psi.Arguments = if ($ExtraArgs) { "`"$ProcessorPath`" $ExtraArgs" } else { "`"$ProcessorPath`"" }
@@ -121,5 +128,7 @@ function Log-HookError {
         $escapedMsg = $Message -replace '\\', '\\\\' -replace '"', '\"'
         $line = "{`"time`":`"$time`",`"gen_ai.agent.type`":`"$AgentType`",`"stage`":`"$Stage`",`"error.type`":`"ps1_$Stage`",`"error.message`":`"$escapedMsg`"}"
         Add-Content -Path $file -Value $line
-    } catch {}
+    } catch {
+        # fail-open：连错误日志都无法写入时也不再抛出。
+    }
 }

@@ -1,3 +1,13 @@
+/**
+ * 安装阶段使用的 Agent 探测 CLI。
+ *
+ * `deploy/installer-opensource.*` 执行构建产物 `dist/cli-probe.cjs`，本文件加载
+ * agents.d 声明并检查路径或命令，最后只向 stdout 写一份 JSON 数组。安装器据此
+ * 展示可选 Agent；任何日志或提示写到 stdout 都会破坏双方协议。`build.mjs` 将本入口
+ * 单独打包成 CommonJS，因此这里可使用构建环境提供的 `__dirname`。
+ */
+
+
 import * as path from 'node:path';
 import { AgentDefLoader } from './deployment/agent-def-loader.js';
 import { detectAgent, commandExists } from './deployment/detect-utils.js';
@@ -29,6 +39,7 @@ interface ProbeResult {
  * 人类可读说明；探测结论仍以 detectAgent() 为准。例如 glob 路径由 detectAgent()
  * 展开匹配，此函数不会重复实现 glob 遍历，因而 reason 允许为空。
  */
+/** glob 命中可能没有可复现的单一路径，此时允许返回空字符串。 */
 async function findDetectionReason(detection: { paths: string[]; commands: string[] }): Promise<string> {
   for (const p of detection.paths) {
     const resolved = resolveHome(p);
@@ -46,6 +57,10 @@ async function findDetectionReason(detection: { paths: string[]; commands: strin
   return '';
 }
 
+/**
+ * 定位安装包根、加载声明并串行探测，最后写紧凑 JSON 到 stdout。
+ * 顶层调用方会把任何异常降级成 `[]`，因此这里可让意外错误向外传播。
+ */
 async function main(): Promise<void> {
   // cli-probe.cjs 位于 dist/，而 agents.d/ 与 dist/ 同处安装包根目录下。
   const builtinDir = path.resolve(__probe_dirname, '..', 'agents.d');

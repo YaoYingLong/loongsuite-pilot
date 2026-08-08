@@ -1,11 +1,12 @@
-# Claude Code hook entrypoint (Windows) — delegates to claude-code-hook-processor.mjs.
+# Claude Code Windows Hook 入口：把 stdin JSON 委托给 claude-code-hook-processor.mjs。
 #
-# Usage (registered in ~/.claude/settings.json by pilot HookStrategy):
+# HookStrategy 将下列命令注册到 ~/.claude/settings.json：
 #   powershell -File $PILOT_DATA/hooks/claude-code-loongsuite-pilot-hook.ps1 <subcommand>
 #
-# Subcommand: stop / subagent-start / subagent-stop
+# 子命令：stop / subagent-start / subagent-stop。stop 解析 transcript 并写本地 JSONL，
+# 子 Agent 事件先保存状态，稍后并入父会话。
 #
-# Fail-open: any error outputs "{}" and exits 0.
+# fail-open：任何错误都输出 `{}` 并退出 0，不阻塞宿主 Agent。
 
 $ErrorActionPreference = "Continue"
 $EMPTY_RESULT = '{}'
@@ -14,7 +15,7 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Processor = Join-Path $ScriptDir "claude-code-hook-processor.mjs"
 $Subcommand = if ($args.Count -gt 0) { $args[0] } else { "unknown" }
 
-# Only process registered subcommands
+# 仅处理当前注册的子命令，未知/旧版命令直接返回空 JSON。
 if ($Subcommand -notin @("stop", "subagent-start", "subagent-stop")) {
     Write-Output $EMPTY_RESULT
     exit 0
@@ -100,19 +101,19 @@ if (-not [Console]::IsInputRedirected) {
 }
 
 try {
-    # Read stdin as raw bytes to avoid PowerShell encoding issues (GB2312/ASCII mangles UTF-8)
+    # 以原始字节读取 stdin，避免 PowerShell 通过 GB2312/ASCII 破坏 UTF-8。
     $stdinStream = [Console]::OpenStandardInput()
     $ms = New-Object System.IO.MemoryStream
     $stdinStream.CopyTo($ms)
     $rawBytes = $ms.ToArray()
     $ms.Dispose()
 
-    # Strip UTF-8 BOM (EF BB BF) before any encoding fixup
+    # 编码修复前去掉 UTF-8 BOM（EF BB BF）。
     if ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF) {
         $rawBytes = $rawBytes[3..($rawBytes.Length - 1)]
     }
 
-    # Fix Cursor's UTF-8→GBK double-encoding on Chinese Windows.
+    # 尝试逆转中文 Windows 上的 UTF-8 -> GBK 二次编码；校验失败时保留原字节。
     if ($rawBytes.Length -gt 2) {
         try {
             $utf8    = [System.Text.Encoding]::UTF8

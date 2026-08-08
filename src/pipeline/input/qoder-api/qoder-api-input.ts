@@ -1,3 +1,11 @@
+/**
+ * Qoder 组织管理 API 的窗口化数据采集与宽表转换。
+ *
+ * 每轮并行/分页调用多个管理接口，产生带确定性 `event_id` 的 `Record<string,string>`。窗口采用
+ * 两阶段提交：collect 只保存 pendingWindowEnd，Pipeline 的 sender 接受整批后才 confirmCycle
+ * 持久化；缓冲拒收或任一关键阶段失败时下轮重采同窗，由 event_id 支持下游去重。
+ */
+
 import * as crypto from 'node:crypto';
 import * as path from 'node:path';
 import { StateStore } from '../../../checkpoints/state-store.js';
@@ -14,10 +22,12 @@ import {
   type QoderUsageEvent,
 } from './qoder-api-client.js';
 
+/** 成员并发数及 token/offset 分页硬上限，避免异常 API 无限循环。 */
 const MEMBER_CONCURRENCY = 5;
 const MAX_MEMBER_PAGES = 50;
 const MAX_OFFSET_PAGES = 50;
 
+/** 创建 Input 所需 client、组织身份、状态目录和首轮回溯参数。 */
 export interface QoderApiInputOptions {
   client: QoderApiClient;
   orgId: string;
@@ -27,16 +37,15 @@ export interface QoderApiInputOptions {
   backfillDays: number;
 }
 
+/** StateStore 中只持久化最近已确认窗口终点。 */
 interface WindowState {
   lastWindowEnd?: string;
 }
 
 /**
- * Standalone Qoder API collection input.
+ * 独立 Qoder API 采集器。
  *
- * Polls the Qoder OpenAPI on a configurable interval and returns raw API
- * records as flat-string rows. Uses a sliding window persisted in a
- * StateStore to avoid duplicate collection across restarts.
+ * 它不继承 BaseInput，由 QoderApiPipeline 控制轮询；输出是 SLS 宽表而非 AgentActivityEntry。
  */
 export class QoderApiInput {
   private readonly client: QoderApiClient;
@@ -48,9 +57,11 @@ export class QoderApiInput {
   private readonly logger: BoundLogger;
   private stateLoaded = false;
   private fatalAuthError = false;
+  /** 同轮 collect Promise，防止外部误并发；pendingWindowEnd 等待 sender 确认。 */
   private inFlight: Promise<Record<string, string>[]> | null = null;
   private pendingWindowEnd: string | null = null;
 
+  /** 保存依赖并为每份 configName 使用独立状态文件。interval 由 Pipeline 管理，此处不建定时器。 */
   constructor(opts: QoderApiInputOptions) {
     this.client = opts.client;
     this.orgId = opts.orgId;
@@ -61,14 +72,14 @@ export class QoderApiInput {
     this.stateStore = new StateStore(this.stateFilePath);
   }
 
-  /** Returns true when a fatal auth error (401/403) has been detected. */
+  /** 是否已观察到 401/403；为 true 后后续 collect 直接返回空数组。 */
   hasFatalAuthError(): boolean {
     return this.fatalAuthError;
   }
 
   /**
-   * Runs the full 16-step collection cycle and returns all collected rows.
-   * Returns an empty array if a previous cycle is still running or auth has failed.
+   * 运行完整多阶段采集并返回所有宽表行。
+   * 上一轮仍在执行或已发生永久鉴权错误时返回空数组。
    */
   async collect(): Promise<Record<string, string>[]> {
     if (this.fatalAuthError) return [];
@@ -85,10 +96,8 @@ export class QoderApiInput {
   }
 
   /**
-   * Called by the pipeline after rows have been successfully delivered to SLS.
-   * Advances the collection window so the next cycle starts from the new position.
-   * This ensures at-least-once semantics: if delivery fails, the window does not
-   * advance and the same data will be re-collected (deduped by event_id).
+   * sender 接受本轮行后由 Pipeline 调用，原子持久化 pending 窗口终点。
+   * 发送接管失败时不调用，因此保持至少一次采集语义并在下轮重采。
    */
   async confirmCycle(): Promise<void> {
     if (this.pendingWindowEnd) {
@@ -98,8 +107,9 @@ export class QoderApiInput {
     }
   }
 
+  /** 初始化状态、计算窗口、执行所有 API 阶段并记录待确认终点。 */
   private async runCycle(): Promise<Record<string, string>[]> {
-    // Ensure state store is loaded on first run.
+    // StateStore 首轮惰性加载，后续周期复用内存状态。
     if (!this.stateLoaded) {
       await ensureDir(path.dirname(this.stateFilePath));
       await this.stateStore.load();
@@ -135,8 +145,7 @@ export class QoderApiInput {
       counts[kind] = (counts[kind] ?? 0) + 1;
     };
 
-    // For endpoints that cap window length (e.g. usage-summary <= 7 days),
-    // clamp the lookback window.
+    // 部分 endpoint 限制最大查询跨度，分别把回溯窗口夹到 7 天/90 天。
     const SEVEN_DAYS_MS = 7 * 24 * 60 * 60 * 1000;
     const NINETY_DAYS_MS = 90 * 24 * 60 * 60 * 1000;
     const sevenDayStartIso = new Date(
@@ -146,7 +155,7 @@ export class QoderApiInput {
       Math.max(windowStart.getTime(), windowEnd.getTime() - NINETY_DAYS_MS + 60_000),
     ).toISOString();
 
-    // 1. Members
+    // 1. 拉取成员清单；失败会阻止本轮窗口推进。
     let members: QoderMember[] = [];
     try {
       members = await this.fetchAllMembers();
@@ -154,7 +163,7 @@ export class QoderApiInput {
       advanceWindow = this.handleCycleError('listMembers', err) && advanceWindow;
     }
 
-    // 2. Per-member usage + quota
+    // 2. 以五人一组并发拉取每成员 usage 和 quota，allSettled 隔离成员失败。
     if (members.length > 0) {
       for (let i = 0; i < members.length; i += MEMBER_CONCURRENCY) {
         const batch = members.slice(i, i + MEMBER_CONCURRENCY);
@@ -180,7 +189,7 @@ export class QoderApiInput {
       }
     }
 
-    // 3. Org-level AI code changes
+    // 3. 组织级 AI 代码 change。
     try {
       const changeLogs = await this.fetchAllChanges(startIso, endIso, reportTs);
       for (const l of changeLogs) pushLog(l);
@@ -188,7 +197,7 @@ export class QoderApiInput {
       advanceWindow = this.handleCycleError('listAiCodeChanges', err) && advanceWindow;
     }
 
-    // 4. Org-level AI code commits
+    // 4. 组织级 AI 代码 commit。
     try {
       const commitLogs = await this.fetchAllCommits(startIso, endIso, reportTs);
       for (const l of commitLogs) pushLog(l);
@@ -196,7 +205,7 @@ export class QoderApiInput {
       advanceWindow = this.handleCycleError('listAiCodeCommits', err) && advanceWindow;
     }
 
-    // 5. Org-level usage events (organization-wide, includes refunds/reversals)
+    // 5. 组织级 usage event，包括退款/冲正。
     try {
       const orgUsageLogs = await this.fetchAllOrgUsageEvents(startIso, endIso, reportTs);
       for (const l of orgUsageLogs) pushLog(l);
@@ -204,7 +213,7 @@ export class QoderApiInput {
       advanceWindow = this.handleCycleError('listOrgUsageEvents', err) && advanceWindow;
     }
 
-    // 6. Per-member usage summary (groupBy=source, <= 7 day window)
+    // 6. 每成员按 source 聚合的 usage summary，窗口最多 7 天。
     if (members.length > 0) {
       for (let i = 0; i < members.length; i += MEMBER_CONCURRENCY) {
         const batch = members.slice(i, i + MEMBER_CONCURRENCY);
@@ -237,7 +246,7 @@ export class QoderApiInput {
       }
     }
 
-    // 7. Per-member usage summary (groupBy=operation, <= 7 day window)
+    // 7. 每成员按 operation 聚合的 usage summary，窗口最多 7 天。
     if (members.length > 0) {
       for (let i = 0; i < members.length; i += MEMBER_CONCURRENCY) {
         const batch = members.slice(i, i + MEMBER_CONCURRENCY);
@@ -270,7 +279,7 @@ export class QoderApiInput {
       }
     }
 
-    // 8. Org resource packages
+    // 8. 组织资源包快照。
     try {
       const pkgLogs = await this.fetchAllResourcePackages(reportTs);
       for (const l of pkgLogs) pushLog(l);
@@ -278,7 +287,7 @@ export class QoderApiInput {
       advanceWindow = this.handleCycleError('listResourcePackages', err) && advanceWindow;
     }
 
-    // 9. Org seat-month batches (third-party only; 404 is OK)
+    // 9. 第三方购买组织的 seat-month 批次；不适用组织返回 404 视为正常跳过。
     try {
       const batchLogs = await this.fetchAllSeatMonthBatches(reportTs);
       for (const l of batchLogs) pushLog(l);
@@ -290,7 +299,7 @@ export class QoderApiInput {
       }
     }
 
-    // 10. AI code stats overview (<= 90 day window)
+    // 10. AI 代码统计总览，窗口最多 90 天。
     try {
       const overview = await this.client.getAiCodeStatsOverview(this.orgId, {
         startDate: ninetyDayStartIso,
@@ -301,7 +310,7 @@ export class QoderApiInput {
       advanceWindow = this.handleCycleError('aiCodeStatsOverview', err) && advanceWindow;
     }
 
-    // 11. AI code daily trend (<= 90 day window)
+    // 11. AI 代码每日趋势，窗口最多 90 天。
     try {
       const trend = await this.client.getAiCodeDailyTrend(this.orgId, {
         startDate: ninetyDayStartIso,
@@ -313,7 +322,7 @@ export class QoderApiInput {
       advanceWindow = this.handleCycleError('aiCodeDailyTrend', err) && advanceWindow;
     }
 
-    // 12. AI code member ranking (<= 90 day window)
+    // 12. AI 代码成员排名，窗口最多 90 天。
     try {
       const ranking = await this.client.getAiCodeMemberRanking(this.orgId, {
         startDate: ninetyDayStartIso,
@@ -326,7 +335,7 @@ export class QoderApiInput {
       advanceWindow = this.handleCycleError('aiCodeMemberRanking', err) && advanceWindow;
     }
 
-    // 13. AI code repos (paginated by page/per_page)
+    // 13. 按 page/per_page 分页的 AI 代码仓库。
     try {
       const repoLogs = await this.fetchAllAiCodeRepos(ninetyDayStartIso, endIso, reportTs);
       for (const l of repoLogs) pushLog(l);
@@ -334,7 +343,7 @@ export class QoderApiInput {
       advanceWindow = this.handleCycleError('aiCodeRepos', err) && advanceWindow;
     }
 
-    // 14. AI code file extensions
+    // 14. AI 代码文件扩展名统计。
     try {
       const extResp = await this.client.listAiCodeFileExtensions(this.orgId, {
         startDate: ninetyDayStartIso,
@@ -346,10 +355,9 @@ export class QoderApiInput {
       advanceWindow = this.handleCycleError('aiCodeFileExtensions', err) && advanceWindow;
     }
 
-    // 15. (Sending handled by pipeline, not here)
+    // 15. 发送由外层 Pipeline/Sender 完成，本类不访问 SLS。
 
-    // 16. Store pending window end — actual advancement happens in confirmCycle()
-    //     after the pipeline confirms SLS delivery.
+    // 16. 仅记录候选窗口终点；外层确认 sender 接管后才由 confirmCycle 真正推进。
     this.pendingWindowEnd = advanceWindow ? endIso : null;
 
     this.logger.info('qoder-api cycle done', {
@@ -365,8 +373,9 @@ export class QoderApiInput {
     return logs;
   }
 
-  // ---------- fetch helpers ----------
+  // 以下 helper 负责分页请求，均设置硬页数上限。
 
+  /** 分页拉取启用成员，最多 50 页。 */
   private async fetchAllMembers(): Promise<QoderMember[]> {
     const out: QoderMember[] = [];
     let nextToken: string | undefined;
@@ -387,6 +396,7 @@ export class QoderApiInput {
     return out;
   }
 
+  /** 拉取单成员 usage 分页和一次 quota；quota 失败只告警并保留 usage。 */
   private async fetchMemberData(
     member: QoderMember,
     startIso: string,
@@ -395,7 +405,7 @@ export class QoderApiInput {
   ): Promise<Record<string, string>[]> {
     const out: Record<string, string>[] = [];
 
-    // Usage events (paginated by nextCredits)
+    // usage events 使用 nextCredits 而非通用 nextToken 分页。
     let nextCredits: string | undefined;
     let memberEventIndex = 0;
     for (let page = 0; page < MAX_OFFSET_PAGES; page++) {
@@ -418,7 +428,7 @@ export class QoderApiInput {
       if (!nextCredits) break;
     }
 
-    // Quota snapshot (single call)
+    // quota 是单次快照，不属于 usage 分页。
     try {
       const quota = await this.client.getMemberQuota(this.orgId, member.id);
       out.push(this.transformQuotaSnapshot(quota, member, startIso, endIso, reportTs));
@@ -431,6 +441,7 @@ export class QoderApiInput {
     return out;
   }
 
+  /** 按 offset page 拉取全部 change 并转换。 */
   private async fetchAllChanges(
     startIso: string,
     endIso: string,
@@ -454,6 +465,7 @@ export class QoderApiInput {
     return out;
   }
 
+  /** 按 offset page 拉取全部 commit 并转换。 */
   private async fetchAllCommits(
     startIso: string,
     endIso: string,
@@ -477,6 +489,7 @@ export class QoderApiInput {
     return out;
   }
 
+  /** 按 nextToken 拉取组织级 usage events。 */
   private async fetchAllOrgUsageEvents(
     startIso: string,
     endIso: string,
@@ -502,6 +515,7 @@ export class QoderApiInput {
     return out;
   }
 
+  /** 按 nextToken 拉取资源包快照。 */
   private async fetchAllResourcePackages(
     reportTs: string,
   ): Promise<Record<string, string>[]> {
@@ -522,6 +536,7 @@ export class QoderApiInput {
     return out;
   }
 
+  /** 按 pageToken 拉取 seat-month 批次。 */
   private async fetchAllSeatMonthBatches(
     reportTs: string,
   ): Promise<Record<string, string>[]> {
@@ -542,6 +557,7 @@ export class QoderApiInput {
     return out;
   }
 
+  /** 按 page/per_page 拉取 AI 代码仓库。 */
   private async fetchAllAiCodeRepos(
     startIso: string,
     endIso: string,
@@ -566,8 +582,9 @@ export class QoderApiInput {
     return out;
   }
 
-  // ---------- transformers ----------
+  // 以下 transformer 把 API 松散对象转成字符串宽表，并构造确定性 event_id。
 
+  /** 转换成员 usage event。 */
   private transformUsageEvent(
     u: QoderUsageEvent,
     member: QoderMember,
@@ -606,6 +623,7 @@ export class QoderApiInput {
     return log;
   }
 
+  /** 转换成员 quota 快照。 */
   private transformQuotaSnapshot(
     q: QoderQuotaResponse,
     member: QoderMember,
@@ -644,6 +662,7 @@ export class QoderApiInput {
     return log;
   }
 
+  /** 转换 AI 代码 change。 */
   private transformChange(
     c: QoderChangeItem,
     startIso: string,
@@ -679,6 +698,7 @@ export class QoderApiInput {
     return log;
   }
 
+  /** 转换 AI 代码 commit 及其分渠道行数。 */
   private transformCommit(
     c: QoderCommitItem,
     startIso: string,
@@ -731,6 +751,7 @@ export class QoderApiInput {
     return log;
   }
 
+  /** 转换组织级 usage event。 */
   private transformOrgUsageEvent(
     u: QoderUsageEvent,
     startIso: string,
@@ -768,6 +789,7 @@ export class QoderApiInput {
     return log;
   }
 
+  /** 转换成员 source/operation usage summary。 */
   private transformUsageSummary(
     kind: string,
     member: QoderMember,
@@ -800,6 +822,7 @@ export class QoderApiInput {
     return log;
   }
 
+  /** 转换资源包记录。 */
   private transformResourcePackage(
     p: Record<string, unknown>,
     reportTs: string,
@@ -829,6 +852,7 @@ export class QoderApiInput {
     return log;
   }
 
+  /** 转换 seat-month 批次。 */
   private transformSeatMonthBatch(
     b: Record<string, unknown>,
     reportTs: string,
@@ -862,6 +886,7 @@ export class QoderApiInput {
     return log;
   }
 
+  /** 转换 AI 代码统计总览。 */
   private transformStatsOverview(
     o: Record<string, unknown>,
     startIso: string,
@@ -891,6 +916,7 @@ export class QoderApiInput {
     return log;
   }
 
+  /** 将 daily trend 主项、扩展项和 next 项展开为多行。 */
   private transformDailyTrend(
     trend: {
       items?: Array<Record<string, unknown>>;
@@ -971,6 +997,7 @@ export class QoderApiInput {
     return out;
   }
 
+  /** 将成员排名数组展开为多行。 */
   private transformMemberRanking(
     ranking: { items?: Array<Record<string, unknown>> },
     startIso: string,
@@ -1005,6 +1032,7 @@ export class QoderApiInput {
     return out;
   }
 
+  /** 转换单个 AI 代码仓库统计。 */
   private transformAiCodeRepo(
     r: Record<string, unknown>,
     startIso: string,
@@ -1031,6 +1059,7 @@ export class QoderApiInput {
     return log;
   }
 
+  /** 将文件扩展名统计数组展开为多行。 */
   private transformFileExtensions(
     resp: { fileExtensions?: Array<Record<string, unknown>> },
     startIso: string,
@@ -1062,20 +1091,23 @@ export class QoderApiInput {
     return out;
   }
 
-  // ---------- state helpers ----------
+  // 窗口状态只通过 StateStore 的固定 key 读写。
 
+  /** 读取最近一次已确认窗口，缺失时返回空对象。 */
   private getWindowState(): WindowState {
     const raw = this.stateStore.get('qoder-api-window');
     const extra = raw.extra as WindowState | undefined;
     return extra ?? {};
   }
 
+  /** 合并更新内存状态；持久化由 confirmCycle 单独调用。 */
   private setWindowState(next: WindowState): void {
     this.stateStore.update('qoder-api-window', {
       extra: { ...this.getWindowState(), ...next },
     });
   }
 
+  /** 分类阶段错误；401/403 锁定 fatalAuth，其余错误阻止本轮窗口推进。 */
   private handleCycleError(stage: string, err: unknown): boolean {
     const message = redact(String(err));
     if (err instanceof QoderApiHttpError && (err.status === 401 || err.status === 403)) {
@@ -1092,8 +1124,9 @@ export class QoderApiInput {
   }
 }
 
-// ---------- module-level helpers ----------
+// 模块级纯函数负责宽表赋值、JSON 安全化、确定性 ID 和日志脱敏。
 
+/** 仅把非空、有限值写为字符串；对象通过 safeStringify。 */
 function setIfPresent(
   log: Record<string, string>,
   key: string,
@@ -1117,6 +1150,7 @@ function setIfPresent(
   log[key] = safeStringify(value);
 }
 
+/** JSON.stringify 失败（例如循环引用）时回退 String。 */
 function safeStringify(value: unknown): string {
   try {
     return JSON.stringify(value);
@@ -1125,6 +1159,7 @@ function safeStringify(value: unknown): string {
   }
 }
 
+/** 用 NUL 分隔组成部分后计算完整 SHA-256 十六进制 event_id。 */
 function sha256(parts: Array<string | number | undefined>): string {
   return crypto
     .createHash('sha256')
@@ -1132,6 +1167,7 @@ function sha256(parts: Array<string | number | undefined>): string {
     .digest('hex');
 }
 
+/** 防御性替换异常文本中可能出现的 Bearer token。 */
 function redact(s: string): string {
   return s.replace(/Bearer\s+[A-Za-z0-9._-]+/g, 'Bearer <redacted>');
 }

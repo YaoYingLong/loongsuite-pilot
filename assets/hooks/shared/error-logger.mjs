@@ -50,6 +50,6 @@ export function logHookError({ agentId, stage, errorType, errorMessage }) {
     };
     fs.appendFileSync(file, JSON.stringify(record) + '\n', 'utf-8');
   } catch {
-    // fail-open: never throw
+    // fail-open：日志目录无权限、磁盘满等情况也绝不向宿主抛出。
   }
 }

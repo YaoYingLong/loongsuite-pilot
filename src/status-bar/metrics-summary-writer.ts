@@ -1,3 +1,15 @@
+/**
+ * 状态栏与 token-usage CLI 共用的本地指标聚合器。
+ *
+ * Orchestrator 注入 InputManager 计数器并启动本类。它先从 `logs/output/*.jsonl`
+ * 流式读取当日规范化事件，再与 `logs/metrics-daily/*.json` digest 合并，生成
+ * metrics-summary.json 中今日/7 天/30 天 token、session、request、tool 及占比统计。
+ * readline 按行处理避免一次加载大文件；文件 mtime/size cache 和 digest 降低重复扫描。
+ * 写入周期由 StatusBarConfig 控制，timer 使用 `unref()`，解析单行失败只跳过该行。
+ */
+
+
+
 import * as fs from 'node:fs/promises';
 import * as fsSync from 'node:fs';
 import * as path from 'node:path';
@@ -13,7 +25,7 @@ const STARTUP_DELAY_MS = 5_000;
 const DIGEST_MAX_DAYS = 200;
 const FILE_NAME_PATTERN = /^(.+)-(\d{4}-\d{2}-\d{2})\.jsonl$/;
 
-// ── Public types (metrics-summary.json shape) ──
+// metrics-summary.json 对外结构。
 
 export interface MetricsSummaryRangeData {
   totalTokens: number;
@@ -77,7 +89,7 @@ export interface MetricsSummary {
   dailySessions: DailyPoint[];
 }
 
-// ── Internal types ──
+// 仅聚合过程使用的内部结构。
 
 interface DayStats {
   tokens: number;
@@ -116,8 +128,14 @@ interface ScanState {
   files: Record<string, { offset: number; size: number; ino: number }>;
 }
 
-// ── Class ──
+// ── 类实现 ──
 
+/**
+ * 把规范化 JSONL 增量聚合为状态栏/CLI 可快速读取的摘要与日 digest。
+ *
+ * refresh 使用互斥标志避免 timer 重入；单行、单文件错误尽量跳过，最终写盘失败由调用
+ * 处记录。stop 只清 timer，不删除历史摘要。
+ */
 export class MetricsSummaryWriter {
   private readonly dataDir: string;
   private readonly config: StatusBarConfig;
@@ -129,6 +147,7 @@ export class MetricsSummaryWriter {
   private intervalTimer: ReturnType<typeof setInterval> | null = null;
   private isRefreshing = false;
 
+  /** 解析 output/summary/digest/scan-state 固定路径；构造阶段不读文件。 */
   constructor(dataDir: string, config: StatusBarConfig) {
     this.dataDir = dataDir;
     this.config = config;
@@ -138,6 +157,7 @@ export class MetricsSummaryWriter {
     this.scanStatePath = path.join(dataDir, 'cache', 'metrics-scan-state.json');
   }
 
+  /** 启用时延迟 5 秒首刷，再按配置建立 unref interval。 */
   start(): void {
     if (!this.config.enabled) {
       logger.info('metrics summary writer disabled');
@@ -158,6 +178,7 @@ export class MetricsSummaryWriter {
     });
   }
 
+  /** 清启动和周期 timer。 */
   stop(): void {
     if (this.startupTimer) {
       clearTimeout(this.startupTimer);
@@ -170,6 +191,7 @@ export class MetricsSummaryWriter {
     logger.info('metrics summary writer stopped');
   }
 
+  /** 防重入执行 aggregate；异常记录后恢复锁，供下轮重试。 */
   async refresh(): Promise<void> {
     if (this.isRefreshing) return;
     this.isRefreshing = true;
@@ -182,6 +204,10 @@ export class MetricsSummaryWriter {
     }
   }
 
+  /**
+   * 加载 digest/scan-state，扫描输出文件，更新历史日摘要，构造三个时间范围和日趋势，
+   * 再按 digest -> scan-state -> summary 顺序原子写盘。顺序保证崩溃时宁可重扫不丢数据。
+   */
   private async aggregate(): Promise<void> {
     const today = getTodayDateString();
     const scanState = await this.loadScanState();
@@ -202,11 +228,8 @@ export class MetricsSummaryWriter {
       const baseName = path.basename(file);
       const isToday = day === today;
 
-      // Today's files: always scan from offset 0. The file is actively written by flushers,
-      // and we need session dedup (Set) + model/provider/repo breakdowns that can't be
-      // incrementally maintained without serializing Sets. Cost is acceptable (<1MB/day typical).
-      // Past files: incremental scan using cached offset.
-      // Exception: if a past day has no digest entry yet, scan from start to ensure data is captured.
+      // 当日文件为维持 session Set 与各维度分解，每次从 0 重扫；历史文件按 offset 增量。
+      // 历史日期尚无 digest 时也从头扫，避免 scan-state 与 digest 不一致造成漏计。
       let startOffset = 0;
       if (!isToday) {
         const hasDigest = !!digest.days[day];
@@ -232,13 +255,12 @@ export class MetricsSummaryWriter {
       };
     }
 
-    // Merge live data into digest for history; past days commit to digest permanently
+    // 历史日 live 结果永久合入 digest。
     for (const [day, stats] of liveStats) {
       if (day !== today) {
         const existing = digest.days[day];
         if (!existing || stats.events > 0) {
-          // If any file for this day was scanned from offset 0, replace digest entirely
-          // to avoid double-counting when scan-state cache is lost but digest is retained
+          // 某日从 0 重扫时整体替换 digest，避免 scan-state 丢失后重复累加。
           digest.days[day] = fullScanDays.has(day)
             ? this.dayStatsToDigest(stats)
             : this.dayStatsToDigest(stats, existing);
@@ -246,17 +268,16 @@ export class MetricsSummaryWriter {
       }
     }
 
-    // Current day — merge live + any partial digest
+    // 当前日合并 live 与已有部分 digest。
     const todayLive = liveStats.get(today);
 
-    // Prune old digest entries
+    // 清理保留窗口外 digest。
     this.pruneDigest(digest, today);
 
-    // Build summary from digest + live data
+    // 从 digest 与 live 构建派生 summary。
     const summary = this.buildSummary(digest, todayLive, today);
 
-    // Persist — write source-of-truth (digest, scanState) before derived output (summary)
-    // so crash recovery favors re-scanning over data loss
+    // 先写事实来源再写派生摘要；崩溃恢复时宁可重扫，不能漏计。
     await ensureDir(path.dirname(this.digestPath));
     await ensureDir(path.dirname(this.summaryPath));
     await writeJsonFile(this.digestPath, digest);
@@ -269,6 +290,7 @@ export class MetricsSummaryWriter {
     });
   }
 
+  /** 列出符合 `<agent>-YYYY-MM-DD.jsonl` 的普通文件并排序。 */
   private async listOutputFiles(): Promise<string[]> {
     try {
       const entries = await fs.readdir(this.outputDir);
@@ -280,6 +302,7 @@ export class MetricsSummaryWriter {
     }
   }
 
+  /** 容错 stat；不存在/权限错误返回 null。 */
   private async safeStat(filePath: string): Promise<fsSync.Stats | null> {
     try {
       return await fs.stat(filePath);
@@ -288,6 +311,7 @@ export class MetricsSummaryWriter {
     }
   }
 
+  /** 获取或创建某日可变统计容器。 */
   private ensureDayStats(map: Map<string, DayStats>, day: string): DayStats {
     let stats = map.get(day);
     if (!stats) {
@@ -311,6 +335,9 @@ export class MetricsSummaryWriter {
     return stats;
   }
 
+  /**
+   * 从字节 offset 建流、按行解析 JSON 并应用记录，返回扫描后的文件 size 作为新 offset。
+   */
   private async scanFile(filePath: string, startOffset: number, stats: DayStats): Promise<number> {
     return new Promise<number>((resolve, reject) => {
       let currentOffset = startOffset;
@@ -321,14 +348,14 @@ export class MetricsSummaryWriter {
       const rl = createInterface({ input: stream, crlfDelay: Infinity });
 
       rl.on('line', (line) => {
-        currentOffset += Buffer.byteLength(line, 'utf8') + 1; // +1 for newline
+        currentOffset += Buffer.byteLength(line, 'utf8') + 1; // 额外的 1 字节用于换行符。
         if (!line.trim()) return;
 
         try {
           const record = JSON.parse(line) as Record<string, string>;
           this.applyRecord(record, stats);
         } catch {
-          // skip malformed lines
+          // 跳过写入中断或格式损坏的单行。
         }
       });
 
@@ -337,6 +364,7 @@ export class MetricsSummaryWriter {
     });
   }
 
+  /** 将一条字符串化规范事件累加到 token/session/request/tool/维度统计。 */
   private applyRecord(record: Record<string, string>, stats: DayStats): void {
     stats.events++;
 
@@ -348,7 +376,7 @@ export class MetricsSummaryWriter {
       stats.sessions.add(sessionId);
     }
 
-    // Agent stats
+    // Agent 维度统计。
     let agent = stats.agentStats.get(agentType);
     if (!agent) {
       agent = { sessions: new Set(), events: 0, tokens: 0 };
@@ -357,7 +385,7 @@ export class MetricsSummaryWriter {
     agent.events++;
     if (sessionId) agent.sessions.add(sessionId);
 
-    // Repo stats
+    // 仓库维度统计。
     const repo = record['git.repo'];
     if (repo) {
       let repoEntry = stats.repoStats.get(repo);
@@ -384,7 +412,7 @@ export class MetricsSummaryWriter {
       const cacheCreationTokens = toNumber(record['gen_ai.usage.cache_creation.input_tokens']);
       const totalTokens = toNumber(record['gen_ai.usage.total_tokens']);
 
-      // input_tokens already includes cache_read and cache_creation (they are subsets, not additive)
+      // input_tokens 已包含 cache read/creation，它们是子集，不能再次相加。
       // total_tokens = input_tokens + output_tokens
       const effectiveTotal = totalTokens > 0
         ? totalTokens
@@ -398,7 +426,7 @@ export class MetricsSummaryWriter {
 
       agent.tokens += effectiveTotal;
 
-      // Model breakdown
+      // 模型维度明细。
       const model = record['gen_ai.request.model'] ?? record['gen_ai.response.model'] ?? 'unknown';
       let modelEntry = stats.modelTokens.get(model);
       if (!modelEntry) {
@@ -409,12 +437,13 @@ export class MetricsSummaryWriter {
       modelEntry.input += inputTokens;
       modelEntry.cacheRead += cacheReadTokens;
 
-      // Provider breakdown
+      // Provider 维度明细。
       const provider = record['gen_ai.provider.name'] ?? 'unknown';
       stats.providerTokens.set(provider, (stats.providerTokens.get(provider) ?? 0) + effectiveTotal);
     }
   }
 
+  /** 把含 Set/Map 的内存统计转换为可 JSON 序列化日 digest。 */
   private dayStatsToDigest(stats: DayStats, existing?: DayDigest): DayDigest {
     if (existing && stats.events === 0) return existing;
     return {
@@ -430,6 +459,7 @@ export class MetricsSummaryWriter {
     };
   }
 
+  /** 只保留最近 200 天且不晚于今天的 digest。 */
   private pruneDigest(digest: DigestFile, today: string): void {
     const cutoff = dateDaysAgo(DIGEST_MAX_DAYS, today);
     for (const day of Object.keys(digest.days)) {
@@ -439,6 +469,7 @@ export class MetricsSummaryWriter {
     }
   }
 
+  /** 构造最终 Summary，包含今日/7日/30日、日趋势、版本和更新时间。 */
   private buildSummary(
     digest: DigestFile,
     todayLive: DayStats | undefined,
@@ -483,6 +514,7 @@ export class MetricsSummaryWriter {
     };
   }
 
+  /** 聚合一组日期，计算总量、去重 session 和模型/Agent/Provider/Repo shares。 */
   private buildRangeData(
     days: string[],
     digest: DigestFile,
@@ -579,6 +611,7 @@ export class MetricsSummaryWriter {
     };
   }
 
+  /** 为指定日期序列生成每天 token/session/request/tool 趋势点。 */
   private buildDailyPoints(
     days: string[],
     digest: DigestFile,
@@ -601,6 +634,7 @@ export class MetricsSummaryWriter {
     });
   }
 
+  /** 从当前版本目录 VERSION 读取版本，失败回退 package.json，再失败为 unknown。 */
   private readPackageVersion(): string {
     try {
       const versionFile = path.join(this.dataDir, 'package', 'VERSION');
@@ -623,24 +657,27 @@ export class MetricsSummaryWriter {
         }
       }
     } catch {
-      // ignore
+      // 版本指针或 VERSION 文件不可读时忽略，下面统一返回 unknown。
     }
     return 'unknown';
   }
 
+  /** 容错加载文件 offset/mtime 缓存。 */
   private async loadScanState(): Promise<ScanState> {
     const data = await readJsonFile<ScanState>(this.scanStatePath);
     return data && data.files ? data : { files: {} };
   }
 
+  /** 容错加载持久化日 digest。 */
   private async loadDigest(): Promise<DigestFile> {
     const data = await readJsonFile<DigestFile>(this.digestPath);
     return data && data.days ? data : { version: 1, days: {} };
   }
 }
 
-// ── Helpers ──
+// ── 辅助函数 ──
 
+/** 把字符串等转换为有限 number，非法值按 0。 */
 function toNumber(value: unknown): number {
   if (typeof value === 'number') return value;
   if (typeof value === 'string') {
@@ -650,12 +687,14 @@ function toNumber(value: unknown): number {
   return 0;
 }
 
+/** 相对 YYYY-MM-DD 计算若干天前的本地日期字符串。 */
 function dateDaysAgo(days: number, reference: string): string {
   const d = new Date(reference + 'T00:00:00');
   d.setDate(d.getDate() - days);
   return formatDate(d);
 }
 
+/** 生成以 today 结束、长度为 count 的连续日期数组。 */
 function daysInRange(count: number, today: string): string[] {
   const result: string[] = [];
   const base = new Date(today + 'T00:00:00');
@@ -667,6 +706,7 @@ function daysInRange(count: number, today: string): string[] {
   return result;
 }
 
+/** 生成本地 YYYY-MM-DD。 */
 function formatDate(d: Date): string {
   return [
     d.getFullYear(),
@@ -675,6 +715,7 @@ function formatDate(d: Date): string {
   ].join('-');
 }
 
+/** 从模型累加 Map 生成按 token 降序的占比列表。 */
 function buildModelShares(
   modelMap: Map<string, { total: number; input: number; cacheRead: number }>,
   totalTokens: number,
@@ -690,6 +731,7 @@ function buildModelShares(
     .sort((a, b) => b.totalTokens - a.totalTokens);
 }
 
+/** 从 Agent 累加 Map 生成按 token 降序的占比列表。 */
 function buildAgentShares(
   agentMap: Map<string, { sessions: number; events: number; tokens: number }>,
   totalEvents: number,
@@ -705,6 +747,7 @@ function buildAgentShares(
     .sort((a, b) => b.events - a.events);
 }
 
+/** 从 Provider 累加 Map 生成按 token 降序的占比列表。 */
 function buildProviderShares(
   providerMap: Map<string, number>,
   totalTokens: number,
@@ -718,6 +761,7 @@ function buildProviderShares(
     .sort((a, b) => b.totalTokens - a.totalTokens);
 }
 
+/** 从 Repo 累加 Map 生成按 event 降序的列表。 */
 function buildRepoShares(
   repoMap: Map<string, { sessions: number; events: number }>,
 ): RepoShareEntry[] {

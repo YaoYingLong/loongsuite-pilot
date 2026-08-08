@@ -1,9 +1,10 @@
-# Codex hook entrypoint (Windows) — delegates to codex-hook-processor.mjs.
+# Codex Windows Hook 入口：把 stdin JSON 委托给 codex-hook-processor.mjs。
 #
-# Usage (registered in ~/.codex/hooks.json by pilot HookStrategy):
+# HookStrategy 将下列命令注册到 ~/.codex/hooks.json，并写 config.toml trust hash：
 #   powershell -File $PILOT_DATA/hooks/codex-loongsuite-pilot-hook.ps1 <subcommand>
 #
-# Fail-open: any error outputs "{}" and exits 0.
+# processor 只在 stop 写 wakeup marker；正式遥测由 CodexTranscriptInput 读取 rollout 生成。
+# fail-open：任何错误都输出 `{}` 并退出 0，不阻塞 Codex。
 
 $ErrorActionPreference = "Continue"
 $EMPTY_RESULT = '{}'
@@ -90,19 +91,19 @@ if (-not $nodeBin) {
 }
 
 try {
-    # Read stdin as raw bytes to avoid PowerShell encoding issues (GB2312/ASCII mangles UTF-8)
+    # 原始字节读取避免 PowerShell 的 GB2312/ASCII 文本转换损坏 UTF-8 JSON。
     $stdinStream = [Console]::OpenStandardInput()
     $ms = New-Object System.IO.MemoryStream
     $stdinStream.CopyTo($ms)
     $rawBytes = $ms.ToArray()
     $ms.Dispose()
 
-    # Strip UTF-8 BOM (EF BB BF) before any encoding fixup
+    # 编码修复前去掉 UTF-8 BOM（EF BB BF）。
     if ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF) {
         $rawBytes = $rawBytes[3..($rawBytes.Length - 1)]
     }
 
-    # Fix Cursor's UTF-8→GBK double-encoding on Chinese Windows.
+    # 尝试逆转中文 Windows 上的 UTF-8 -> GBK 二次编码；失败时保留原字节。
     if ($rawBytes.Length -gt 2) {
         try {
             $utf8    = [System.Text.Encoding]::UTF8

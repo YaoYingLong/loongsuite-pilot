@@ -1,48 +1,22 @@
-// BUN_OPTIONS preload script for Claude Code fetch interception.
-// Injected via: BUN_OPTIONS="--preload=<this-file>" claude ...
-// Writes one JSON file per LLM call to:
-//   ~/.loongsuite-pilot/intercept/claude-code/<session_id>/<response_id>.json
-//
-// What it captures:
-//   1. system_instructions — parsed from the outgoing /v1/messages request
-//      body's `system` field, mapped to the MessagePart[] form defined by
-//      loongsuite-pilot/specs/gen-ai-system_instructions.json (TextPart uses
-//      `content`, not the Anthropic `text` field). The first block, which is
-//      a Claude Code billing-header marker, is filtered out.
-//   2. response_id — extracted from the first SSE `message_start` event's
-//      `message.id`. Same value pilot already stores under
-//      `gen_ai.response.id`, so the hook processor can join 1:1.
-//   3. ttft_ns — performance.now() delta (ms) at the moment the first
-//      content_block_delta (text_delta / thinking_delta / input_json_delta)
-//      arrives, converted to integer nanoseconds.
-//
-// Design notes:
-//   - SSE is parsed by splitting the accumulated buffer on `\n\n` event
-//     boundaries. A sliding-window regex was tried first and silently
-//     corrupted long preambles — do NOT change back.
-//   - Once both response_id and ttft_ns are captured we stop parsing and
-//     transparently pipe the rest of the stream, keeping memory bounded.
-//   - All work is wrapped in try/catch; an exception here must never break
-//     Claude Code's own fetch flow.
-//   - NOTE: This file uses require() which is Bun-specific in .mjs context.
-//     It only runs under BUN_OPTIONS --preload inside a compiled Bun binary
-//     (Claude Code CLI).
-//
-// 捕获的三类数据：
-// 1.系统提示词（system_instructions） 从向外发送的 /v1/messages 请求请求体的 system 字段中解析提取，并且转换为 MessagePart[] 格式（该格式由
-//    loongsuite-pilot/specs/gen-ai-system_instructions.json 规范定义）；其中文本结构体使用字段名content，而非 Anthropic 接口标准的text字段。
-//    同时会过滤掉第一段作为 Claude Code 计费标识的头部内容块。
-// 2.响应 ID（response_id） 从第一条 SSE 推送的message_start事件里的message.id字段提取。该 ID
-//    与采集器已存入gen_ai.response.id字段的值完全一致，上层钩子处理器可依靠此字段实现一对一的数据关联匹配。
-// 3.首字符抵达耗时 ttft_ns 当首个content_block_delta事件（包含文本增量、思考过程增量、入参 JSON 增量三类）到达时，
-//    通过performance.now()计算时间差值（毫秒），最终转换为整型纳秒值保存。
-//
-// 设计说明
-// 1.SSE 数据流解析方式：将累积缓冲区按照\n\n事件分隔符做切割解析。项目早期曾尝试滑动窗口正则方案，但长前置报文场景下会出现静默数据损坏问题，禁止改回正则实现方案。
-// 2.一旦成功捕获到response_id与ttft_ns两项指标，即刻停止解析逻辑，后续的原始流式数据直接透传转发，以此控制内存占用不会持续上涨。
-// 3.全部解析逻辑包裹在try/catch异常捕获中：本钩子内部抛出任何异常，都绝对不能破坏 Claude Code 原生的网络请求流程。
-//
-// 重要备注：本文件为.mjs格式却使用require()导入模块，该写法仅 Bun 运行环境支持。此脚本只会由 Claude Code 编译后的 Bun 二进制程序，通过BUN_OPTIONS --preload预加载方式运行。
+/**
+ * Claude Code 请求侧 fetch 截获脚本。
+ *
+ * Claude Code 通过 `BUN_OPTIONS="--preload=<本文件>"` 在自身 Bun 进程启动前加载它。
+ * 本模块包装 `globalThis.fetch`，只观察 `/v1/messages` 请求及其 SSE 响应；正式对话内容仍由
+ *原生 transcript 采集。每次 LLM 调用写一个
+ * `~/.loongsuite-pilot/intercept/claude-code/<session_id>/<response_id>.json`，随后
+ * `claude-code-hook-processor.mjs` 在 stop 阶段按 `response_id` 与 transcript 一对一合并。
+ *
+ * 捕获三类 transcript 中没有或不够精确的数据：请求 `system` 转成 MessagePart[] 后的
+ * `system_instructions`（过滤 Claude 计费头块）、首个 SSE `message_start.message.id`，以及从
+ * 发起 fetch 到首个内容增量的 `ttft_ns`。SSE 必须按空行 `\n\n` 的完整事件边界切分；旧的
+ * 滑动窗口正则会静默破坏长前导数据，不可恢复为该实现。取得 response_id 和 TTFT 后停止解析
+ * 并透明转发余下数据，以限制内存。
+ *
+ * 该文件虽为 `.mjs` 却使用 `require()`，这是 Bun preload 环境特性，不应由普通 Node.js
+ * 直接运行。所有观察逻辑均 fail-open：网络错误原样抛给 Claude Code，截获自身错误则被吞掉，
+ * 不能改变请求、响应、流背压或宿主异常行为。
+ */
 const fs = require('node:fs');
 const path = require('node:path');
 
@@ -55,11 +29,11 @@ const LLM_URL_RE = /\/v1\/messages(?:\?|$|\/)/;
 const BILLING_HEADER_PREFIX = 'x-anthropic-billing-header:';
 const SSE_DELIMITER = '\n\n';
 
-// ─── system_instructions extraction ──────────────────────────────────────
+// ─── system_instructions 提取 ─────────────────────────────────────────────
 
 function extractSystemInstructions(systemField) {
   if (systemField == null) return null;
-  // Defensive: accept a bare string and wrap (spec returns array form)
+  // 兼容 system 为裸字符串的输入，并包装成规范要求的数组形式。
   if (typeof systemField === 'string') {
     if (systemField.startsWith(BILLING_HEADER_PREFIX)) return null;
     return [{ type: 'text', content: systemField }];
@@ -75,9 +49,7 @@ function extractSystemInstructions(systemField) {
       if (text.startsWith(BILLING_HEADER_PREFIX)) continue;
       result.push({ type: 'text', content: text });
     } else if (typeof type === 'string') {
-      // Non-text block: pass through under GenericPart (spec allows
-      // additionalProperties). Preserve all original fields so server-side
-      // consumers see everything.
+      // 非文本块按 GenericPart 透传；规范允许 additionalProperties，因此保留原字段供服务端使用。
       const { type: t, ...rest } = block;
       result.push({ type: t, ...rest });
     }
@@ -85,7 +57,7 @@ function extractSystemInstructions(systemField) {
   return result.length > 0 ? result : null;
 }
 
-// ─── header / body helpers ────────────────────────────────────────────────
+// ─── 请求头和请求体工具 ─────────────────────────────────────────────────
 
 function dumpHeaders(h) {
   const out = {};
@@ -123,28 +95,27 @@ function safeParseRequestSystem(body) {
   }
 }
 
-// ─── intercept record writer ──────────────────────────────────────────────
+// ─── 截获记录写入 ───────────────────────────────────────────────────────
 
 function writeRecord(sessionId, record) {
   try {
     const dir = path.join(INTERCEPT_BASE, sessionId);
     fs.mkdirSync(dir, { recursive: true });
     const file = path.join(dir, `${record.response_id}.json`);
-    // Single record per file (~27KB worst case) — POSIX guarantees writes
-    // under PIPE_BUF (~4KB) are atomic; for larger writes appendFileSync
-    // could interleave, but writeFileSync writes once to a fresh inode so
-    // partial reads aren't a concern in practice.
+    // 每个 response 独占新文件（最坏约 27KB），不用 append，避免多个调用把内容交错写入。
+    // processor 只会在 stop 后读取，正常情况下不会观察到写到一半的文件。
     fs.writeFileSync(file, JSON.stringify(record));
   } catch (_) {
-    // intercept storage failure must not affect the host process
+    // 截获记录落盘失败不能影响 Claude Code 的网络请求。
   }
 }
 
-// ─── SSE event-block parsing ──────────────────────────────────────────────
+// ─── SSE 完整事件块解析 ─────────────────────────────────────────────────
 
 /**
- * Parse a single complete SSE event block (text between two `\n\n`).
- * Returns { event, data } or null if malformed.
+ * 解析两个 `\n\n` 之间的一条完整 SSE 事件块。
+ * @param {string} block SSE 文本块。
+ * @returns {{event: string, data: string} | null} 事件名和合并后的 data；格式不完整时返回 null。
  */
 function parseSseBlock(block) {
   let event = null;
@@ -157,7 +128,7 @@ function parseSseBlock(block) {
   return { event, data: dataLines.join('\n') };
 }
 
-// ─── globalThis.fetch monkey-patch ───────────────────────────────────────
+// ─── 包装 globalThis.fetch ──────────────────────────────────────────────
 
 const origFetch = globalThis.fetch;
 if (typeof origFetch === 'function') {
@@ -175,9 +146,7 @@ if (typeof origFetch === 'function') {
       return origFetch.call(this, input, init);
     }
 
-    // Header session_id is required to scope intercept output. Without it
-    // we have no way for the hook processor to find this record, so we
-    // skip writing — let the request go through normally.
+    // session_id 请求头决定输出目录；缺失时 processor 无法关联记录，因此仅透传请求而不落盘。
     let sessionId = null;
     let systemInstructions = null;
     try {
@@ -201,11 +170,11 @@ if (typeof origFetch === 'function') {
     try {
       response = await origFetch.call(this, input, init);
     } catch (err) {
-      // Network failure: nothing useful to record; rethrow to host.
+      // 真实网络失败必须原样抛给宿主；本模块不能伪装请求成功。
       throw err;
     }
 
-    // No body (HEAD-style, 204, etc.) → can't observe stream.
+    // 没有 body（例如 204）时无流可观察，直接返回原响应。
     if (!response || !response.body) return response;
 
     let responseId = null;
@@ -250,7 +219,7 @@ if (typeof origFetch === 'function') {
     try {
       transform = new TransformStream({
         transform(chunk, controller) {
-          controller.enqueue(chunk); // pass through first, parsing is best-effort
+          controller.enqueue(chunk); // 先透传数据；解析仅为尽力而为的旁路操作。
           if (stopParsing) return;
           try {
             pending += decoder.decode(chunk, { stream: true });
@@ -268,15 +237,12 @@ if (typeof origFetch === 'function') {
           } catch (_) {}
         },
         flush() {
-          // Stream ended normally without ever producing a content delta
-          // (e.g. tool-only response that arrived as a single block, or
-          // server returned an error mid-stream). Persist whatever we have.
+          // 流正常结束但从未出现内容增量（如纯工具响应或中途服务端错误）时，保存已取得的字段。
           if (!recordWritten && responseId) tryEmit();
         },
       });
     } catch (_) {
-      // TransformStream construction failed (very old runtime): bail out
-      // and return the original response untouched.
+      // 很旧的运行时若无法创建 TransformStream，则放弃观察并原样返回响应。
       return response;
     }
 

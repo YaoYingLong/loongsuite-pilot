@@ -1,9 +1,11 @@
 /**
- * All supported AI coding tool types.
- * Extend this enum when adding a new agent.
+ * Agent、工具类别与采集方式的稳定枚举。
+ *
+ * 新增 Agent 时需要同步扩展 ClientType、Orchestrator 注册、agents.d 声明和测试。枚举值会进入
+ * 配置、checkpoint、日志与 Trace Resource，因此发布后不应随意改名。
  */
 export enum ClientType {
-  // IDE tools
+  // IDE 或桌面应用类 Agent。
   Cursor = 'cursor',
   Qoder = 'qoder',
   QoderCn = 'qoder-cn',
@@ -17,7 +19,7 @@ export enum ClientType {
   LingmaVscode = 'lingma-vscode',
   Wukong = 'wukong',
 
-  // CLI tools
+  // 命令行或 session 文件型 Agent。
   GeminiCli = 'gemini-cli',
   YkCli = 'ykcli',
   QwenCodeCli = 'qwen-code-cli',
@@ -27,7 +29,7 @@ export enum ClientType {
   CursorCli = 'cursor-cli',
   PiCodingAgent = 'pi-coding-agent',
 
-  // Hook-based tools
+  // 通过 Hook/插件产生结构化事件的 Agent。
   ClaudeCliHook = 'claude-code',
   IflowCliHook = 'iflow-cli-hook',
   CursorHook = 'cursor-hook',
@@ -43,6 +45,7 @@ export enum ClientType {
 
 }
 
+/** Agent 产品的交互形态，供发现和展示层分类。 */
 export enum ToolType {
   IDE = 'ide',
   CLI = 'cli',
@@ -50,19 +53,20 @@ export enum ToolType {
   Plugin = 'plugin',
 }
 
+/** Input 从源 Agent 获取数据的方式。 */
 export enum CollectionMethod {
-  /** Periodically read IDE local DiskKV / history files */
+  /** 周期读取 IDE 本地 DiskKV/history 快照。 */
   IdeSnapshotPolling = 'ide-snapshot-polling',
-  /** Incrementally query a local SQLite database */
+  /** 增量查询本地 SQLite 数据库。 */
   SqlitePolling = 'sqlite-polling',
-  /** Intercept tool events via injected hook scripts, read JSONL logs */
+  /** 注入 Hook 产生日志，再增量读取 JSONL。 */
   HookJsonl = 'hook-jsonl',
-  /** Configure tool telemetry output to a file, poll and forward */
+  /** 配置工具把 telemetry 写文件，再轮询转发。 */
   CliTelemetryForwarding = 'cli-telemetry-forwarding',
-  /** Read session record files (JSONL/JSON) */
+  /** 读取 Agent 的 session JSON/JSONL 文件。 */
   SessionFilePolling = 'session-file-polling',
-  /** Access tool's Language Server via HTTP API */
+  /** 通过 HTTP 调用工具的 Language Server API。 */
   LsHttpApi = 'ls-http-api',
-  /** Poll agent data via local CLI API (e.g. wukong) */
+  /** 通过本地 CLI API 轮询，例如 Wukong。 */
   CliApiPolling = 'cli-api-polling',
 }

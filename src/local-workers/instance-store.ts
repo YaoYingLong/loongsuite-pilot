@@ -1,3 +1,14 @@
+/**
+ * Local Worker 实例的声明式配置、凭据与状态读取仓库。
+ *
+ * worker CLI 通过 connect/reconnect/enable/delete 修改
+ * `<dataDir>/local-workers/<instanceId>/instance.json`，ActivationService 再把 enabled
+ * 期望状态收敛为真实进程。bootstrap token 单独以受限权限写入 credentials，避免进入
+ * 可展示的 instance.json。查询函数合并 supervisor/runtime/matrix 快照生成 CLI 视图；
+ * 所有 ID 和相对路径均经校验，写入使用项目原子 JSON 工具。
+ */
+
+
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
@@ -70,30 +81,37 @@ export interface LocalWorkerView {
 const LOCAL_WORKER_HEARTBEAT_STALE_MS = 120_000;
 
 // 以下路径函数集中定义实例目录约定，避免 CLI、激活服务和 Supervisor 各自拼接出不同路径。
+/** 返回 `<dataDir>/local-workers`。 */
 export function localWorkerRoot(dataDir: string): string {
   return path.join(resolveHome(dataDir), 'local-workers');
 }
 
+/** 返回单实例隔离目录。 */
 export function instanceDir(dataDir: string, instanceId: string): string {
   return path.join(localWorkerRoot(dataDir), instanceId);
 }
 
+/** 返回实例期望配置 instance.json 路径。 */
 export function instanceConfigPath(dataDir: string, instanceId: string): string {
   return path.join(instanceDir(dataDir, instanceId), 'instance.json');
 }
 
+/** 根据 instance 中的相对引用返回凭据绝对路径。 */
 export function bootstrapTokenPath(dataDir: string, instance: LocalWorkerInstance): string {
   return path.join(instanceDir(dataDir, instance.id), instance.bootstrapTokenRef);
 }
 
+/** 返回实例状态快照目录。 */
 export function stateDir(dataDir: string, instanceId: string): string {
   return path.join(instanceDir(dataDir, instanceId), 'state');
 }
 
+/** 返回实例日志目录。 */
 export function logDir(dataDir: string, instanceId: string): string {
   return path.join(instanceDir(dataDir, instanceId), 'logs');
 }
 
+/** 返回实例独享 Runtime 包目录。 */
 export function bundleDir(dataDir: string, instanceId: string): string {
   return path.join(instanceDir(dataDir, instanceId), 'bundle');
 }
@@ -103,6 +121,7 @@ export function bundleDir(dataDir: string, instanceId: string): string {
  * 必须先 disconnect，并等待 ActivationService 确认相关 PID 已退出，避免删除仍在运行的
  * Worker 所依赖的 token、状态目录和日志句柄。
  */
+/** 前置条件不满足时抛错，满足后递归删除实例目录。 */
 export async function deleteLocalWorkerInstance(dataDir: string, instanceId: string): Promise<void> {
   const instance = await readLocalWorkerInstance(dataDir, instanceId);
   if (!instance) throw new Error(`local worker not found: ${instanceId}`);
@@ -117,6 +136,7 @@ export async function deleteLocalWorkerInstance(dataDir: string, instanceId: str
 }
 
 /** 创建一个默认启用的新实例，并持久化运行目录、凭据和实例配置。 */
+/** 校验 runtime/token、分配 ID、创建隔离目录与凭据，并写默认 enabled 实例。 */
 export async function connectLocalWorker(opts: ConnectLocalWorkerOptions): Promise<LocalWorkerInstance> {
   const runtime = opts.runtime.trim();
   if (!runtime) throw new Error('runtime is required');
@@ -153,6 +173,7 @@ export async function connectLocalWorker(opts: ConnectLocalWorkerOptions): Promi
  * 重新启用已有实例，并按需更新凭据、工作目录和 Runtime 参数。
  * 未提供的可选项沿用旧值；runtimeOptions 只要显式传入（包括空对象）就整体替换。
  */
+/** 重连实例；未提供字段沿用旧值，显式 runtimeOptions 整体替换。 */
 export async function reconnectLocalWorker(opts: ReconnectLocalWorkerOptions): Promise<LocalWorkerInstance> {
   const instance = await readLocalWorkerInstance(opts.dataDir, opts.instanceId);
   if (!instance) throw new Error(`local worker not found: ${opts.instanceId}`);
@@ -318,6 +339,7 @@ export async function readLocalWorkerView(
 }
 
 /** 从实例引用的独立凭据文件读取 bootstrap token。 */
+/** 文件缺失/不可读时透传异常给 Worker 启动流程。 */
 export async function readBootstrapToken(dataDir: string, instance: LocalWorkerInstance): Promise<string> {
   return (await fs.readFile(bootstrapTokenPath(dataDir, instance), 'utf-8')).trim();
 }
@@ -340,6 +362,7 @@ async function hasRunningLocalWorkerProcess(dataDir: string, instanceId: string)
   return false;
 }
 
+/** 容错解析正整数 PID；文件缺失或非法返回 undefined。 */
 async function readPidFile(pidPath: string): Promise<number | undefined> {
   try {
     const pid = Number.parseInt((await fs.readFile(pidPath, 'utf-8')).trim(), 10);
@@ -367,6 +390,7 @@ async function writeBootstrapToken(dir: string, token: string): Promise<void> {
 }
 
 /** 将随机字节编码为不区分大小写文件系统也可安全使用的 Base32 文本。 */
+/** 把随机字节编码为无填充 Base32，用于可读实例 ID。 */
 function base32(bytes: Buffer): string {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
   let bits = 0;
@@ -384,16 +408,19 @@ function base32(bytes: Buffer): string {
   return output;
 }
 
+/** 读取非空字符串。 */
 function readString(value: unknown): string | undefined {
   return typeof value === 'string' && value !== '' ? value : undefined;
 }
 
+/** 将字符串/数字/布尔转成 CLI 展示文本。 */
 function readDisplayValue(value: unknown): string | undefined {
   if (typeof value === 'boolean') return value ? 'connected' : 'disconnected';
   if (typeof value === 'string' && value !== '') return value;
   return undefined;
 }
 
+/** 根据 Worker 自报 state/status/connected 判断降级。 */
 function isWorkerDegraded(worker: Record<string, unknown> | null): boolean {
   const phase = String(worker?.phase ?? worker?.state ?? '').toLowerCase();
   const reason = String(worker?.reason ?? '').toLowerCase();
@@ -401,6 +428,7 @@ function isWorkerDegraded(worker: Record<string, unknown> | null): boolean {
 }
 
 /** 同时兼容秒、毫秒、纯数字字符串和 ISO 日期字符串格式的时间戳。 */
+/** 兼容 ISO 字符串与毫秒/秒数值时间戳，统一返回毫秒。 */
 function readTimestampMs(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return value > 1_000_000_000_000 ? value : value * 1000;
@@ -414,6 +442,7 @@ function readTimestampMs(value: unknown): number | undefined {
   return Number.isFinite(parsed) ? parsed : undefined;
 }
 
+/** 将可解析时间戳规范成 ISO 展示值。 */
 function readTimestampDisplay(value: unknown): string | undefined {
   const raw = readString(value);
   if (raw) return raw;
@@ -421,12 +450,14 @@ function readTimestampDisplay(value: unknown): string | undefined {
   return ms === undefined ? undefined : new Date(ms).toISOString();
 }
 
+/** 只接受非数组对象。 */
 function readRecord(value: unknown): Record<string, unknown> | undefined {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
 }
 
+/** 从多个 Runtime 快照层级回退解析 team name。 */
 function readTeamName(
   runtimeSnapshot: Record<string, unknown> | null,
   runtimeMember?: Record<string, unknown>,
@@ -445,6 +476,7 @@ function readTeamName(
   return match?.[1];
 }
 
+/** 将 Matrix 快照收敛为 connected/disconnected 等展示字符串。 */
 function readMatrixSnapshot(value: Record<string, unknown> | null): string | undefined {
   if (!value) return undefined;
   if (readString(value.matrixSyncToken)) return 'connected';
@@ -452,15 +484,18 @@ function readMatrixSnapshot(value: Record<string, unknown> | null): string | und
   return cursors && Object.keys(cursors).length > 0 ? 'connected' : undefined;
 }
 
+/** 返回对象首个 key，常用于从 cursor Map 推断 roomId。 */
 function firstRecordKey(value: unknown): string | undefined {
   const record = readRecord(value);
   return record ? Object.keys(record).find(key => key !== '') : undefined;
 }
 
+/** 只接受有限数值。 */
 function readNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
+/** 用 signal 0 检测 PID；异常按不存活。 */
 function isAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);

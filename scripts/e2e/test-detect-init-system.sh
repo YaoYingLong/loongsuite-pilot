@@ -1,9 +1,10 @@
 #!/bin/bash
-# test-detect-init-system.sh — Docker-based test for detect_init_system() scenarios
+# `detect_init_system()` 的 Docker 测试入口：构建一个镜像并在单个容器内运行全部场景。
+# 它只挂载测试代码，不接触宿主机的 systemd/launchd；docker build/run 任一步失败即返回非零退出码。
 #
-# Usage: ./scripts/e2e/test-detect-init-system.sh
+# 用法：./scripts/e2e/test-detect-init-system.sh
 #
-# Builds a single test image then runs all scenarios inside one container.
+# 严格模式解释：`-e` 命令失败退出，`-u` 未定义变量退出，`pipefail` 让管道中间失败可见。
 
 set -euo pipefail
 

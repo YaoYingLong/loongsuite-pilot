@@ -1,3 +1,4 @@
+/** Qoder CLI Hook JSONL Input，解析 CLI canonical 记录并维护版本/历史消费状态。 */
 import { ClientType } from '../../types/index.js';
 import type { AgentActivityEntry, AgentEventName, JsonValue } from '../../types/index.js';
 import { BaseHookInput, type HookInputOptions } from '../base/base-hook-input.js';
@@ -17,16 +18,23 @@ const IGNORED_ROW_TYPES = new Set(['ai-title', 'last-prompt', 'session_meta', 'p
 const UNKNOWN_MODEL = 'unknown';
 type QoderVariant = 'qoder-cli' | 'qoder';
 
-/** Qoder transcript hook input. */
+/**
+ * 读取 Qoder/Qoder CLI Hook 追加 JSONL 的输入适配器。
+ *
+ * BaseHookInput 管理文件发现、字节 offset、轮转和坏行隔离。本类优先识别 canonical Hook schema，
+ * 再兼容 PostToolUse 与历史 transcript 形状，并补充 Git/source context 后构建标准事件。
+ */
 export class QoderCliInput extends BaseHookInput {
   readonly id = 'qoder-cli-hook';
   readonly agentType = ClientType.QoderCli;
   private lastAgentVersion = '';
 
+  /** 返回最近一条记录中观察到的 Qoder 版本，供 InputManager/状态输出展示。 */
   getAgentVersion(): string {
     return this.lastAgentVersion;
   }
 
+  /** 配置 Hook history 目录、文件前缀和轮询间隔；构造阶段不读取日志。 */
   constructor(opts?: Partial<HookInputOptions> & { stateStore: HookInputOptions['stateStore'] }) {
     super({
       stateStore: opts!.stateStore,
@@ -36,14 +44,22 @@ export class QoderCliInput extends BaseHookInput {
     });
   }
 
+  /** 通过 `~/.qoder` 是否存在判断本机是否可能安装了 Qoder。 */
   static async checkAvailability(): Promise<boolean> {
     return directoryExists(resolveHome('~/.qoder'));
   }
 
+  /** 返回发现服务应监听的 Qoder 用户目录。 */
   static getWatchPaths(): string[] {
     return [resolveHome('~/.qoder')];
   }
 
+  /**
+   * 将一条未知版本的 Qoder Hook/transcript record 转成标准事件。
+   *
+   * 处理优先级为 canonical -> PostToolUse -> assistant/user transcript；控制行和无法识别的内容返回
+   * null。Git 推断涉及子进程调用，由 `inferGitContext()` 自身做缓存和失败降级。
+   */
   protected async transformRecord(
     record: Record<string, unknown>,
   ): Promise<AgentActivityEntry | null> {
@@ -120,6 +136,7 @@ export class QoderCliInput extends BaseHookInput {
   }
 }
 
+/** 兼容毫秒 number、数字字符串和日期字符串；无法解析时返回 undefined。 */
 function parseTimestamp(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isFinite(value)) return value;
   if (typeof value !== 'string') return undefined;
@@ -131,6 +148,9 @@ function parseTimestamp(value: unknown): number | undefined {
   return Number.isNaN(parsed) ? undefined : parsed;
 }
 
+/**
+ * 识别 Qoder CLI 的 PostToolUse Hook，并构建成功的 tool.result；其他事件类型返回 null。
+ */
 async function buildPostToolUseEntry(record: Record<string, unknown>): Promise<AgentActivityEntry | null> {
   const data = (record.data && typeof record.data === 'object' && !Array.isArray(record.data))
     ? record.data as Record<string, unknown>
@@ -172,6 +192,7 @@ async function buildPostToolUseEntry(record: Record<string, unknown>): Promise<A
   });
 }
 
+/** 依据 CLI 专有字段判断记录来自 Qoder CLI 还是 IDE 兼容格式。 */
 function inferVariant(record: Record<string, unknown>): QoderVariant {
   if (
     getStringValue(record, 'entrypoint') === 'cli' ||
@@ -184,6 +205,7 @@ function inferVariant(record: Record<string, unknown>): QoderVariant {
   return 'qoder';
 }
 
+/** 将 transcript 行角色和主内容块类型映射为四种 GenAI 事件名。 */
 function inferEventName(rowType: string, content: Record<string, unknown>): AgentEventName {
   const contentType = getStringValue(content, 'type');
   if (contentType === 'tool_result') return 'tool.result';
@@ -192,6 +214,10 @@ function inferEventName(rowType: string, content: Record<string, unknown>): Agen
   return 'llm.request';
 }
 
+/**
+ * 从 message.content 选择本条事件最有语义的块，优先级为 tool_result、tool_use、text、thinking。
+ * 字符串内容会先包装成 text 块；没有可识别对象时返回 null。
+ */
 function selectDominantContentBlock(rawContent: unknown): Record<string, unknown> | null {
   if (typeof rawContent === 'string') return { type: 'text', text: rawContent };
   const blocks = Array.isArray(rawContent)
@@ -207,12 +233,14 @@ function selectDominantContentBlock(rawContent: unknown): Record<string, unknown
     ?? null;
 }
 
+/** 把用户文本包装为本次 llm.request 的增量消息。 */
 function buildInputMessagesDelta(content: Record<string, unknown>): JsonValue | undefined {
   const text = getStringValue(content, 'text') ?? getStringValue(content, 'content');
   if (!text) return undefined;
   return [{ role: 'user', content: text }];
 }
 
+/** 把 assistant 文本或 thinking 内容映射为 text/reasoning 输出 part。 */
 function buildOutputMessages(content: Record<string, unknown>): JsonValue | undefined {
   const contentType = getStringValue(content, 'type');
   const text = getStringValue(content, 'text')
@@ -225,6 +253,7 @@ function buildOutputMessages(content: Record<string, unknown>): JsonValue | unde
   }];
 }
 
+/** 从顶层 toolUseResult 或内容块 content 中提取 JSON 兼容的工具结果。 */
 function buildToolResultPayload(
   record: Record<string, unknown>,
   content: Record<string, unknown>,
@@ -233,6 +262,7 @@ function buildToolResultPayload(
   return toJsonValue(raw);
 }
 
+/** 仅在源记录明确提供 is_error 布尔值时输出 success/failure。 */
 function inferToolResultStatus(content: Record<string, unknown>): string | undefined {
   const isError = getBooleanValue(content, 'is_error');
   if (isError === true) return 'failure';
@@ -240,6 +270,7 @@ function inferToolResultStatus(content: Record<string, unknown>): string | undef
   return undefined;
 }
 
+/** 收集仍有诊断价值但不属于统一 schema 顶层字段的 Qoder 原始属性。 */
 function buildAttributes(
   record: Record<string, unknown>,
   message: Record<string, unknown>,
@@ -265,6 +296,9 @@ function buildAttributes(
   });
 }
 
+/**
+ * 归一化记录中不同命名的 repo/branch/domain/workspace 字段；缺项时按 cwd 调用 Git 探测补齐。
+ */
 async function buildSourceFields(
   record: Record<string, unknown>,
 ): Promise<Record<string, JsonValue>> {
@@ -316,22 +350,26 @@ async function buildSourceFields(
 }
 
 
+/** 从不可信对象读取非空字符串字段。 */
 function getStringValue(data: Record<string, unknown>, key: string): string | undefined {
   const val = data[key];
   return typeof val === 'string' && val.length > 0 ? val : undefined;
 }
 
+/** 从不可信对象读取严格布尔字段，不把字符串 true/false 强制转换。 */
 function getBooleanValue(data: Record<string, unknown>, key: string): boolean | undefined {
   const val = data[key];
   return typeof val === 'boolean' ? val : undefined;
 }
 
+/** 把普通对象原样返回，其余值转换为空对象以简化兼容解析。 */
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
 }
 
+/** 递归过滤 undefined 等 JSON 不可表示值，生成可序列化对象。 */
 function toJsonObject(value: Record<string, unknown>): { [key: string]: JsonValue } {
   const out: { [key: string]: JsonValue } = {};
   for (const [key, raw] of Object.entries(value)) {
@@ -341,6 +379,7 @@ function toJsonObject(value: Record<string, unknown>): { [key: string]: JsonValu
   return out;
 }
 
+/** 将未知值递归转换成 JsonValue；函数等非常规值最后退化为字符串。 */
 function toJsonValue(value: unknown): JsonValue | undefined {
   if (value === undefined) return undefined;
   if (

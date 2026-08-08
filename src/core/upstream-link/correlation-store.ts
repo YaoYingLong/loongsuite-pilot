@@ -1,3 +1,13 @@
+/**
+ * acp-correlate JSONL 的按 session 查询与一次性消费仓库。
+ *
+ * Hook/adapter 把 turn 级 prompt 指纹或 session 级 traceparent 写入磁盘；TraceLinker
+ * 调用本类按“精确 hash、内容前缀、首轮 session”顺序解析。文件 mtime 未变化时复用
+ * 内存索引，变化后重读，并保留已经消费的下标，避免同一上游上下文被多个 turn
+ * 重复使用。同步 fs API 使单次解析保持原子视图；所有格式错误均被跳过以保证采集
+ * fail-open。
+ */
+
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { contentHash } from '../../utils/content-hash.js';
@@ -21,17 +31,18 @@ interface SessionState {
   mtimeMs: number;
   turns: TurnRecord[];
   sessions: SessionRecord[];
-  /** Indices already consumed (consume-once), preserved across file re-reads. */
+  /** 已一次性消费的下标；文件重读后仍保留。 */
   consumedTurns: Set<number>;
   sessionConsumed: boolean;
-  /** contentHash -> ascending turn indices, for O(1) exact-match lookup. */
+  /** contentHash -> 升序 turn 下标，用于摊销 O(1) 的精确匹配。 */
   hashIndex: Map<string, number[]>;
-  /** contentHash -> next bucket position to consider (skips consumed prefix). */
+  /** contentHash -> 下一个待检查的桶位置，用来跳过已消费前缀。 */
   hashCursor: Map<string, number>;
-  /** Wall-clock of the last access; used to evict idle sessions. */
+  /** 最后访问的墙上时钟时间，用于淘汰空闲 session。 */
   lastAccessMs: number;
 }
 
+/** 为 turn 记录按 contentHash 建立升序下标桶，减少精确匹配扫描。 */
 function buildHashIndex(turns: TurnRecord[]): Map<string, number[]> {
   const index = new Map<string, number[]>();
   for (let i = 0; i < turns.length; i += 1) {
@@ -44,50 +55,65 @@ function buildHashIndex(turns: TurnRecord[]): Map<string, number[]> {
   return index;
 }
 
+/** 把 sessionId 收敛为可用作单个文件名的安全字符串。 */
 function safeName(value: string): string {
   return path.basename(String(value)).replace(/[^a-zA-Z0-9_-]/g, '_') || 'unknown';
 }
 
 /**
- * Reads upstream-context correlation records written to
- * `${dataDir}/acp-correlate/<sessionId>.jsonl`:
- *   - `turn`    records (adapter, per prompt): matched by content, consume-once.
- *   - `session` records (env hook, first turn): applied to a session's first turn.
+ * 读取 `${dataDir}/acp-correlate/<sessionId>.jsonl` 中的上游上下文关联记录。
  *
- * State is per-session and lazily (re)loaded by mtime. Consumption cursors live
- * in memory and survive file re-reads (records are append-only, indices stable).
+ * `turn` 记录由 adapter 按 prompt 写入，通过内容匹配并且只能消费一次；`session`
+ * 记录由环境 Hook 写入，只应用于 session 的第一轮。
+ *
+ * 状态按 session 隔离，并根据 mtime 惰性加载或重载。消费游标只保存在内存中；由于
+ * 文件采用追加写、下标稳定，文件重读后仍能继续沿用已消费集合。
  */
 export class CorrelationStore {
   private readonly dir: string;
   private readonly states = new Map<string, SessionState>();
 
+  /** @param correlateDir `<dataDir>/acp-correlate` 的绝对路径。 */
   constructor(correlateDir: string) {
+    // ~/.loongsuite-pilot/acp-correlate
     this.dir = correlateDir;
   }
 
+  /**
+   * 按 session 读取 JSONL；mtime 未变化时复用缓存，变化时重建索引并保留已消费集合。
+   * 文件缺失返回 null，坏行逐行跳过；同步读取保证一次解析看到同一文件快照。
+   */
   private load(sessionId: string): SessionState | null {
+    // 获取对应sessionId对应的文件路径
     const file = path.join(this.dir, `${safeName(sessionId)}.jsonl`);
     let stat: fs.Stats;
     try {
+      // 同步方法，获取 file 路径对应的文件元信息（大小、修改时间、是否存在等）
       stat = fs.statSync(file);
     } catch {
-      return null; // no records for this session
+      return null; // 文件不存在或不可访问，表示该 session 暂无可用记录。
     }
 
     const existing = this.states.get(sessionId);
+    // 如果缓存中存在对应sessionId的数据，内存里有缓存 并且 缓存记录保存的文件修改时间 mtimeMs 等于磁盘当前文件的 mtimeMs
     if (existing && existing.mtimeMs === stat.mtimeMs) {
+      // 磁盘文件自从上次加载后没有被修改过，内存缓存依然有效
       existing.lastAccessMs = Date.now();
       return existing;
     }
 
+    // 如果磁盘文件自从上次加载后有被修改过，需要重新读取
     const turns: TurnRecord[] = [];
     const sessions: SessionRecord[] = [];
     try {
+      // 读取文件内容
       const raw = fs.readFileSync(file, 'utf8');
+      // 按行读取
       for (const line of raw.split('\n')) {
         if (!line.trim()) continue;
         let rec: unknown;
         try {
+          // 将每行的数据转换成json数据
           rec = JSON.parse(line);
         } catch {
           continue;
@@ -115,8 +141,7 @@ export class CorrelationStore {
       sessions,
       consumedTurns: existing?.consumedTurns ?? new Set<number>(),
       sessionConsumed: existing?.sessionConsumed ?? false,
-      // Rebuilt on every (re)read; indices are stable (append-only file), and
-      // cursors re-derive from consumedTurns on first use, so a reset is safe.
+      // 每次重读都重建索引；追加写保证下标稳定，游标首次使用时会根据 consumedTurns 重新定位。
       hashIndex: buildHashIndex(turns),
       hashCursor: new Map<string, number>(),
       lastAccessMs: Date.now(),
@@ -126,21 +151,14 @@ export class CorrelationStore {
   }
 
   /**
-   * Resolve a per-turn upstream traceparent by matching the collected user text
-   * against turn records. Exact `contentHash` matches take precedence and are
-   * looked up via a per-hash index (O(1) amortized, so a session with many
-   * turns stays linear overall instead of O(turns^2)); `contentPrefix` is a
-   * fallback used only when no exact record matches (covers agents that rewrite
-   * the prompt, e.g. appending `@file`). Both consume the lowest unconsumed
-   * matching record in file order. Null if no match.
+   * 一次性消费与用户文本匹配的 turn traceparent：先精确 hash，再尝试内容前缀。
+   * @returns 命中的 traceparent；无文件或无未消费匹配时返回 null。
    */
   resolveTurn(sessionId: string, collectedText: string): string | null {
     const state = this.load(sessionId);
     if (!state || state.turns.length === 0) return null;
 
-    // Exact path: advance the hash bucket cursor past already-consumed entries
-    // (a bucket entry may have been consumed via the prefix fallback), then take
-    // the first unconsumed index.
+    // 精确路径先跨过已消费下标（某个桶成员也可能已被前缀回退消费），再取最早未消费项。
     const hash = contentHash(collectedText);
     const bucket = state.hashIndex.get(hash);
     if (bucket) {
@@ -155,9 +173,8 @@ export class CorrelationStore {
       state.hashCursor.set(hash, c);
     }
 
-    // Prefix fallback: lowest unconsumed turn whose contentPrefix the collected
-    // text starts with. Linear in turns, but only reached when the exact lookup
-    // misses (prompt-rewrite turns are the minority).
+    // 精确 hash 未命中时才线性扫描前缀，取文件顺序中最早且未消费的匹配项；该分支主要
+    // 兼容 Agent 在 prompt 后追加 `@file` 等内容的情况。
     for (let i = 0; i < state.turns.length; i += 1) {
       if (state.consumedTurns.has(i)) continue;
       const t = state.turns[i];
@@ -169,10 +186,7 @@ export class CorrelationStore {
     return null;
   }
 
-  /**
-   * Resolve the session-level (env) traceparent, consumed once per session.
-   * Intended to be applied only to the session's first collected turn.
-   */
+  /** 仅一次消费 session 级 traceparent，供该 session 第一 turn 回退使用。 */
   resolveSessionFirst(sessionId: string): string | null {
     const state = this.load(sessionId);
     if (!state || state.sessions.length === 0 || state.sessionConsumed) return null;
@@ -180,13 +194,7 @@ export class CorrelationStore {
     return state.sessions[0].traceparent;
   }
 
-  /**
-   * Whether a correlation file currently exists for the session. Callers use
-   * this to avoid waiting/retrying for records that were never written (the
-   * common case when linking is enabled but no adapter/env produced records) —
-   * the adapter writes the record when it sends the prompt, so by collection
-   * time the file exists if it ever will.
-   */
+  /** 只检查关联文件是否存在，用于 TraceLinker 避免无意义重试。 */
   hasSession(sessionId: string): boolean {
     try {
       return fs.statSync(path.join(this.dir, `${safeName(sessionId)}.jsonl`)).isFile();
@@ -196,9 +204,8 @@ export class CorrelationStore {
   }
 
   /**
-   * Drop in-memory state for sessions not accessed since `cutoffMs`. Called
-   * periodically (same cadence/TTL as file cleanup) so the per-session maps do
-   * not grow unbounded in a long-running daemon. Returns the number evicted.
+   * 淘汰截止时间前未访问的 session 缓存。
+   * @returns 删除的 session 数量。
    */
   pruneIdle(cutoffMs: number): number {
     let evicted = 0;

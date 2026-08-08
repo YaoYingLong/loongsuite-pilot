@@ -1,26 +1,25 @@
 #!/usr/bin/env bash
-# release-opensource.sh — Bump version, tag, and push. CI creates the GitHub Release.
+# 开源版本发布入口：计算/写入版本、创建 release 分支和 tag、推送 Git，并上传 OSS 产物。
+# GitHub Actions 在 tag 推送后创建 GitHub Release；`--oss-only` 则跳过全部 Git 写操作。
 #
-# Usage:
-#   bash deploy/release-opensource.sh                    # patch bump
-#   bash deploy/release-opensource.sh --patch            # same as default
-#   bash deploy/release-opensource.sh --minor            # minor bump (1.0.x → 1.1.0)
-#   bash deploy/release-opensource.sh --major            # major bump (1.x.x → 2.0.0)
-#   bash deploy/release-opensource.sh --version 1.2.3    # explicit version
-#   bash deploy/release-opensource.sh --dry-run          # show what would happen
-#   bash deploy/release-opensource.sh --oss-only         # build, package, upload to OSS only (no git)
+# 用法：
+#   bash deploy/release-opensource.sh                    # 默认递增 patch
+#   bash deploy/release-opensource.sh --patch            # 与默认行为相同
+#   bash deploy/release-opensource.sh --minor            # 递增 minor（1.0.x → 1.1.0）
+#   bash deploy/release-opensource.sh --major            # 递增 major（1.x.x → 2.0.0）
+#   bash deploy/release-opensource.sh --version 1.2.3    # 显式指定版本
+#   bash deploy/release-opensource.sh --dry-run          # 只展示动作，不写 Git/OSS
+#   bash deploy/release-opensource.sh --oss-only         # 只构建、打包、上传 OSS
 #
-# Flow:
-#   1. Fetch latest tags from remote
-#   2. Determine next version
-#   3. Create release/<version> branch from origin/main
-#   4. Bump package.json, commit, tag
-#   5. Push branch + tag to remote
-#   6. Build, package, and upload to OSS
-#   7. GitHub Actions (release.yml) picks up the tag → create GitHub Release
+# 流程：拉取 tag → 计算版本 → 从 origin/main 建分支 → 更新 package.json → commit/tag/push
+# → 调用 `package-opensource.sh` 构建 tar.gz/zip → ossutil 上传版本/latest/安装器。
+# 外部依赖包括 git、node、bash、ossutil；任何未被显式捕获的失败都会因严格模式终止发布。
 
+# `env bash` 按 PATH 选择 Bash；`-euo pipefail` 分别表示失败即退出、未定义变量报错、
+# 管道中任一命令失败即使整个管道失败，避免发布到一半仍继续上传。
 set -euo pipefail
 
+# `BASH_SOURCE[0]` 指向当前脚本；两次 cd/pwd 得到不受调用者工作目录影响的绝对项目根目录。
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -56,7 +55,7 @@ cd "$PROJECT_ROOT"
 
 PACKAGE_NAME="loongsuite-pilot"
 
-# ── Validate semver format ──
+# ── 校验语义版本格式 ──
 validate_semver() {
     if [[ ! "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         echo "❌ Invalid version format: $1 (expected X.Y.Z)" >&2
@@ -64,9 +63,9 @@ validate_semver() {
     fi
 }
 
-# ── Resolve version ──
+# ── 解析目标版本 ──
 if [ "$OSS_ONLY" -eq 1 ]; then
-    # --oss-only: use explicit version or current package.json version
+    # `--oss-only` 使用显式版本，否则读取当前 package.json.version。
     if [ -n "$EXPLICIT_VERSION" ]; then
         NEXT_VERSION="$EXPLICIT_VERSION"
     else
@@ -89,7 +88,7 @@ if [ "$OSS_ONLY" -eq 1 ]; then
         exit 0
     fi
 else
-    # Full release flow: ensure clean tree and resolve version from tags
+    # 完整发布先确认工作树干净，再从远端 tag 计算版本。
     if [ -n "$(git status --porcelain)" ]; then
         echo "❌ Working tree is not clean. Please commit or stash changes first."
         git status --short
@@ -153,14 +152,14 @@ else
         exit 0
     fi
 
-    # ── Confirm ──
+    # ── 发布确认 ──
     read -r -p "Proceed with release v${NEXT_VERSION}? [y/N] " confirm
     if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
         echo "Aborted."
         exit 0
     fi
 
-    # ── Create release branch from origin/main ──
+    # ── 从 origin/main 创建 release 分支 ──
     echo "==> Creating release branch..."
     if git show-ref --verify --quiet "refs/heads/${RELEASE_BRANCH}"; then
         echo "    Branch ${RELEASE_BRANCH} already exists locally, switching to it"
@@ -170,7 +169,7 @@ else
     fi
     echo "    ✅ On branch ${RELEASE_BRANCH}"
 
-    # ── Update package.json ──
+    # ── 更新 package.json ──
     echo "==> Updating package.json..."
     NEXT_VERSION="$NEXT_VERSION" node -e "
 const fs = require('fs');
@@ -180,7 +179,7 @@ fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
 "
     echo "    ✅ package.json → ${NEXT_VERSION}"
 
-    # ── Commit & Tag ──
+    # ── 创建 commit 与 tag ──
     echo "==> Committing and tagging..."
     git add package.json
     if git diff --cached --quiet; then
@@ -195,7 +194,7 @@ fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
         echo "    ✅ Tagged v${NEXT_VERSION}"
     fi
 
-    # ── Push branch and tag to remote ──
+    # ── 推送分支和 tag ──
     echo ""
     echo "==> Pushing to remote..."
     git push origin "${RELEASE_BRANCH}" "v${NEXT_VERSION}" -u
@@ -226,35 +225,35 @@ if [ "$SKIP_OSS" -eq 0 ]; then
     echo ""
     echo "==> Uploading to OSS..."
 
-    # Upload versioned packages (Linux/macOS .tar.gz + Windows .zip)
+    # 上传带版本路径的 Linux/macOS tar.gz 与 Windows zip。
     ossutil cp "$TARBALL" "${OSS_BUCKET}/${OSS_PREFIX}/${NEXT_VERSION}/${PACKAGE_NAME}.tar.gz" -f
     echo "    ✅ ${OSS_PREFIX}/${NEXT_VERSION}/${PACKAGE_NAME}.tar.gz"
 
     ossutil cp "$ZIPFILE" "${OSS_BUCKET}/${OSS_PREFIX}/${NEXT_VERSION}/${PACKAGE_NAME}.zip" -f
     echo "    ✅ ${OSS_PREFIX}/${NEXT_VERSION}/${PACKAGE_NAME}.zip"
 
-    # Upload as latest
+    # 同时覆盖 latest 下载路径。
     ossutil cp "$TARBALL" "${OSS_BUCKET}/${OSS_PREFIX}/latest/${PACKAGE_NAME}.tar.gz" -f
     echo "    ✅ ${OSS_PREFIX}/latest/${PACKAGE_NAME}.tar.gz"
 
     ossutil cp "$ZIPFILE" "${OSS_BUCKET}/${OSS_PREFIX}/latest/${PACKAGE_NAME}.zip" -f
     echo "    ✅ ${OSS_PREFIX}/latest/${PACKAGE_NAME}.zip"
 
-    # Upload installer scripts (Linux/macOS .sh + Windows .ps1)
+    # 上传 Linux/macOS Shell 与 Windows PowerShell 安装器。
     ossutil cp deploy/installer-opensource.sh "${OSS_BUCKET}/${OSS_PREFIX}/installer.sh" -f
     echo "    ✅ ${OSS_PREFIX}/installer.sh"
 
     ossutil cp deploy/installer-opensource.ps1 "${OSS_BUCKET}/${OSS_PREFIX}/installer.ps1" -f
     echo "    ✅ ${OSS_PREFIX}/installer.ps1"
 
-    # Cleanup
+    # 清理本地临时构建产物。
     rm -f "$TARBALL" "$ZIPFILE"
 else
     echo ""
     echo "==> Skipping OSS upload (--skip-oss)"
 fi
 
-# ── Done ──
+# ── 发布完成 ──
 echo ""
 echo "============================================================"
 if [ "$OSS_ONLY" -eq 1 ]; then

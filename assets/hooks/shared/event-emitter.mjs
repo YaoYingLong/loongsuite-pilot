@@ -20,6 +20,7 @@
  *                                             append 写 <logDir>/<agentId>-YYYY-MM-DD.jsonl
  */
 
+// 同步 append 能确保短生命周期 Hook 进程退出前记录已经交给操作系统。
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -27,11 +28,11 @@ import crypto from 'node:crypto';
 // ─── trace/span id 生成(纯 crypto,与 OTel JS SDK 内部 IdGenerator 行为一致) ───
 
 export function generateTraceId() {
-  return crypto.randomBytes(16).toString('hex'); // 32 hex chars
+  return crypto.randomBytes(16).toString('hex'); // 16 字节编码为 32 个十六进制字符。
 }
 
 export function generateSpanId() {
-  return crypto.randomBytes(8).toString('hex'); // 16 hex chars
+  return crypto.randomBytes(8).toString('hex'); // 8 字节编码为 16 个十六进制字符。
 }
 
 // ─── chain hash(用于增量记录 input.messages_delta + 间或写出 input.messages 全量) ───
@@ -44,6 +45,7 @@ function stableSerialize(obj) {
     return '[' + obj.map(stableSerialize).join(',') + ']';
   }
   if (typeof obj === 'object') {
+    // 对象键排序后再序列化，使同一语义对象不受属性插入顺序影响。
     const keys = Object.keys(obj).sort();
     const parts = keys.map((k) => JSON.stringify(k) + ':' + stableSerialize(obj[k]));
     return '{' + parts.join(',') + '}';
@@ -60,6 +62,7 @@ export function hashStep(prevHash, msg) {
 }
 
 export function computeHash(prevHash, deltaMessages) {
+  // 每条新增 message 都以前一步结果为输入，形成不可交换的有序 hash 链。
   let h = prevHash;
   for (const msg of deltaMessages || []) {
     h = hashStep(h, msg);
@@ -68,6 +71,7 @@ export function computeHash(prevHash, deltaMessages) {
 }
 
 export function shouldLogFullMessages(prevHash, delta, currentFullHash) {
+  // 若增量推导不出当前全量 hash，写出一次全量消息供下游重新建立基线。
   return computeHash(prevHash, delta) !== currentFullHash;
 }
 
@@ -89,6 +93,7 @@ export function writeJsonlRecords(logDir, agentId, records) {
   if (!records || records.length === 0) return;
   const filePath = getJsonlFilePath(logDir, agentId);
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  // JSONL 要求每个对象独占一行，末尾换行便于 tailer 判断记录完整。
   const lines = records.map((r) => JSON.stringify(r)).join('\n') + '\n';
   fs.appendFileSync(filePath, lines, 'utf-8');
 }

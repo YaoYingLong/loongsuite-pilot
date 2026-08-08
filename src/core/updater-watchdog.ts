@@ -1,3 +1,13 @@
+/**
+ * Collector 侧的独立 Updater 进程健康巡检器。
+ *
+ * 自动更新启用时，Orchestrator 周期检查 updater-runtime.json、PID 活性、命令行匹配
+ * 和 heartbeat 新鲜度；睡眠唤醒与启动阶段设有宽限期。异常持续时通过稳定的
+ * loongsuite-pilot CLI 子进程重启 Updater，并受冷却时间限制，同时向 AlarmManager
+ * 上报状态。timer 不保持进程存活，`stop()` 只取消未来检查。
+ */
+
+
 import { execFile } from 'node:child_process';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -19,10 +29,12 @@ const DEFAULT_SLEEP_WAKE_GRACE_MS = 3 * 60_000;
 const DEFAULT_RESTART_COOLDOWN_MS = 10 * 60_000;
 const COMMAND_TIMEOUT_MS = 30_000;
 
+/** 解析当前用户 HOME，兼容 Windows USERPROFILE。 */
 function homeDir(): string {
   return process.env.HOME ?? process.env.USERPROFILE ?? os.homedir();
 }
 
+/** 返回稳定 CLI 路径；Windows 使用 ps1 入口。 */
 function defaultPilotBinPath(): string {
   const ext = process.platform === 'win32' ? '.ps1' : '';
   return path.join(homeDir(), '.local', 'bin', `loongsuite-pilot${ext}`);
@@ -61,11 +73,10 @@ export interface UpdaterWatchdogOptions {
 }
 
 /**
- * Collector-side second line of defense for updater liveness.
+ * Collector 侧 Updater 活性检查的第二道防线。
  *
- * This watchdog intentionally does not understand update manifests, version
- * comparison, package download, pointer writes, or deployment. It only observes
- * local updater process/heartbeat health and asks the runtime CLI to recover.
+ * 本类刻意不理解 manifest、版本比较、下载、指针或部署，只观察本地 Updater 进程与
+ * heartbeat，并请求稳定 Runtime CLI 恢复。
  */
 export class UpdaterWatchdog {
   private readonly enabled: boolean;
@@ -84,6 +95,7 @@ export class UpdaterWatchdog {
   private sleepWakeGraceUntil = 0;
   private lastRestartAt = 0;
 
+  /** 保存阈值、可替换活性探针与 AlarmManager；构造阶段不启动 timer。 */
   constructor(opts: UpdaterWatchdogOptions) {
     this.enabled = opts.enabled;
     this.dataDir = opts.dataDir;
@@ -98,6 +110,7 @@ export class UpdaterWatchdog {
       ?? ((pidFile: string) => checkProcessLiveness(pidFile, UPDATER_PROCESS_PATTERNS));
   }
 
+  /** 启用时立即异步检查一次，再按 interval 建立 unref timer。 */
   start(): void {
     if (!this.enabled) {
       logger.info('updater-watchdog disabled');
@@ -115,12 +128,17 @@ export class UpdaterWatchdog {
     void this.runCheck();
   }
 
+  /** 清除周期 timer。 */
   stop(): void {
     if (!this.timer) return;
     clearInterval(this.timer);
     this.timer = null;
   }
 
+  /**
+   * 检查 runtime heartbeat、PID 文件和命令行；健康返回状态，异常按宽限/冷却决定是否
+   * 调 restart。调用被 timer 触发时错误会在本方法内转为结果与告警。
+   */
   async runCheck(): Promise<UpdaterWatchdogResult> {
     if (!this.enabled) return { status: 'disabled' };
 
@@ -171,6 +189,7 @@ export class UpdaterWatchdog {
     return { status: 'healthy' };
   }
 
+  /** 读取 Updater runtime 状态并调用 pid-utils 验证进程身份。 */
   private async readUpdaterProcess(): Promise<{
     running: boolean;
     pid?: number;
@@ -199,10 +218,14 @@ export class UpdaterWatchdog {
     };
   }
 
+  /** 判断仍处于启动或系统睡眠唤醒宽限窗口。 */
   private inGraceWindow(now: number): boolean {
     return now - this.startedAt < this.startupGraceMs || now < this.sleepWakeGraceUntil;
   }
 
+  /**
+   * 受冷却限制地执行 `loongsuite-pilot restart-updater` 子进程，并返回新的巡检结果。
+   */
   private async restart(
     status: Exclude<UpdaterWatchdogStatus, 'disabled' | 'healthy' | 'grace' | 'restart-rate-limited' | 'restart-attempted' | 'restart-failed'>,
     reason: string,
@@ -242,6 +265,7 @@ export class UpdaterWatchdog {
     }
   }
 
+  /** 上报 Updater 服务不存在/身份异常类告警。 */
   private recordServiceAlarm(message: string): void {
     this.alarmManager?.record(
       'SERVICE_NOT_RUNNING_ALARM',
@@ -251,6 +275,7 @@ export class UpdaterWatchdog {
     );
   }
 
+  /** 上报重启命令失败类告警。 */
   private recordFailureAlarm(message: string): void {
     this.alarmManager?.record(
       'UPDATER_FAILURE_ALARM',

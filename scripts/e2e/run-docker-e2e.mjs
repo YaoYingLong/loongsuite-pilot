@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 /**
- * Docker-based E2E entry — replaces SSH-based run-remote-e2e.mjs.
- * Runs inside the Docker container with agents pre-installed.
- * Reuses the same scenario script generators.
+ * Docker E2E 主入口，替代旧的 SSH runner，在预装 Agent 的容器内部执行场景。
+ * 它解析命令行/环境变量，加载 agent-matrix，根据场景生成 Bash 文本，并交给
+ * `docker-runner.mjs` 创建带超时和日志转发的子进程。失败场景会设置非零退出码。
+ * 生成器与远程测试共用，避免安装、升级、卸载及 Agent 探测行为出现两套实现。
  */
 import process from 'node:process';
 import { runLocalScript } from './lib/docker-runner.mjs';
@@ -28,6 +29,7 @@ import {
 
 const ARTIFACT_DIR = process.env.E2E_ARTIFACT_DIR?.trim() || '/opt/artifacts';
 
+/** 生成 Docker install-smoke 使用的 Bash，安全引用安装器 URL、用户 ID 和可选 SLS 参数。 */
 function installSmokeScript(installerUrl, userId, env) {
   const u = installerUrl.replace(/'/g, `'\\''`);
   const id = userId.replace(/'/g, `'\\''`);
@@ -47,8 +49,7 @@ echo "install-smoke: loongsuite-pilot on PATH and data dir present"
 }
 
 /**
- * Docker-adapted reboot script: installs pilot, verifies status,
- * then simulates reboot via process kill + service restart.
+ * Docker 适配的重启脚本：安装 Pilot、验证状态，再通过杀进程并重启服务模拟主机重启。
  */
 function dockerRebootAutostartScript(installerUrl, userId, env) {
   const u = installerUrl.replace(/'/g, `'\\''`);
@@ -90,6 +91,7 @@ sleep 5
 `;
 }
 
+/** 作为 run-docker-e2e.mjs 的命令入口，编排参数、I/O 和退出码；顶层错误由文件末尾统一处理。 */
 async function main() {
   const env = process.env;
   const scenario = (env.E2E_SCENARIO ?? 'preflight').trim();
@@ -155,7 +157,7 @@ async function main() {
 
   console.log(`[e2e-docker] "${scenario}" completed successfully (exit 0).`);
 
-  // For reboot-autostart: run post-reboot verification after simulated reboot
+    // reboot-autostart 场景在模拟重启后继续执行“重启后”验证。
   if (scenario === 'reboot-autostart') {
     console.log('[e2e-docker] Running post-reboot verification...');
     const verifyScript = postRebootVerificationScript();
@@ -172,12 +174,12 @@ async function main() {
     console.log('[e2e-docker] Post-reboot verification passed.');
   }
 
-  // Agent probe phase for install-smoke
+  // install-smoke 的 Agent probe 阶段。
   if (scenario === 'install-smoke') {
     const probeBody = buildAgentProbeOnlyScript({ ...env, E2E_ENSURE_AGENT_CLIS: '0' });
     if (probeBody) {
-      // Step 1: Write agent configs IMMEDIATELY so pilot can discover agents on next poll.
-      // This creates ~/.codex/ (for codex discovery), ~/.claude.json, proxy config, etc.
+    // 步骤 1：立即写入 Agent 配置，使 Pilot 在下一轮询发现；其中会创建 Codex 检测目录、
+    // Claude 配置和 proxy 配置等。
       const configScript = buildAgentConfigSetupScript(env);
       if (configScript) {
         console.log('[e2e-docker] Writing agent configs (codex, claude, proxy)...');
@@ -202,8 +204,7 @@ async function main() {
         }
       }
 
-      // Step 2: Wait for required deploy definitions to be deployed by pilot.
-      // qoder-cli uses the qoder deploy definition; JSONL coverage checks qoder-cli later.
+    // 步骤 2：等待 Pilot 完成必需声明的部署。qoder-cli 复用 qoder 声明，稍后再检查其 JSONL 覆盖。
       const requiredAgents = (env.E2E_REQUIRED_DEPLOY_AGENTS ?? 'claude-code,codex,qoder,cursor,qwen-code-cli,opencode')
         .split(',')
         .map(s => s.trim())
@@ -251,7 +252,7 @@ async function main() {
         artifactLabel: 'pilot-ready-wait',
       });
 
-      // Step 3: Run agent probes (ensure CLIs + matrix probe)
+    // 步骤 3：确认 CLI 后运行 Agent matrix probes。
       const probeScript = `${buildProbeEnvInjections(env)}${probeBody}`;
       const probe = await runLocalScript({
         script: probeScript,
@@ -264,11 +265,11 @@ async function main() {
       }
       console.log('[e2e-docker] agent probe phase completed successfully.');
 
-      // Wait for pilot to flush collected agent activity to JSONL/SLS
+    // 等待 Pilot 把已采集 Agent 活动 flush 到 JSONL/SLS。
       console.log('[e2e-docker] Waiting 60s for pilot to process agent activity logs...');
       await new Promise(resolve => setTimeout(resolve, 60_000));
 
-      // Diagnostics: check pilot state and log directories
+    // 输出诊断：检查 Pilot 状态和日志目录。
       await runLocalScript({
         script: `set +e
 echo "=== [diagnostics] pilot process ==="
@@ -290,7 +291,7 @@ ls -la "$HOME/.loongsuite-pilot/logs/claude/" 2>/dev/null || echo "logs/claude d
         artifactLabel: 'diagnostics',
       });
 
-      // JSONL validation after pilot has had time to process
+    // 给 Pilot 留出处理时间后校验 JSONL。
       const jsonlSh = buildJsonlValidationSh(env);
       if (jsonlSh) {
         console.log('[e2e-docker] Running JSONL validation...');
@@ -306,7 +307,7 @@ ls -la "$HOME/.loongsuite-pilot/logs/claude/" 2>/dev/null || echo "logs/claude d
         console.log('[e2e-docker] JSONL validation passed.');
       }
 
-      // Agent coverage check: require all expected agents to produce JSONL data
+    // Agent 覆盖检查：所有预期 Agent 都必须产出 JSONL 数据。
       const requiredJsonlAgents = (env.E2E_REQUIRED_JSONL_AGENTS ?? 'claude-code,codex,qoder-cli,cursor-cli,qwen-code-cli,opencode').trim();
       if (requiredJsonlAgents) {
         console.log(`[e2e-docker] Checking JSONL agent coverage: ${requiredJsonlAgents}`);
@@ -331,12 +332,11 @@ ls -la "$HOME/.loongsuite-pilot/logs/claude/" 2>/dev/null || echo "logs/claude d
 }
 
 /**
- * Keep container alive for debugging (docker exec -it <container> bash).
+ * 保持容器存活，便于通过 `docker exec -it <container> bash` 调试。
  *
- * Behavior matrix:
- *   E2E_DOCKER_KEEP_ALIVE=1  → always keep alive (success or failure)
- *   E2E_DOCKER_EXIT_ON_FAILURE=1 → exit immediately on failure
- *   default → keep alive on failure only
+ * 行为矩阵：
+ * `E2E_DOCKER_KEEP_ALIVE=1` 无论成功失败都保持；`E2E_DOCKER_EXIT_ON_FAILURE=1` 失败立即退出；
+ * 默认只在失败时保持容器。
  */
 async function keepAliveIfRequested(code) {
   const keepAlive = process.env.E2E_DOCKER_KEEP_ALIVE === '1';
@@ -351,10 +351,11 @@ async function keepAliveIfRequested(code) {
   console.log(`[e2e-docker] Test ${status} (exit ${code}). Container kept alive for debugging.`);
   console.log('[e2e-docker] Attach with: docker exec -it <container> bash');
   console.log('[e2e-docker] Set E2E_DOCKER_KEEP_ALIVE=0 to exit immediately on success.');
-  // setInterval keeps the Node event loop alive (a bare Promise doesn't)
+    // setInterval 会让 Node.js 事件循环保持活跃；单独一个未完成 Promise 不具备该效果。
   await new Promise(() => { setInterval(() => {}, 1 << 30); });
 }
 
+/** 按 E2E 保活开关等待，便于失败后进入容器排障；默认立即返回原退出码。 */
 async function keepAliveOnFailure(code) {
   await keepAliveIfRequested(code);
   process.exit(code);

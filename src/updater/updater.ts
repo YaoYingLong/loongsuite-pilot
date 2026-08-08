@@ -1,3 +1,17 @@
+/**
+ * 自动更新的版本选择、下载校验和原子部署核心。
+ *
+ * 独立 `src/updater/index.ts` 创建本类。检查循环获取 manifest，结合稳定版本、canary
+ * policy、installId 分桶及 hotfix 选择目标；随后带超时下载包、核验 SHA-256、解压到
+ * 新版本目录、安装生产依赖，并原子切换 previous/current 指针。切换后通过稳定 CLI
+ * 只重启 Collector，失败则保留旧版本并指数退避；成功后每轮最多回收一个无引用旧
+ * 版本。所有子进程只获得补齐 Node 路径的环境，网络和文件异常由 run loop 计数、
+ * 指标记录并决定是否继续。
+ */
+
+
+
+
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { execFile } from 'node:child_process';
@@ -20,13 +34,12 @@ const logger = createLogger('Updater');
 const FETCH_TIMEOUT_MS = 30_000;
 const DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
 const NPM_INSTALL_TIMEOUT_MS = 2 * 60_000;
-const MAX_BACKOFF_MS = 6 * 60 * 60_000; // 6 hours
+const MAX_BACKOFF_MS = 6 * 60 * 60_000; // 失败退避最长为 6 小时。
 const MAX_CONSECUTIVE_FAILURES = 10;
 const MAX_VERSION_GC_REMOVALS_PER_CHECK = 1;
 
 /**
- * Build an env for child processes that ensures node/npm are on PATH.
- * Only the spawned child sees the modified PATH; current process is untouched.
+ * 为 npm/Node 子进程补齐当前 Node 所在 PATH；只修改复制后的 env，不改变当前进程。
  */
 function buildChildEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env };
@@ -70,16 +83,19 @@ export interface UpdaterPaths {
   runtimeFile: string;
 }
 
+/** 解析安装缓存根使用的用户 HOME。 */
 function homeDir(): string {
   return process.env.HOME ?? process.env.USERPROFILE ?? os.homedir();
 }
 
+/** 返回安装器部署的稳定 CLI 路径，Windows 选择 ps1。 */
 function pilotBinPath(): string {
   const home = homeDir();
   const ext = process.platform === 'win32' ? '.ps1' : '';
   return path.join(home, '.local', 'bin', `loongsuite-pilot${ext}`);
 }
 
+/** 构造生产默认路径；版本/cache 固定在 HOME，runtime 文件可随自定义 dataDir。 */
 function defaultPaths(): UpdaterPaths {
   const home = homeDir();
   const cacheDir = path.join(home, '.loongsuite-pilot');
@@ -95,6 +111,7 @@ function defaultPaths(): UpdaterPaths {
   };
 }
 
+/** 为测试或显式 baseDir 构造一套隔离路径。 */
 export function buildPaths(baseDir: string): UpdaterPaths {
   return {
     cacheDir: baseDir,
@@ -115,6 +132,12 @@ export interface ResolvedTarget {
 
 const DEFAULT_CONFIG_PATH = '~/.loongsuite-pilot/config.json';
 
+/**
+ * 独立 Updater 的检查循环和部署事务。
+ *
+ * start 创建 heartbeat/check timer；check 用 checking 锁避免重入，失败按指数退避但在十次
+ * 后仍保持降级重试。成功部署以 candidate 目录和原子 current/previous 指针切换完成。
+ */
 export class Updater {
   private timer: ReturnType<typeof setInterval> | null = null;
   private heartbeatTimer: ReturnType<typeof setInterval> | null = null;
@@ -125,6 +148,10 @@ export class Updater {
   private metrics: UpdaterMetrics | null = null;
   private readonly configPath: string;
 
+  /**
+   * @param config ConfigLoader 解析的自动更新配置。
+   * @param baseDir 测试/隔离部署路径；省略时使用生产多版本布局。
+   */
   constructor(
     private config: AutoUpdateConfig,
     baseDir?: string,
@@ -135,10 +162,15 @@ export class Updater {
     );
   }
 
+  /** 注入可选指标/告警记录器。 */
   setMetrics(metrics: UpdaterMetrics): void {
     this.metrics = metrics;
   }
 
+  /**
+   * 启用时立即写 heartbeat，60 秒后首检，并建立 heartbeat 与配置周期两个 timer。
+   * timer 有意保持独立 Updater 进程存活。
+   */
   start(): void {
     if (!this.config.enabled) {
       logger.debug('auto-update disabled');
@@ -162,6 +194,7 @@ export class Updater {
     );
   }
 
+  /** 清两个 interval 并异步记录 stopped；已在执行的 check 不强制中断。 */
   stop(): void {
     if (this.timer) {
       clearInterval(this.timer);
@@ -175,6 +208,11 @@ export class Updater {
     void this.metrics?.writeEvent('updater_stopped');
   }
 
+  /**
+   * 单轮主流程：manifest -> installId/灰度目标 -> 版本判断 -> 下载部署 -> 持久化 canary
+   * -> 重启 Collector/Monitor -> GC。网络 fetch 返回 null 时安静结束；抛出的部署异常会
+   * 增加失败次数、计算最多 6 小时退避、写告警和 heartbeat。
+   */
   async check(): Promise<void> {
     if (this.checking) return;
 
@@ -283,6 +321,10 @@ export class Updater {
     }
   }
 
+  /**
+   * 以 30 秒 AbortSignal 获取 manifest。无 URL、非 2xx、网络或 JSON 异常返回 null，
+   * 当前不会计入连续失败退避。
+   */
   private async fetchManifest(): Promise<VersionManifest | null> {
     const url = this.config.manifestUrl;
     if (!url) {
@@ -305,6 +347,7 @@ export class Updater {
     }
   }
 
+  /** 从 current 指向目录的 VERSION 读取 version/git_commit；任一读取错误返回 null。 */
   private async readLocalVersion(): Promise<LocalVersion | null> {
     const currentDir = await this.resolveCurrentVersionDir();
     if (!currentDir) return null;
@@ -320,6 +363,10 @@ export class Updater {
     }
   }
 
+  /**
+   * 远端数字版本更高、同版本 canary hotfix 更高或 git commit 不同时需要更新；远端版本
+   * 更低明确跳过。
+   */
   needsUpdate(local: LocalVersion | null, manifest: VersionManifest, channel: 'stable' | 'canary' = 'stable'): boolean {
     if (!local) return true;
     const cmp = compareVersions(manifest.version, local.version);
@@ -342,6 +389,10 @@ export class Updater {
     return false;
   }
 
+  /**
+   * 按 canary policy 选择 stable/canary：off 固定稳定，latest 固定灰度，auto 使用
+   * installId+canary version 的稳定 0..99 分桶；任何解析异常回退 stable。
+   */
   resolveTargetVersion(latest: LatestManifest): ResolvedTarget {
     try {
       const canary = latest.canary;
@@ -412,6 +463,7 @@ export class Updater {
     }
   }
 
+  /** 缺 installId 时生成 UUID 并 best-effort 回写 config；内存配置无论写盘成败都会更新。 */
   private async ensureInstallId(): Promise<void> {
     if (this.config.installId) return;
 
@@ -428,6 +480,7 @@ export class Updater {
     }
   }
 
+  /** best-effort 把已安装 canary hotfix_version 合并回 config.canary。 */
   private async persistCanaryState(hotfixVersion: number): Promise<void> {
     try {
       const configFile = await readJsonFile<Record<string, unknown>>(this.configPath) ?? {};
@@ -439,6 +492,16 @@ export class Updater {
     }
   }
 
+  /**
+   * 更新部署事务：
+   * 1. 五分钟超时下载并可选校验 SHA-256；
+   * 2. tar 解压、校验 package/dist，复制到 candidate；
+   * 3. npm production install、sqlite3 smoke test、best-effort postinstall；
+   * 4. candidate 改名为版本目录，原子切 previous/current，并同步稳定启动脚本。
+   *
+   * 最终激活失败会恢复指针和旧脚本；临时目录在 finally 清理。成功后 Collector 重启由
+   * 外层 check 单独调用。
+   */
   private async downloadAndDeploy(
     packageUrl: string,
     manifest: VersionManifest,
@@ -569,6 +632,7 @@ export class Updater {
     }
   }
 
+  /** 在解压目录自身或一级子目录寻找 package.json，找不到返回 null。 */
   private async findExtractedPackage(dir: string): Promise<string | null> {
     const entries = await fs.readdir(dir);
     for (const entry of entries) {
@@ -585,6 +649,10 @@ export class Updater {
     return hasRoot ? dir : null;
   }
 
+  /**
+   * 写 updater-runtime.json：PID、版本指针、失败次数、下次检查时间。读取/写入异常只告警，
+   * 避免健康文件故障终止更新循环。
+   */
   private async writeHeartbeat(): Promise<void> {
     if (!this.config.enabled) return;
 
@@ -622,6 +690,7 @@ export class Updater {
     }
   }
 
+  /** 把版本内两个 bootstrap daemon 与平台 CLI 原子同步到不随 current 变化的稳定路径。 */
   private async syncInstalledScripts(versionDir: string): Promise<void> {
     const { bootstrapDir, loongsuitePilotBin } = this.paths;
     const srcDir = path.join(versionDir, 'scripts');
@@ -641,6 +710,7 @@ export class Updater {
     logger.info('installed scripts synced');
   }
 
+  /** 指针目录存在时同步其稳定脚本，供回滚恢复。 */
   private async syncInstalledScriptsForPointer(versionName: string): Promise<void> {
     const dir = path.join(this.paths.versionsDir, versionName);
     const exists = await fs.access(dir).then(() => true).catch(() => false);
@@ -648,6 +718,9 @@ export class Updater {
     await this.syncInstalledScripts(dir);
   }
 
+  /**
+   * 内容相同则只校正权限；不同时先复制到 `.tmp`、chmod，再 rename，避免启动器读半文件。
+   */
   private async copyFileAtomic(src: string, dst: string, mode?: number): Promise<void> {
     const srcContent = await fs.readFile(src);
     const dstContent = await fs.readFile(dst).catch(() => null);
@@ -668,12 +741,14 @@ export class Updater {
     await fs.rename(tmp, dst);
   }
 
+  /** 通过 `.tmp` + rename 原子写单行版本指针。 */
   private async writePointerFile(filePath: string, value: string): Promise<void> {
     const tmp = filePath + '.tmp';
     await fs.writeFile(tmp, value + '\n');
     await fs.rename(tmp, filePath);
   }
 
+  /** 按事务前快照恢复 current/previous；原值为空时删除相应指针。 */
   private async restorePointers(currentValue: string | null, previousValue: string | null): Promise<void> {
     const { currentFile, previousFile } = this.paths;
     if (currentValue) {
@@ -689,6 +764,10 @@ export class Updater {
     }
   }
 
+  /**
+   * 调稳定 CLI 的 restart-collector，避免 Updater 重启自身。命令失败只告警，不回滚已激活
+   * 版本，也不向 check 抛出。
+   */
   private async restartCollector(): Promise<void> {
     logger.info('restarting collector service');
     try {
@@ -715,6 +794,7 @@ export class Updater {
     }
   }
 
+  /** 仅当 monitor/dashboard 任一 PID 存活时，用稳定 CLI stop/start；失败只告警。 */
   private async restartMonitorIfRunning(): Promise<void> {
     const monitorPidFile = path.join(this.paths.cacheDir, 'loongsuite-pilot-monitor.pid');
     const dashboardPidFile = path.join(this.paths.cacheDir, 'loongsuite-pilot-dashboard.pid');
@@ -743,6 +823,7 @@ export class Updater {
     }
   }
 
+  /** 读取正整数 PID 并用 signal 0 检查活性；任何异常返回 false。 */
   private async isPidFileRunning(pidFile: string): Promise<boolean> {
     try {
       const raw = await fs.readFile(pidFile, 'utf-8');
@@ -755,6 +836,9 @@ export class Updater {
     }
   }
 
+  /**
+   * 保护 current/previous，其余版本按 mtime 从旧到新排序，每轮最多删除一个，控制 I/O。
+   */
   private async gcOldVersions(): Promise<void> {
     const { versionsDir, currentFile, previousFile } = this.paths;
     try {
@@ -795,6 +879,7 @@ export class Updater {
     }
   }
 
+  /** 解析 current 版本目录，不可用时兼容旧 `<cache>/package/dist/index.js` 布局。 */
   private async resolveCurrentVersionDir(): Promise<string | null> {
     const { versionsDir, currentFile, cacheDir } = this.paths;
     const name = await this.readPointerFile(currentFile);
@@ -804,13 +889,14 @@ export class Updater {
       if (exists) return dir;
     }
 
-    // Legacy fallback
+    // 兼容旧单 package 布局。
     const legacyDir = path.join(cacheDir, 'package');
     const legacyExists = await fs.access(path.join(legacyDir, 'dist', 'index.js'))
       .then(() => true).catch(() => false);
     return legacyExists ? legacyDir : null;
   }
 
+  /** 容错读取并 trim 指针；缺失/空/不可读返回 null。 */
   private async readPointerFile(filePath: string): Promise<string | null> {
     try {
       const content = await fs.readFile(filePath, 'utf-8');

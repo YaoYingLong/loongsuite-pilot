@@ -1,3 +1,11 @@
+/**
+ * 主事件流的阿里云 SLS 批量输出通道。
+ *
+ * 每条标准事件按 endpoint、project、logstore（以及需要时的 agentType）分桶；定时器或条数
+ * 阈值触发 flush。每个 endpoint 可独立选择 AK SDK 或 WebTracking，失败经过指数重试后只把
+ * 有界诊断元数据写入本地，不持久化原 payload/凭据，也不阻断其他 endpoint。
+ */
+
 import ALY from '@alicloud/log';
 import * as os from 'node:os';
 import { BaseFlusher } from './base-flusher.js';
@@ -25,11 +33,13 @@ import {
   RETRYABLE_STATUS_CODES,
 } from './sls-transport.js';
 
+/** 进程启动时固定的主机名，作为 SLS tag。 */
 const HOSTNAME = os.hostname();
 
 const BATCH_MAX_SIZE = 20;
 const FLUSH_INTERVAL_MS = 2000;
 
+/** 队列中的单条日志同时保留目标、Agent 类型和估算字节数。 */
 interface QueuedLog {
   content: Record<string, string>;
   endpoint: SlsEndpoint;
@@ -39,6 +49,7 @@ interface QueuedLog {
 
 const logger = createLogger('SlsFlusher');
 
+/** MetricsWriter 读取的每 endpoint 累计统计。 */
 export interface EndpointCounter {
   inEntries: number;
   inBytes: number;
@@ -53,12 +64,15 @@ export interface EndpointCounter {
   logstore: string;
 }
 
+/** 同时支持多个 SLS endpoint 和两种传输模式的 Flusher。 */
 export class SlsFlusher extends BaseFlusher {
   readonly name = 'sls';
   private readonly config: SlsFlusherConfig;
+  /** 分桶 key 到有序待发送日志；flush 时整体交换并清空。 */
   private readonly queue: Map<string, QueuedLog[]> = new Map();
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private readonly failedLogWriter: SlsFailureLogWriter;
+  /** AK Client 按 endpoint 名惰性缓存，shutdown 时无需显式关闭。 */
   private readonly akClients: Map<string, any> = new Map();
   private readonly endpointCounters: Map<string, EndpointCounter> = new Map();
   private alarmManager: AlarmManager | null = null;
@@ -66,6 +80,10 @@ export class SlsFlusher extends BaseFlusher {
   private readonly serviceName: string;
   private readonly userAgent: string;
 
+  /**
+   * @param config ConfigLoader 合并后的全部 SLS endpoints 和批量参数。
+   * @param dataDir 失败诊断目录及安装版本 User-Agent 的数据根。
+   */
   constructor(config: SlsFlusherConfig, dataDir: string) {
     super();
     this.config = config;
@@ -74,6 +92,7 @@ export class SlsFlusher extends BaseFlusher {
     );
     this.serviceName = config.serviceNamePrefix || '';
     this.userAgent = buildUserAgent(dataDir);
+    // 为每个 endpoint 预建稳定计数器，便于无流量时也能展示状态。
     for (const ep of config.endpoints) {
       this.endpointCounters.set(ep.name, {
         inEntries: 0, inBytes: 0, outEntries: 0, outFailed: 0,
@@ -83,14 +102,17 @@ export class SlsFlusher extends BaseFlusher {
     }
   }
 
+  /** 暴露计数器 Map 给 MetricsCollector；调用方只读但返回的是实时对象。 */
   getEndpointCounters(): Map<string, EndpointCounter> {
     return this.endpointCounters;
   }
 
+  /** Orchestrator 后置注入告警管理器，避免输出层构造循环依赖。 */
   setAlarmManager(alarmManager: AlarmManager): void {
     this.alarmManager = alarmManager;
   }
 
+  /** 按 endpoint 名惰性创建并复用 SLS AK SDK Client。 */
   private getAkClient(endpoint: SlsEndpoint): any {
     let client = this.akClients.get(endpoint.name);
     if (!client) {
@@ -105,6 +127,7 @@ export class SlsFlusher extends BaseFlusher {
     return client;
   }
 
+  /** 初始化失败日志目录并启动周期 flush 定时器。 */
   async start(): Promise<void> {
     await this.failedLogWriter.start();
     this.flushTimer = setInterval(
@@ -113,11 +136,13 @@ export class SlsFlusher extends BaseFlusher {
     );
   }
 
+  /** 序列化单条事件，并为每个配置 endpoint 各入队一份。 */
   async send(entry: AgentActivityEntry): Promise<void> {
     const serialized = serialiseLogEntry(entry, { dropAgentScopedFields: true });
     const agentType = normalizeAgentType(String(entry['gen_ai.agent.type'] ?? 'unknown'));
 
     for (const endpoint of this.config.endpoints) {
+      // endpoint.redact 是旧 CodeGeneration 兼容裁剪，不替代全局 mask。
       const content = endpoint.redact
         ? redactCodeGenerationFields(serialized)
         : serialized;
@@ -125,12 +150,17 @@ export class SlsFlusher extends BaseFlusher {
     }
   }
 
+  /** 逐条调用 send，保持每个 endpoint bucket 内的输入顺序。 */
   async sendBatch(entries: AgentActivityEntry[]): Promise<void> {
     for (const entry of entries) {
       await this.send(entry);
     }
   }
 
+  /**
+   * 原子取走当前所有 bucket，并行发送各 bucket。
+   * 发送期间新事件进入新的 queue；单 bucket 失败被 catch 并计数，不 reject 整体 flush。
+   */
   async flush(): Promise<void> {
     const batches = Array.from(this.queue.entries());
     this.queue.clear();
@@ -171,17 +201,19 @@ export class SlsFlusher extends BaseFlusher {
     await Promise.all(tasks);
   }
 
-  /** Per-endpoint service name: managed endpoints may override the shared prefix. */
+  /** 托管 endpoint 可覆盖用户共享 serviceName 前缀。 */
   private effectiveServiceName(endpoint?: SlsEndpoint): string {
     return endpoint?.serviceName || this.serviceName;
   }
 
+  /** 组合最终 `<prefix>-<agentType>`，前缀为空时不写 service tag。 */
   private resolveServiceName(endpoint?: SlsEndpoint, agentType?: string): string {
     const base = this.effectiveServiceName(endpoint);
     if (!base) return '';
     return agentType ? `${base}-${agentType}` : base;
   }
 
+  /** AK SDK 要求 tags 为单键对象数组。 */
   private buildAkTags(endpoint: SlsEndpoint, agentType?: string): Record<string, string>[] {
     const tags: Record<string, string>[] = [{ __hostname__: HOSTNAME }];
     const sn = this.resolveServiceName(endpoint, agentType);
@@ -189,6 +221,7 @@ export class SlsFlusher extends BaseFlusher {
     return tags;
   }
 
+  /** WebTracking body 使用普通键值对象承载 tags。 */
   private buildWebtrackingTags(endpoint: SlsEndpoint, agentType?: string): Record<string, string> {
     const tags: Record<string, string> = { __hostname__: HOSTNAME };
     const sn = this.resolveServiceName(endpoint, agentType);
@@ -196,6 +229,7 @@ export class SlsFlusher extends BaseFlusher {
     return tags;
   }
 
+  /** service name 含 Agent 时检查 bucket 是否意外混入多个类型。 */
   private warnIfMixedAgentTypes(logs: QueuedLog[]): void {
     if (this.effectiveServiceName(logs[0]?.endpoint)) {
       const types = new Set(logs.map(l => l.agentType));
@@ -203,6 +237,7 @@ export class SlsFlusher extends BaseFlusher {
     }
   }
 
+  /** 通过官方 AK SDK 发送一个 bucket，执行有限指数退避和告警。 */
   private async flushViaAk(endpoint: SlsEndpoint, logs: QueuedLog[]): Promise<void> {
     this.warnIfMixedAgentTypes(logs);
     const now = Math.floor(Date.now() / 1000);
@@ -236,6 +271,7 @@ export class SlsFlusher extends BaseFlusher {
       } catch (err) {
         lastErr = err;
         if (!isRetryable(err) || attempt === RETRY_MAX_ATTEMPTS - 1) break;
+        // 退避序列为 base、2*base、4*base，不阻塞事件循环。
         const delay = RETRY_BASE_DELAY_MS * 2 ** attempt;
         logger.warn('SLS ak send retrying', {
           endpoint: endpoint.name,
@@ -263,6 +299,7 @@ export class SlsFlusher extends BaseFlusher {
         { endpoint_name: endpoint.name },
       );
     }
+    // 最终失败只落有界元数据，原始 batch 不写磁盘。
     await this.persistFailedLogs(
       endpoint,
       logs.length,
@@ -271,6 +308,7 @@ export class SlsFlusher extends BaseFlusher {
     );
   }
 
+  /** 先按 WebTracking 服务限制拆 chunk，再顺序发送。 */
   private async flushViaWebtracking(endpoint: SlsEndpoint, logs: QueuedLog[]): Promise<void> {
     const chunks = this.splitForWebtracking(logs);
     for (const chunk of chunks) {
@@ -278,6 +316,7 @@ export class SlsFlusher extends BaseFlusher {
     }
   }
 
+  /** 保持顺序按最大日志数和估算请求体字节数拆分。 */
   private splitForWebtracking(logs: QueuedLog[]): QueuedLog[][] {
     const chunks: QueuedLog[][] = [];
     let current: QueuedLog[] = [];
@@ -304,6 +343,7 @@ export class SlsFlusher extends BaseFlusher {
     return chunks;
   }
 
+  /** 构造 WebTracking body，通过 fetch 发送并执行有限重试。 */
   private async postWebtracking(endpoint: SlsEndpoint, logs: QueuedLog[]): Promise<void> {
     this.warnIfMixedAgentTypes(logs);
     const agentType = logs[0]?.agentType;
@@ -315,6 +355,7 @@ export class SlsFlusher extends BaseFlusher {
     };
 
     const raw = JSON.stringify(body);
+    // 有 project 时将它插入 endpoint host，符合 SLS WebTracking URL 规则。
     const base = endpoint.project
       ? endpoint.endpoint.replace(/^(https?:\/\/)/, `$1${endpoint.project}.`)
       : endpoint.endpoint;
@@ -385,6 +426,7 @@ export class SlsFlusher extends BaseFlusher {
     await this.persistFailedLogs(endpoint, logs.length, Buffer.byteLength(raw), lastErr);
   }
 
+  /** 委托 SlsFailureLogWriter 保存不含 payload 的失败摘要。 */
   private async persistFailedLogs(
     endpoint: SlsEndpoint,
     batchCount: number,
@@ -403,6 +445,7 @@ export class SlsFlusher extends BaseFlusher {
     });
   }
 
+  /** 清理定时器、提交当前队列并等待串行失败日志写入完成。 */
   async shutdown(): Promise<void> {
     if (this.flushTimer) {
       clearInterval(this.flushTimer);
@@ -411,6 +454,7 @@ export class SlsFlusher extends BaseFlusher {
     await this.flush();
   }
 
+  /** 把非标准 payload 作为单条 WebTracking 日志直接发送。 */
   override async sendRaw(topic: string, payload: Record<string, unknown>): Promise<void> {
     const content: Record<string, string> = { topic };
     for (const [k, v] of Object.entries(payload)) {
@@ -450,6 +494,7 @@ export class SlsFlusher extends BaseFlusher {
     }
   }
 
+  /** 根据 endpoint 和可选 agentType 选择 bucket，更新指标并按阈值异步触发 flush。 */
   private enqueue(endpoint: SlsEndpoint, content: Record<string, string>, agentType?: string): void {
     const base = `${endpoint.name}/${endpoint.project}/${endpoint.logstore}`;
     const key = (this.effectiveServiceName(endpoint) && agentType)
@@ -472,10 +517,12 @@ export class SlsFlusher extends BaseFlusher {
 
     const maxSize = this.config.batchMaxSize || BATCH_MAX_SIZE;
     if (bucket.length >= maxSize) {
+      // 不 await 以保持 send 低延迟；flush 内部自行隔离 endpoint 错误。
       void this.flush();
     }
   }
 
+  /** Promise 化退避等待。 */
   private sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms));
   }

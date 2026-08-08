@@ -1,3 +1,11 @@
+/**
+ * 周期指标/告警写入与发送调度器。
+ *
+ * Orchestrator 启动后创建本类：L1/L2 每 10 分钟落本地 JSONL并调用 internal sender，告警每
+ * 30 秒消费 AlarmManager。三个定时器均 `unref()`，不会单独阻止 Node.js 进程自然退出；stop
+ * 会清理定时器并执行最后一次写入。
+ */
+
 import * as path from 'node:path';
 import { appendLine, ensureDir } from '../utils/fs-utils.js';
 import { createLogger } from '../utils/logger.js';
@@ -11,6 +19,7 @@ import type { ProcessLiveness } from '../utils/pid-utils.js';
 
 const logger = createLogger('MetricsWriter');
 
+/** 周期和资源阈值；基础设施告警一小时后可再次触发。 */
 const L1_INTERVAL_MS = 600_000;
 const L2_INTERVAL_MS = 600_000;
 const ALARM_FLUSH_INTERVAL_MS = 30_000;
@@ -18,6 +27,7 @@ const CPU_THRESHOLD_PERCENT = 80;
 const MEM_THRESHOLD_MB = 512;
 const INFRA_ALARM_COOLDOWN_MS = 3_600_000;
 
+/** MetricsWriter 构造依赖；getSnapshot 在每次周期调用时读取实时状态。 */
 export interface MetricsWriterOptions {
   dataDir: string;
   version: string;
@@ -31,6 +41,7 @@ export interface MetricsWriterOptions {
   updaterLiveness?: (pidFile: string) => ProcessLiveness;
 }
 
+/** 管理 L1/L2/告警三个后台周期任务。 */
 export class MetricsWriter {
   private readonly logsDir: string;
   private readonly collector: MetricsCollector;
@@ -41,8 +52,10 @@ export class MetricsWriter {
   private alarmTimer: ReturnType<typeof setInterval> | null = null;
   private userIdAlarmEmitted = false;
   private startupAlarmEmitted = false;
+  /** 每类基础设施告警最近触发时间，用于可恢复故障的冷却重置。 */
   private readonly lastInfraAlarmAt: Map<string, number> = new Map();
 
+  /** @param opts 固定身份配置、实时 snapshot 回调及可选告警依赖。 */
   constructor(opts: MetricsWriterOptions) {
     this.logsDir = path.join(opts.dataDir, 'logs', 'metric_alarm');
     this.collector = new MetricsCollector({
@@ -59,10 +72,12 @@ export class MetricsWriter {
     this.alarmManager = opts.alarmManager ?? null;
   }
 
+  /** 创建日志目录、启动非保活定时器，并立即写首条 L1。 */
   async start(): Promise<void> {
     await ensureDir(this.logsDir);
 
     this.l1Timer = setInterval(() => void this.writeL1(), L1_INTERVAL_MS);
+    // unref 后如果其他服务都已关闭，定时器不会让事件循环继续存活。
     this.l1Timer.unref();
     this.l2Timer = setInterval(() => void this.writeL2(), L2_INTERVAL_MS);
     this.l2Timer.unref();
@@ -76,6 +91,7 @@ export class MetricsWriter {
     logger.info('metrics-writer started');
   }
 
+  /** 清除全部定时器并尽力写出最终 L1/L2/告警。 */
   async stop(): Promise<void> {
     if (this.l1Timer) {
       clearInterval(this.l1Timer);
@@ -95,6 +111,7 @@ export class MetricsWriter {
     logger.info('metrics-writer stopped');
   }
 
+  /** 构建 L1、落盘、做阈值/基础设施检查并调用状态 sender。 */
   private async writeL1(): Promise<void> {
     try {
       const snapshot = this.getSnapshot();
@@ -106,6 +123,7 @@ export class MetricsWriter {
       this.checkUserId();
       this.checkStartupMode(metrics);
       this.checkInfraHealth();
+      // internal sender 是同步 fire-and-forget 门面，不在这里等待网络。
       sendStatus('pilot_status', flattenToStrings(metrics));
       sendRunningStatus(flattenToStrings(metrics));
     } catch (err) {
@@ -113,6 +131,7 @@ export class MetricsWriter {
     }
   }
 
+  /** CPU/内存超过固定阈值时聚合 PROCESS_RESOURCE_ALARM。 */
   private checkThresholds(metrics: { cpu: string; mem: string }): void {
     if (!this.alarmManager) return;
 
@@ -133,6 +152,7 @@ export class MetricsWriter {
     }
   }
 
+  /** 只在进程生命周期内检查一次花括号形式的疑似错误 userId。 */
   private checkUserId(): void {
     if (!this.alarmManager || this.userIdAlarmEmitted) return;
     const userId = this.collector.getUserId();
@@ -145,6 +165,7 @@ export class MetricsWriter {
     }
   }
 
+  /** nohup/unknown 启动方式无法保证重启后自恢复，仅告警一次。 */
   private checkStartupMode(metrics: L1Metrics): void {
     if (!this.alarmManager || this.startupAlarmEmitted) return;
 
@@ -158,8 +179,7 @@ export class MetricsWriter {
     }
   }
 
-  // Persistent infra-failures can self-heal at runtime (operator fixes pointer, etc.),
-  // so re-arm them after a cooldown window instead of using a once-guard.
+  // 基础设施故障可由运维在线修复，因此不用永久 once guard；冷却一小时后仍失败可再次告警。
   private recordInfraAlarm(
     type: 'UPDATER_NOT_RUNNING_ALARM' | 'BROKEN_VERSION_POINTER_ALARM' | 'INVALID_NODE_BIN_ALARM',
     level: '2' | '3',
@@ -173,12 +193,14 @@ export class MetricsWriter {
     this.alarmManager.record(type, level, message);
   }
 
+  /** 根据最近一次 L1 健康快照触发 Updater/current/node-bin 告警。 */
   private checkInfraHealth(): void {
     if (!this.alarmManager) return;
 
     const health = this.collector.getLastInfraHealth();
     if (!health) return;
 
+    // Updater 连续两次探测失败才告警，降低启动竞态或单次扫描失败的噪声。
     if (health.updaterConsecutiveFailures >= 2) {
       this.recordInfraAlarm(
         'UPDATER_NOT_RUNNING_ALARM', '3',
@@ -201,6 +223,7 @@ export class MetricsWriter {
     }
   }
 
+  /** 展开并逐行写 Input、Flusher 和 Input 健康三类 L2 指标。 */
   private async writeL2(): Promise<void> {
     try {
       const snapshot = this.getSnapshot();
@@ -242,6 +265,7 @@ export class MetricsWriter {
     }
   }
 
+  /** 消费 AlarmManager 当前聚合项，先落本地再调用内部 sender。 */
   private async writeAlarms(): Promise<void> {
     if (!this.alarmManager) return;
     try {

@@ -1,3 +1,4 @@
+/** 从 Qoder trace segment 文件提取 token 样本，并维护文件级增量状态。 */
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import type { Dirent } from 'node:fs';
@@ -7,10 +8,12 @@ import { readInterceptData } from './intercept-token-reader.js';
 
 const logger = createLogger('SegmentTokenReader');
 
+/** 返回 Qoder CLI 原生 session segment 根目录。 */
 function getSessionsDir(): string {
   return resolveHome('~/.qoder/logs/sessions');
 }
 
+// 模块级 Map 在同一进程内被所有 QoderTraceInput 实例共享，减少同一 session 的重复全目录扫描。
 const sessionCache = new Map<string, { data: SegmentTokenData[]; ts: number }>();
 const CACHE_TTL_MS = 60_000;
 const CACHE_MAX_SIZE = 50;
@@ -28,6 +31,12 @@ export interface SegmentTokenData {
   model: string;
 }
 
+/**
+ * 读取一个 session 的全部 segment JSONL，并关联 request/response/tool 完成时间和 token 用量。
+ *
+ * 结果缓存 60 秒；源 segment 的 token 为 0 时，按 requestId 尝试用 intercept 数据补齐。目录、
+ * 文件或坏行错误均 fail-open，调用方可继续使用 canonical trace 的原始事件。
+ */
 export async function readSegmentTokensForSession(sessionId: string): Promise<SegmentTokenData[]> {
   const cached = sessionCache.get(sessionId);
   if (cached && Date.now() - cached.ts < CACHE_TTL_MS) return cached.data;
@@ -38,7 +47,7 @@ export async function readSegmentTokensForSession(sessionId: string): Promise<Se
   const requestStarts = new Map<string, number>();
   const results: SegmentTokenData[] = [];
 
-  // Collect all events in order to properly associate tool.execution.finished with LLM calls
+  // 先收集全部相关事件，后面才能根据时间顺序把 tool.execution.finished 归属到正确 LLM step。
   const allEvents: Array<{ type: string; ts: number; requestId?: string; data?: Record<string, unknown> }> = [];
 
   for (const filePath of files) {
@@ -72,7 +81,7 @@ export async function readSegmentTokensForSession(sessionId: string): Promise<Se
     }
   }
 
-  // Build results from ordered events
+  // 第一遍用 request_id 配对 model.request.started 与 model.response.completed，构造每次 LLM 样本。
   for (const evt of allEvents) {
     if (evt.type === 'model.request.started' && evt.requestId && evt.ts > 0) {
       requestStarts.set(evt.requestId, evt.ts);
@@ -97,8 +106,7 @@ export async function readSegmentTokensForSession(sessionId: string): Promise<Se
     }
   }
 
-  // Associate tool.execution.finished with the preceding LLM call.
-  // The last tool.execution.finished before the next model.request.started belongs to that step.
+  // 第二遍把 response 之后、下一次 model.request.started 之前的最后一个 tool finished 归给当前 step。
   for (let i = 0; i < results.length; i++) {
     const currentEnd = results[i].responseEndTs;
     const nextStart = i + 1 < results.length ? results[i + 1].requestStartTs : Infinity;
@@ -112,7 +120,7 @@ export async function readSegmentTokensForSession(sessionId: string): Promise<Se
     results[i].toolFinishedTs = lastToolFinish;
   }
 
-  // Fill individual segments with 0 tokens from intercept data (qodercli 1.0.21+ regression)
+  // Qoder CLI 1.0.21+ 某些 segment 会写 0 token；仅对这些样本按 requestId 使用 intercept 数据补齐。
   const zeroSegments = results.filter(r => r.inputTokens === 0 && r.outputTokens === 0);
   if (zeroSegments.length > 0) {
     try {
@@ -127,7 +135,7 @@ export async function readSegmentTokensForSession(sessionId: string): Promise<Se
           seg.inputTokens = match.promptTokens;
           seg.outputTokens = match.completionTokens;
           seg.cacheReadTokens = match.cachedTokens;
-          // Intercept data has no cache_creation field — known limitation
+          // intercept 格式没有 cache_creation 字段，这是已知数据源限制，只能保留为 0。
           seg.cacheCreationTokens = 0;
         }
       }
@@ -136,7 +144,7 @@ export async function readSegmentTokensForSession(sessionId: string): Promise<Se
     }
   }
 
-  // Evict expired entries and enforce max size
+  // 写入新缓存前清理过期项，并在达到容量上限时移除最早项，避免模块级 Map 无限增长。
   const now = Date.now();
   for (const [key, entry] of sessionCache) {
     if (now - entry.ts > CACHE_TTL_MS) sessionCache.delete(key);
@@ -150,6 +158,7 @@ export async function readSegmentTokensForSession(sessionId: string): Promise<Se
   return results;
 }
 
+/** 跨所有 cwd key 查找指定 sessionId 的 segments JSONL，并排序返回。 */
 async function findSegmentFilesForSession(sessionId: string): Promise<string[]> {
   const files: string[] = [];
   let cwdDirs: Dirent[];
@@ -178,6 +187,7 @@ async function findSegmentFilesForSession(sessionId: string): Promise<string[]> 
   return files.sort();
 }
 
+/** 兼容有限 number、日期字符串和数字字符串；无法解析时返回 0。 */
 function parseTs(value: unknown): number {
   if (typeof value === 'number' && Number.isFinite(value)) return value;
   if (typeof value === 'string') {
@@ -189,6 +199,7 @@ function parseTs(value: unknown): number {
   return 0;
 }
 
+/** 仅接受有限 number，避免异常数值进入 token 计算。 */
 function finiteNum(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isFinite(value)) return value;
   return undefined;

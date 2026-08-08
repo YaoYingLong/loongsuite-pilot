@@ -1,3 +1,11 @@
+/**
+ * 支持 rotation、断行缓存和 checkpoint 恢复的增量文件读取器。
+ *
+ * 每个逻辑路径维护 reader 队列：rename rotation 后旧 inode 继续读完，新 inode 从 0 开始；
+ * copytruncate 则重置当前 reader。单次最多读 4 MiB，未换行尾部缓存到下一轮，checkpoint 同时
+ * 保存 dev/inode 和文件头签名，防止 inode 复用导致错位续读。
+ */
+
 import * as fs from 'node:fs/promises';
 import * as fsSync from 'node:fs';
 import * as path from 'node:path';
@@ -7,6 +15,7 @@ import { createLogger } from '../../../utils/logger.js';
 
 const logger = createLogger('FileTailer');
 
+/** 读取/发现/队列/超时和断行缓存的资源上限。 */
 const MAX_READ_BYTES = 4 * 1024 * 1024;
 const MAX_FILES_PER_CYCLE = 100;
 const SIGNATURE_BYTES = 1024;
@@ -14,18 +23,21 @@ const MAX_READER_QUEUE_LENGTH = 20;
 const READER_TIMEOUT_MS = 3_600_000;
 const MAX_CACHE_BYTES = 1024 * 1024;
 
+/** 单次读取结果；hasMore 也表示队列中还有旧 reader 待处理。 */
 export interface ReadResult {
   lines: string[];
   checkpoint: FileCheckpoint;
   hasMore: boolean;
 }
 
+/** 按路径管理一个或多个 inode reader 的增量 tailer。 */
 export class FileTailer {
   private readonly filePaths: string[];
   private readonly encoding: BufferEncoding;
   private readonly maxDirSearchDepth: number;
   private readerQueues: Map<string, FileReaderState[]> = new Map();
 
+  /** @param opts glob 路径、文本编码和最大递归深度。 */
   constructor(opts: {
     filePaths: string[];
     encoding?: string;
@@ -36,6 +48,7 @@ export class FileTailer {
     this.maxDirSearchDepth = opts.maxDirSearchDepth ?? 0;
   }
 
+  /** 按所有 glob 同步发现文件，整个周期最多返回 100 个稳定排序结果。 */
   discoverFiles(): string[] {
     const result: string[] = [];
     for (const pattern of this.filePaths) {
@@ -46,6 +59,10 @@ export class FileTailer {
     return result.slice(0, MAX_FILES_PER_CYCLE);
   }
 
+  /**
+   * 校验 checkpoint 的文件存在、dev/inode 和可选头签名后恢复 reader。
+   * @returns 校验成功为 true；无效 checkpoint 不修改队列并返回 false。
+   */
   async initReaderFromCheckpoint(filePath: string, checkpoint: FileCheckpoint): Promise<boolean> {
     let stat: fsSync.Stats;
     try {
@@ -66,6 +83,7 @@ export class FileTailer {
       return false;
     }
 
+    // dev/inode 匹配仍可能是 inode 复用，头部签名提供第二层验证。
     if (checkpoint.signatureHash) {
       const currentSig = await computeFileSignature(filePath);
       if (currentSig && currentSig !== checkpoint.signatureHash) {
@@ -99,10 +117,12 @@ export class FileTailer {
     return true;
   }
 
+  /** 返回所有当前有 reader 队列的逻辑路径。 */
   getActiveFiles(): string[] {
     return [...this.readerQueues.keys()];
   }
 
+  /** 只返回每路径最新 reader checkpoint；保留接口供兼容调用。 */
   getCheckpoints(): Map<string, FileCheckpoint> {
     const result = new Map<string, FileCheckpoint>();
     for (const [filePath, queue] of this.readerQueues) {
@@ -114,6 +134,7 @@ export class FileTailer {
     return result;
   }
 
+  /** 返回所有旧/新 reader checkpoint，key 追加 dev/inode 以区分 rotation 队列。 */
   getAllReaderCheckpoints(): Map<string, FileCheckpoint> {
     const result = new Map<string, FileCheckpoint>();
     for (const [filePath, queue] of this.readerQueues) {
@@ -125,6 +146,10 @@ export class FileTailer {
     return result;
   }
 
+  /**
+   * 确保 reader 存在、检测 rotation，再从队首 reader 读取完整行。
+   * 可选 checkpoint 只在该路径尚无队列时尝试恢复。
+   */
   async readNewLines(filePath: string, checkpoint?: FileCheckpoint | null): Promise<ReadResult> {
     if (checkpoint && !this.readerQueues.has(filePath)) {
       await this.initReaderFromCheckpoint(filePath, checkpoint);
@@ -140,6 +165,7 @@ export class FileTailer {
         return this.emptyResult();
       }
       const sig = await computeFileSignature(filePath);
+      // 首次发现新文件从 offset 0 开始，并记录文件头签名。
       const reader: FileReaderState = {
         filePath,
         devInode: { dev: stat.dev, ino: stat.ino },
@@ -159,12 +185,14 @@ export class FileTailer {
     return this.processQueue(filePath, queue);
   }
 
+  /** backpressure 暂停读取期间仍可单独检测 rotation，避免错过旧 inode。 */
   async checkRotation(filePath: string): Promise<void> {
     const queue = this.readerQueues.get(filePath);
     if (!queue || queue.length === 0) return;
     await this.detectRotation(filePath, queue);
   }
 
+  /** 系统唤醒后刷新所有 reader 时间，避免把睡眠时长误判为一小时无活动。 */
   refreshReaderTimestamps(): void {
     const now = Date.now();
     for (const [, queue] of this.readerQueues) {
@@ -177,6 +205,7 @@ export class FileTailer {
     }
   }
 
+  /** 删除超过一小时未活动的 reader；已删除 reader 还要求 deletedTime 同样超时。 */
   cleanupStaleReaders(): void {
     const now = Date.now();
     for (const [filePath, queue] of this.readerQueues) {
@@ -197,11 +226,13 @@ export class FileTailer {
     }
   }
 
+  /** 识别路径消失、dev/inode 变化和 size 回退三类 rotation。 */
   private async detectRotation(filePath: string, queue: FileReaderState[]): Promise<void> {
     let stat: fsSync.Stats;
     try {
       stat = await fs.stat(filePath);
     } catch {
+      // 路径暂时消失时保留 reader，后续按 inode 在父目录寻找 rename 后文件。
       const latest = queue[queue.length - 1];
       if (latest && !latest.deleted) {
         latest.deleted = true;
@@ -232,9 +263,11 @@ export class FileTailer {
         deleted: false,
         deletedTime: 0,
       };
+      // 新 inode reader 加到队尾，processQueue 会先读完旧 reader。
       queue.push(newReader);
 
       while (queue.length > MAX_READER_QUEUE_LENGTH) {
+        // 极端高频 rotation 时限制为 20 个 reader；淘汰会记录可能的数据缺口。
         const evicted = queue.shift()!;
         logger.warn('reader queue overflow, evicting oldest reader', {
           file: filePath,
@@ -244,6 +277,7 @@ export class FileTailer {
         });
       }
     } else if (stat.size < latestReader.offset) {
+      // copytruncate 保持 inode 但文件缩短，只能从新文件头重新读取。
       logger.info('file truncated (copytruncate rotation)', {
         file: filePath,
         recorded: latestReader.offset,
@@ -257,11 +291,13 @@ export class FileTailer {
     }
   }
 
+  /** 从队首 reader 开始，必要时定位 rename 文件；读完旧 reader 后切换下一项。 */
   private async processQueue(filePath: string, queue: FileReaderState[]): Promise<ReadResult> {
     while (queue.length > 0) {
       const reader = queue[0];
 
       const readPath = reader.deleted
+        // rename 后逻辑路径已指向新文件，需要按 dev/inode 在同目录找到旧文件名。
         ? await this.findFileByDevInode(path.dirname(filePath), reader.devInode)
         : reader.filePath;
 
@@ -307,6 +343,7 @@ export class FileTailer {
     return this.emptyResult();
   }
 
+  /** 从单个物理文件按 offset 最多读取 4 MiB，仅返回换行结束的完整非空行。 */
   private async readFromReader(
     filePath: string,
     reader: FileReaderState,
@@ -332,6 +369,7 @@ export class FileTailer {
 
       const lastNewline = text.lastIndexOf('\n');
       if (lastNewline === -1) {
+        // 没有完整行时把文本拼入 cache；超过 1 MiB 丢弃以防无换行巨型文件占满内存。
         const newCache = reader.cache + text;
         if (Buffer.byteLength(newCache, this.encoding) > MAX_CACHE_BYTES) {
           logger.warn('cache overflow, discarding', {
@@ -348,6 +386,7 @@ export class FileTailer {
       }
 
       const completePart = reader.cache + text.substring(0, lastNewline);
+      // 最后一个换行后的残片留到下轮，与下一段前缀拼接。
       reader.cache = text.substring(lastNewline + 1);
       const lines = completePart.split('\n').filter((l) => l.length > 0);
 
@@ -360,6 +399,7 @@ export class FileTailer {
     }
   }
 
+  /** 在同一目录普通文件中寻找指定 dev/inode，供 rename rotation 续读。 */
   private async findFileByDevInode(dir: string, devInode: DevInode): Promise<string | null> {
     let entries: fsSync.Dirent[];
     try {
@@ -382,6 +422,7 @@ export class FileTailer {
     return null;
   }
 
+  /** 将可变 reader 状态复制成可序列化 checkpoint。 */
   private readerToCheckpoint(reader: FileReaderState): FileCheckpoint {
     return {
       offset: reader.offset,
@@ -394,6 +435,7 @@ export class FileTailer {
     };
   }
 
+  /** 文件不可用时返回稳定空结果。 */
   private emptyResult(): ReadResult {
     return {
       lines: [],
@@ -411,6 +453,7 @@ export class FileTailer {
   }
 }
 
+/** 读取文件头 1 KiB 计算 MD5 身份签名；仅用于变化检测，不用于安全认证。 */
 async function computeFileSignature(filePath: string): Promise<string> {
   let handle;
   try {
@@ -426,6 +469,7 @@ async function computeFileSignature(filePath: string): Promise<string> {
   }
 }
 
+/** 在 pattern 父目录按 basename glob 同步收集文件，并限制递归深度。 */
 function matchGlob(pattern: string, maxDepth: number): string[] {
   const dir = path.dirname(pattern);
   const filePattern = path.basename(pattern);
@@ -438,6 +482,7 @@ function matchGlob(pattern: string, maxDepth: number): string[] {
   return results.sort();
 }
 
+/** 深度优先递归目录；达到每周期 100 文件后立即停止。 */
 function collectFiles(
   dir: string,
   regex: RegExp,
@@ -464,6 +509,7 @@ function collectFiles(
   }
 }
 
+/** 将 basename 中 `*` 转成“不跨路径分隔符”的正则，其余正则字符全部转义。 */
 export function globToRegex(pattern: string): RegExp {
   const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&');
   const regexStr = escaped.replace(/\*/g, '[^/]*');

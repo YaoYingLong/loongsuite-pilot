@@ -42,6 +42,7 @@ const EVENT_KEY_MAP: Record<string, string> = {
   Stop: 'stop',
 };
 
+/** 递归按对象 key 排序，数组保持顺序，为跨运行稳定 hash 准备 canonical 值。 */
 function canonicalJson(value: unknown): unknown {
   if (value === null || value === undefined) return value;
   if (Array.isArray(value)) return value.map(canonicalJson);
@@ -55,6 +56,7 @@ function canonicalJson(value: unknown): unknown {
   return value;
 }
 
+/** 对 canonical JSON 做 SHA-256，并加 Codex 期望的 `sha256:` 前缀。 */
 function versionForToml(obj: unknown): string {
   const canonical = canonicalJson(obj);
   const serialized = JSON.stringify(canonical);
@@ -72,6 +74,7 @@ function versionForToml(obj: unknown): string {
  * HookHandlerConfig::Command { type:"command", command, timeout_sec:Some(600), async:false, status_message:None, command_windows:None }
  *   timeout_sec serde rename "timeout";command_windows / status_message 缺省时跳过
  */
+/** 未知 event 会抛错，调用方新增事件时必须同步 EVENT_KEY_MAP。 */
 export function computeHookTrustHash(eventName: string, command: string): string {
   const eventKey = EVENT_KEY_MAP[eventName];
   if (!eventKey) throw new Error(`Unknown hook event: ${eventName}`);
@@ -101,6 +104,7 @@ export function computeHookTrustHash(eventName: string, command: string): string
  * 如果其他第三方 hook(如 r2c)排在前面,pilot 的 hook 会在 1、2... 的位置。
  * handler_index 目前固定 0(每个 group 只有一个 handler)。
  */
+/** groupIndex 必须是 Hook group 在对应事件数组中的真实下标。 */
 export function hookStateKey(
   hooksJsonAbsPath: string,
   eventName: string,
@@ -120,6 +124,7 @@ interface ParsedTrustHash {
  * 从 config.toml content 中提取所有 [hooks.state."..."].trusted_hash 条目。
  * 仅按 marker BEGIN/END 包裹的 block 内提取。
  */
+/** marker 块缺失或倒置时返回空数组，坏 section 不会匹配正则。 */
 function parseTrustBlock(content: string, marker: string): ParsedTrustHash[] {
   const begin = `# BEGIN ${marker} trust`;
   const end = `# END ${marker} trust`;
@@ -142,6 +147,7 @@ function parseTrustBlock(content: string, marker: string): ParsedTrustHash[] {
  * 不在 marker 块内,但 path/event 匹配 + handler=0 → pilot 拥有的 slot,清掉。
  * 匹配任意 group index(老插件可能在 :0:0,新 pilot 可能在 :1:0 等)。
  */
+/** 纯字符串变换：删除 path/event 匹配且 handler=0 的本项目历史 state section。 */
 function removeStaleTrustState(
   content: string,
   hooksJsonAbsPath: string,
@@ -162,6 +168,7 @@ function removeStaleTrustState(
   const sectionHeader = /^\s*\[hooks\.state\."([^"]+)"\]\s*$/;
   const anyHeader = /^\s*\[/;
 
+  /** 判断 trust section key 是否属于本项目当前 hooks.json、事件和 handler。 */
   const isOwnedKey = (key: string): boolean => {
     // key 格式: "<path>:<event>:<group>:<handler>"
     const lastColon = key.lastIndexOf(':');
@@ -234,6 +241,7 @@ export interface WriteTrustedHashesOpts {
  *
  * 注意 command 字符串与 hook 注册到 hooks.json 时一致:`bash <entryPath> <subcommand>`
  */
+/** 同步读写 config.toml；文件错误或未知事件向 HookStrategy 抛出。 */
 export function writeTrustedHashes(opts: WriteTrustedHashesOpts): void {
   const { configPath, hooksJsonAbsPath, hookEvents, eventToCommand, eventToGroupIndex, marker, forceBypass } = opts;
 
@@ -245,21 +253,21 @@ export function writeTrustedHashes(opts: WriteTrustedHashesOpts): void {
   const TRUST_BEGIN = `# BEGIN ${marker} trust`;
   const TRUST_END = `# END ${marker} trust`;
 
-  // Step 1: 删 BEGIN/END marker 注释行(仅删注释行本身,不按范围删,
+  // 步骤 1：删除 BEGIN/END marker 注释行（仅删注释行本身，不按范围删除，
   // 因为 codex 桌面版会重新序列化 TOML,导致 END marker 位移,范围删会误伤用户数据)
   content = content.split('\n')
     .filter((line) => line.trim() !== TRUST_BEGIN && line.trim() !== TRUST_END)
     .join('\n');
 
-  // Step 1b: 删 bypass_hook_trust 行(上次 forceBypass 留下的)
+  // 步骤 1b：删除上次 forceBypass 留下的 bypass_hook_trust 行。
   content = content.split('\n')
     .filter((line) => !/^\s*bypass_hook_trust\s*=/.test(line))
     .join('\n');
 
-  // Step 2: 清所有 owned [hooks.state."<our path>:<our event>:<any group>:0"] section
+  // 步骤 2：清理所有本项目拥有的 [hooks.state."<our path>:<our event>:<any group>:0"] 区段。
   content = removeStaleTrustState(content, hooksJsonAbsPath, hookEvents);
 
-  // Step 3: 写新块
+  // 步骤 3：写入新的 trust 区块。
   const lines: string[] = [TRUST_BEGIN];
   if (forceBypass) {
     lines.push('bypass_hook_trust = true');
@@ -297,6 +305,7 @@ export function writeTrustedHashes(opts: WriteTrustedHashesOpts): void {
  * @param hooksJsonAbsPath 不传时退化为只删 marker 注释行(兼容老的 installer 调用)
  * @param hookEvents 不传时退化为只删 marker 注释行
  */
+/** 纯字符串变换：删除 marker 注释及可识别的 owned state。 */
 export function removeTrustBlock(
   configPath: string,
   marker: string,
@@ -310,17 +319,17 @@ export function removeTrustBlock(
   const TRUST_BEGIN = `# BEGIN ${marker} trust`;
   const TRUST_END = `# END ${marker} trust`;
 
-  // Step 1: 删 BEGIN/END marker 注释行(仅删注释行本身,不删中间内容)
+  // 步骤 1：删除 BEGIN/END marker 注释行（只删注释行，不删除中间内容）。
   content = content.split('\n')
     .filter((line) => line.trim() !== TRUST_BEGIN && line.trim() !== TRUST_END)
     .join('\n');
 
-  // Step 2: 删 bypass_hook_trust 行(如存在)
+  // 步骤 2：删除 bypass_hook_trust 行（如果存在）。
   content = content.split('\n')
     .filter((line) => !/^\s*bypass_hook_trust\s*=/.test(line))
     .join('\n');
 
-  // Step 3: 逐条删 [hooks.state."<owned>"] section
+  // 步骤 3：逐条删除本项目拥有的 [hooks.state."<owned>"] 区段。
   if (hooksJsonAbsPath && hookEvents) {
     content = removeStaleTrustState(content, hooksJsonAbsPath, hookEvents);
   }
@@ -355,6 +364,7 @@ export interface VerifyResult {
  * 用途: deploy 后立即调用,确认我们写入正确(防止 string 拼接错位等);失败时 logger.error。
  *       不直接阻塞 deploy(让 hook-watchdog 活性检查再次触发 redeploy 兜底)。
  */
+/** 重读并逐事件比较 expected/actual，返回报告而不因不一致抛错。 */
 export function verifyTrustHashes(opts: VerifyTrustHashesOpts): VerifyResult {
   const { configPath, hooksJsonAbsPath, hookEvents, eventToCommand, eventToGroupIndex, marker } = opts;
   if (!fs.existsSync(configPath)) {

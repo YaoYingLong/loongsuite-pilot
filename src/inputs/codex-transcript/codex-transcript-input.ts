@@ -1,3 +1,10 @@
+/**
+ * 当前 Codex 生产主链的统一 rollout transcript Input。
+ *
+ * Stop Hook 只写 wakeup marker；本类递归发现 `~/.codex/sessions` 各层目录中的 rollout JSONL，在首次
+ * 启动 baseline 已有历史，运行中按 byte offset 恢复 active turn，调用 Extractor/Builder 生成
+ * 增量标准事件。terminal 解析失败会保存 pendingTerminal 并阻塞后续 turn，优先保证不静默丢失。
+ */
 import * as fsSync from 'node:fs';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
@@ -36,8 +43,8 @@ const MAX_EMIT_BATCH_BYTES = 1024 * 1024;
 const MAX_PERSISTED_INPUT_CONTEXT_BYTES = 1024 * 1024;
 const MAX_TERMINALS_PER_FILE_CYCLE = 100;
 const MAX_SCAN_BYTES_PER_FILE_CYCLE = 16 * 1024 * 1024;
-// Values emitted by DEFAULT_RESOURCE_ENV_FIELD_MAP in assets/hooks/shared/resource-context.mjs.
-// Add new AgentTeams resource fields to both lists together.
+// 这些字段由 assets/hooks/shared/resource-context.mjs 的 DEFAULT_RESOURCE_ENV_FIELD_MAP 写入 marker。
+// 新增 AgentTeams resource 字段时必须同步修改写入端与此白名单，避免任意 marker 字段进入事件。
 const WAKEUP_RESOURCE_ATTRIBUTE_KEYS = [
   'agentteams.worker.name',
   'agentteams.instance.id',
@@ -83,10 +90,19 @@ interface PendingRecoveryResult {
 }
 
 export interface CodexTranscriptInputOptions extends InputOptions {
+  /** Codex rollout JSONL 根目录；默认 `~/.codex/sessions`。 */
   sessionDir?: string;
+  /** Stop Hook 写入唤醒 marker 的目录；默认位于 Pilot data dir 下。 */
   wakeupDir?: string;
 }
 
+/**
+ * Codex rollout transcript 的生产采集器。
+ *
+ * Orchestrator 创建并交给 InputManager 启停。类启动时对现有文件做 baseline，之后同时依靠 30 秒
+ * 轮询与 wakeup 目录的 `fs.watch` 触发采集。每个文件维护 inode、字节 offset、active turn、待恢复
+ * terminal 和事件 ID 去重状态；停止时关闭 watcher，轮询定时器和在途周期由 BaseInput 统一清理。
+ */
 export class CodexTranscriptInput extends BaseInput {
   readonly id = 'codex-transcript';
   readonly agentType = ClientType.CodexCliHook;
@@ -100,20 +116,27 @@ export class CodexTranscriptInput extends BaseInput {
   private processedTerminalTurnIds = new Set<string>();
   private processedTerminalTurnIdOrder: string[] = [];
 
+  /** 保存状态存储与目录配置；构造阶段不扫描文件，也不创建 watcher。 */
   constructor(opts: CodexTranscriptInputOptions) {
     super({ stateStore: opts.stateStore, pollIntervalMs: opts.pollIntervalMs ?? 30_000 });
     this.sessionDir = opts.sessionDir ?? resolveHome(DEFAULT_SESSION_DIR);
     this.wakeupDir = opts.wakeupDir ?? defaultWakeupDir();
   }
 
+  /** 返回 AgentDiscoveryService 可用于判断 Codex 是否存在的默认会话目录。 */
   static getWatchPaths(): string[] {
     return [resolveHome(DEFAULT_SESSION_DIR)];
   }
 
+  /** 异步检查默认会话目录是否存在；不存在时返回 false，不抛出普通文件系统错误。 */
   static async checkAvailability(): Promise<boolean> {
     return directoryExists(resolveHome(DEFAULT_SESSION_DIR));
   }
 
+  /**
+   * 加载跨文件去重状态、baseline 新发现的旧文件，并监听 Stop Hook 的唤醒目录。
+   * watcher 失败不会阻止 Input 启动，因为 BaseInput 的周期轮询仍能继续采集。
+   */
   protected override async onStart(): Promise<void> {
     this.loadGlobalProcessedTerminalTurnIds();
     for (const filePath of await this.discoverSessionFiles()) {
@@ -123,6 +146,7 @@ export class CodexTranscriptInput extends BaseInput {
     this.saveGlobalProcessedTerminalTurnIds();
     await fs.mkdir(this.wakeupDir, { recursive: true });
     try {
+      // `persistent: false` 表示单独这个 watcher 不会阻止 Node.js 进程正常退出。
       this.wakeupWatcher = fsSync.watch(this.wakeupDir, { persistent: false }, () => {
         this.requestCollection();
       });
@@ -137,11 +161,18 @@ export class CodexTranscriptInput extends BaseInput {
     }
   }
 
+  /** 关闭 wakeup 文件系统监听器；BaseInput 随后还会等待正在执行的 collect 周期结束。 */
   protected override async onStop(): Promise<void> {
     this.wakeupWatcher?.close();
     this.wakeupWatcher = null;
   }
 
+  /**
+   * 发现并顺序处理所有 rollout 文件。
+   *
+   * `processFile()` 为控制批大小会直接发出 `entries` 事件，所以这里返回空数组，避免 BaseInput
+   * 再次发送相同数据。单文件异常会按其内部策略处理；未捕获错误交给 BaseInput 记录。
+   */
   protected override async collect(): Promise<AgentActivityEntry[]> {
     let emittedCount = 0;
     for (const filePath of await this.discoverSessionFiles()) {
@@ -153,11 +184,16 @@ export class CodexTranscriptInput extends BaseInput {
     return [];
   }
 
+  /**
+   * 按最多 256 条或约 1 MiB 把事件同步分批交给 BaseInput 的 `entries` 监听器。
+   * @returns 实际发出的事件条数；EventEmitter 本身不等待异步监听器。
+   */
   private emitEntryBatches(entries: AgentActivityEntry[]): number {
     let emittedCount = 0;
     let batch: AgentActivityEntry[] = [];
     let batchBytes = 0;
 
+    /** 发出当前批次并重置累计数组和字节数。 */
     const flush = (): void => {
       if (batch.length === 0) return;
       this.emit('entries', batch);
@@ -181,6 +217,14 @@ export class CodexTranscriptInput extends BaseInput {
     return emittedCount;
   }
 
+  /**
+   * 从一个 rollout 文件的 checkpoint 继续扫描、恢复 turn、发出事件并更新状态。
+   *
+   * 每周期限制 terminal 数和扫描字节，避免一个大文件饿死其他 Agent。inode 改变时视为文件替换并
+   * 重新 baseline；pending terminal 必须优先恢复，恢复失败会阻塞该文件后续字节以保证不漏数据。
+   *
+   * @returns 本文件本周期实际发出的事件数。
+   */
   private async processFile(filePath: string): Promise<number> {
     let stat;
     try {
@@ -234,6 +278,7 @@ export class CodexTranscriptInput extends BaseInput {
       );
       let terminalTurnId: string | null = null;
       let terminalEndOffset: number | null = null;
+      /** 只识别 session meta、turn 起点和 terminal；返回 false 让扫描器停在 terminal 后。 */
       const processScannedLine = (line: JsonLine): void | false => {
         const payload = asRecord(line.record.payload);
         if (!payload) return;
@@ -259,8 +304,8 @@ export class CodexTranscriptInput extends BaseInput {
       };
       let scan = await scanJsonLines(filePath, scanStartOffset, scanEndOffset, processScannedLine);
 
-      // A single JSONL record may exceed the byte budget. Read far enough to
-      // consume one complete line so this file can make forward progress.
+      // 单条 JSONL 可能超过本周期字节预算。若预算范围内连一条完整换行都没有，就额外读到文件
+      // 当前末尾并消费一条完整记录，否则 scanOffset 会永远停在同一位置。
       if (scan.nextOffset === scanStartOffset && scanEndOffset < stat.size) {
         scan = await scanJsonLines(filePath, scanStartOffset, stat.size, line => {
           processScannedLine(line);
@@ -335,8 +380,10 @@ export class CodexTranscriptInput extends BaseInput {
   }
 
   /**
-   * A completed terminal line is never retried by the normal offset scan.
-   * Persist the range and retry it before reading later transcript data.
+   * 优先重试已经读到、但上次无法解析的 terminal turn。
+   *
+   * 正常扫描的 offset 已越过 terminal 行，不会自动回头，因此必须持久化 terminalEndOffset 并在
+   * 读取后续数据前重试。若仍不可解析，返回 `blocked: true`，调用方保存重试次数后停止处理该文件。
    */
   private async recoverPendingTerminal(
     filePath: string,
@@ -383,6 +430,12 @@ export class CodexTranscriptInput extends BaseInput {
     return { blocked: false, emittedCount, processedTerminalCount: 1 };
   }
 
+  /**
+   * 重读 active turn 的指定字节片段，经 Extractor 和 Builder 转为新事件。
+   *
+   * 方法会更新 activeTurn 的模型、已发事件 ID、step 数和输入上下文，但不直接写 StateStore；
+   * `processFile()` 在本轮结束时统一持久化。terminal=false 时只提交 Extractor 确认闭合的前缀。
+   */
   private async recoverTurnSegment(
     filePath: string,
     checkpoint: CodexTranscriptCheckpoint,
@@ -398,6 +451,7 @@ export class CodexTranscriptInput extends BaseInput {
         diagnostics: emptySegmentRecoveryDiagnostics(),
       };
     }
+    // turn 片段和最近 session_meta 分开读取；meta 可能位于 activeTurn 起点之前。
     const records = await readJsonLines(filePath, activeTurn.startOffset, endOffset);
     const metaRecord = checkpoint.latestSessionMetaOffset === null
       ? null
@@ -431,6 +485,7 @@ export class CodexTranscriptInput extends BaseInput {
     }
 
     const stepStart = (activeTurn.emittedStepCount ?? 0) + 1;
+    // terminal 允许闭合全部 step；活跃 turn 只能采用 extractor 判定可增量提交的连续前缀。
     const closedStepCount = terminal
       ? turn.steps.length
       : extraction.committedStepCount;
@@ -445,6 +500,7 @@ export class CodexTranscriptInput extends BaseInput {
       contextStepCount: committedTurn.steps.length,
     });
     const readyEntries = built.entries;
+    // Builder 使用确定性 ID 重建整个片段，随后依据 checkpoint 中的 ID 集合过滤已经发出的事件。
     const entries = this.filterNewSegmentEntries(readyEntries, activeTurn);
     const diagnostics: SegmentRecoveryDiagnostics = {
       sourceRecordCount: records.items.length,
@@ -509,6 +565,12 @@ export class CodexTranscriptInput extends BaseInput {
     };
   }
 
+  /**
+   * 恢复 Builder 的上一个输入上下文。
+   *
+   * 小 delta 直接存于 checkpoint；超过 1 MiB 时只保存 transcript 字节范围，此处重读该范围并从
+   * 最后一个 step 重建 delta。重建失败仅记录警告并保留哈希，不阻塞当前采集。
+   */
   private async resolveInputContext(
     filePath: string,
     activeTurn: CodexActiveTranscriptTurn,
@@ -539,6 +601,10 @@ export class CodexTranscriptInput extends BaseInput {
     return { ...context, delta: nextInputMessagesForStep(lastStep) };
   }
 
+  /**
+   * 根据 activeTurn 中四类已发 ID 去掉重建片段里的重复事件，并同步更新这些有界 checkpoint 字段。
+   * prompt 使用单独布尔值控制；未知事件类型原样保留，避免未来 schema 扩展被静默丢弃。
+   */
   private filterNewSegmentEntries(
     entries: AgentActivityEntry[],
     activeTurn: NonNullable<CodexTranscriptCheckpoint['activeTurn']>,
@@ -593,6 +659,12 @@ export class CodexTranscriptInput extends BaseInput {
     return out;
   }
 
+  /**
+   * 读取 Stop Hook marker 中的 AgentTeams 归属字段。
+   *
+   * 只接受白名单内、长度不超过 512 的非空字符串；文件缺失、JSON 损坏或无有效字段均返回
+   * `undefined`，不影响 transcript 主数据输出。
+   */
   private async readWakeupResourceAttributes(sessionId: string): Promise<Record<string, JsonValue> | undefined> {
     const marker = path.join(this.wakeupDir, `${safeWakeupSessionPart(sessionId)}.json`);
     let raw: string;
@@ -640,6 +712,10 @@ export class CodexTranscriptInput extends BaseInput {
     return resourceAttributes;
   }
 
+  /**
+   * 首次见到文件时扫描到当前 EOF，并把既有 terminal turn 标为已处理，不回放安装前的历史。
+   * 若文件末尾存在活跃 turn，仅保存其元数据并把 startOffset 放到 EOF，之后只接收新增内容。
+   */
   private async baselineFile(filePath: string, key: string): Promise<void> {
     let stat;
     try {
@@ -686,16 +762,22 @@ export class CodexTranscriptInput extends BaseInput {
     });
   }
 
+  /** 递归发现 sessionDir 下所有 `rollout-*.jsonl`，排序后返回以保持处理顺序稳定。 */
   private async discoverSessionFiles(): Promise<string[]> {
     const files: string[] = [];
     await collectRolloutFiles(this.sessionDir, files);
     return files.sort();
   }
 
+  /** 以 Input ID 和绝对文件路径组合 StateStore key，避免不同 transcript 共享 offset。 */
   private stateKey(filePath: string): string {
     return `${this.id}:${filePath}`;
   }
 
+  /**
+   * 从通用 StateStore 验证并恢复 Codex 专用 checkpoint。
+   * 旧版本缺失的新字段使用空值，非法必需字段则返回 null，让调用方重新 baseline。
+   */
   private readCheckpoint(key: string): CodexTranscriptCheckpoint | null {
     const raw = this.stateStore.get(key).extra?.codexTranscript;
     const value = asRecord(raw);
@@ -752,6 +834,7 @@ export class CodexTranscriptInput extends BaseInput {
     };
   }
 
+  /** 合并写入 Codex checkpoint，并把通用 lastOffset 同步为 scanOffset。 */
   private saveCheckpoint(key: string, checkpoint: CodexTranscriptCheckpoint): void {
     const current = this.stateStore.get(key);
     this.stateStore.update(key, {
@@ -763,6 +846,9 @@ export class CodexTranscriptInput extends BaseInput {
     });
   }
 
+  /**
+   * 惰性加载跨文件 terminal 去重集合；若还没有全局状态，则从各文件旧 checkpoint 迁移一次。
+   */
   private loadGlobalProcessedTerminalTurnIds(): void {
     if (this.processedTerminalTurnIdsLoaded) return;
     this.processedTerminalTurnIdsLoaded = true;
@@ -789,6 +875,7 @@ export class CodexTranscriptInput extends BaseInput {
     }
   }
 
+  /** 读取并验证最多 10000 个全局 terminal ID，防止损坏状态或无限增长。 */
   private readGlobalState(): CodexTranscriptGlobalState {
     const raw = this.stateStore.get(this.id).extra?.codexTranscriptGlobal;
     const value = asRecord(raw);
@@ -801,6 +888,7 @@ export class CodexTranscriptInput extends BaseInput {
     };
   }
 
+  /** 仅在 dirty 时写回全局去重状态，减少每次轮询的磁盘写入。 */
   private saveGlobalProcessedTerminalTurnIds(): void {
     if (!this.processedTerminalTurnIdsDirty) return;
     const current = this.stateStore.get(this.id);
@@ -816,16 +904,19 @@ export class CodexTranscriptInput extends BaseInput {
     this.processedTerminalTurnIdsDirty = false;
   }
 
+  /** 检查 turn 是否已在任意 transcript 文件中处理，调用前确保全局状态已加载。 */
   private isGloballyProcessedTerminalTurn(turnId: string): boolean {
     this.loadGlobalProcessedTerminalTurnIds();
     return this.processedTerminalTurnIds.has(turnId);
   }
 
+  /** 把 turn 放到单文件最近去重列表头部，并裁剪到配置上限。 */
   private rememberProcessedTerminalTurnId(checkpoint: CodexTranscriptCheckpoint, turnId: string): void {
     checkpoint.emittedTerminalTurnIds = [turnId, ...checkpoint.emittedTerminalTurnIds.filter(id => id !== turnId)]
       .slice(0, MAX_EMITTED_TERMINAL_TURNS);
   }
 
+  /** 加入跨文件有界 Set/顺序表；新值会把状态标记为待持久化。 */
   private rememberGlobalProcessedTerminalTurnId(turnId: string, markDirty = true): void {
     if (this.processedTerminalTurnIds.has(turnId)) return;
     this.processedTerminalTurnIds.add(turnId);
@@ -838,6 +929,10 @@ export class CodexTranscriptInput extends BaseInput {
   }
 }
 
+/**
+ * 深度优先递归收集 rollout 文件，结果追加到调用者数组。
+ * 目录不存在或临时不可读时按 fail-open 返回，下一轮发现会再次尝试。
+ */
 async function collectRolloutFiles(dir: string, files: string[]): Promise<void> {
   let entries: Dirent[];
   try {
@@ -855,6 +950,7 @@ async function collectRolloutFiles(dir: string, files: string[]): Promise<void> 
   }
 }
 
+/** 读取指定半开字节区间内所有完整 JSONL 记录，并返回实际消费到的换行后 offset。 */
 async function readJsonLines(filePath: string, startOffset: number, endOffset: number): Promise<{
   items: JsonLine[];
   nextOffset: number;
@@ -867,6 +963,12 @@ async function readJsonLines(filePath: string, startOffset: number, endOffset: n
   return { items, nextOffset };
 }
 
+/**
+ * 分块扫描 JSONL 文件，在完整换行处解析对象并顺序调用回调。
+ *
+ * `onLine` 返回 false 时立即停止；末尾没有换行的不完整记录保留到下周期，不推进 nextOffset。
+ * 文件句柄在 finally 中关闭。打开或读取失败会向上抛出，由 Input 周期统一记录。
+ */
 async function scanJsonLines(
   filePath: string,
   startOffset: number,
@@ -888,6 +990,7 @@ async function scanJsonLines(
       if (bytesRead <= 0) break;
       position += bytesRead;
 
+      // 上个 chunk 的半行与本次字节拼接后再找换行，避免把跨 chunk JSON 拆成两条坏记录。
       const data = pending.length > 0
         ? Buffer.concat([pending, chunk.subarray(0, bytesRead)])
         : chunk.subarray(0, bytesRead);
@@ -912,7 +1015,7 @@ async function scanJsonLines(
               }
             }
           } catch {
-            // Invalid completed lines are ignored but their bytes are consumed.
+            // 已换行但 JSON 无效的记录无法通过继续等待修复：忽略内容，但消费其字节以避免永久卡住。
           }
         }
         nextOffset = dataStartOffset + newline + 1;
@@ -929,6 +1032,10 @@ async function scanJsonLines(
   }
 }
 
+/**
+ * 从已知 offset 读取一条 JSONL，最多尝试 16 个 64 KiB 块；用于回读 session_meta。
+ * 找不到换行、超过上限或 JSON 无效时返回 null，文件句柄始终关闭。
+ */
 async function readJsonLineAt(filePath: string, offset: number): Promise<Record<string, unknown> | null> {
   const handle = await fs.open(filePath, 'r');
   try {
@@ -956,11 +1063,13 @@ async function readJsonLineAt(filePath: string, offset: number): Promise<Record<
   }
 }
 
+/** 从 `turn_context` 或 `task_started` 提取 turn 起点 ID，其他记录返回 null。 */
 function turnIdForStart(record: Record<string, unknown>, payload: Record<string, unknown>): string | null {
   if (record.type !== 'turn_context' && !(record.type === 'event_msg' && payload.type === 'task_started')) return null;
   return stringValue(payload.turn_id) ?? null;
 }
 
+/** 创建新的活跃 turn checkpoint，并初始化四类事件去重数组。 */
 function createActiveTurn(
   turnId: string,
   startOffset: number,
@@ -980,6 +1089,7 @@ function createActiveTurn(
   };
 }
 
+/** 从 turn_context 增量补充 model、cwd 和 developer instructions。 */
 function updateActiveTurnMetadata(
   activeTurn: CodexActiveTranscriptTurn,
   record: Record<string, unknown>,
@@ -994,6 +1104,7 @@ function updateActiveTurnMetadata(
   if (developerInstructions) activeTurn.developerInstructions = developerInstructions;
 }
 
+/** 把 checkpoint 中持久化的 turn 元数据转换为 Extractor 的恢复选项。 */
 function partialTurnOptions(activeTurn: CodexActiveTranscriptTurn): {
   startedAtMs: number;
   model?: string;
@@ -1008,6 +1119,7 @@ function partialTurnOptions(activeTurn: CodexActiveTranscriptTurn): {
   };
 }
 
+/** 解析成功后用更完整的 turn 数据回填 checkpoint，但不以 `unknown` 覆盖已有模型。 */
 function updateActiveTurnFromExtractedTurn(
   activeTurn: CodexActiveTranscriptTurn,
   turn: { model: string; cwd?: string; developerInstructions?: string },
@@ -1017,23 +1129,27 @@ function updateActiveTurnFromExtractedTurn(
   if (turn.developerInstructions) activeTurn.developerInstructions = turn.developerInstructions;
 }
 
+/** 从 task_complete/turn_aborted 提取 terminal turn ID，其他事件返回 null。 */
 function terminalTurnIdFor(record: Record<string, unknown>, payload: Record<string, unknown>): string | null {
   if (record.type !== 'event_msg' || (payload.type !== 'task_complete' && payload.type !== 'turn_aborted')) return null;
   return stringValue(payload.turn_id) ?? null;
 }
 
+/** 将未知 JSON 值安全缩窄为普通对象。 */
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
 }
 
+/** 从旧 checkpoint 中只保留真正的字符串数组元素。 */
 function stringArray(value: unknown): string[] {
   return Array.isArray(value)
     ? value.filter((item): item is string => typeof item === 'string')
     : [];
 }
 
+/** 估算事件 UTF-8 JSON 字节数；序列化异常时返回单批上限以强制单独发送。 */
 function serializedEntryBytes(entry: AgentActivityEntry): number {
   try {
     return Buffer.byteLength(JSON.stringify(entry), 'utf8');
@@ -1042,6 +1158,7 @@ function serializedEntryBytes(entry: AgentActivityEntry): number {
   }
 }
 
+/** 为首次解析失败的 terminal 创建带时间和诊断计数的重试状态。 */
 function newPendingTerminal(
   turnId: string,
   terminalEndOffset: number,
@@ -1058,6 +1175,7 @@ function newPendingTerminal(
   };
 }
 
+/** 构造所有统计为 0 的恢复诊断对象，统一不可解析分支的返回结构。 */
 function emptySegmentRecoveryDiagnostics(
   sourceRecordCount = 0,
   previouslyEmittedStepCount = 0,
@@ -1076,6 +1194,10 @@ function emptySegmentRecoveryDiagnostics(
   };
 }
 
+/**
+ * 把白名单 resourceAttributes 附加到事件；存在 worker name 时同时作为 Agent 显示名称。
+ * 此函数会原地修改传入事件数组，随后返回同一数组。
+ */
 function attachWakeupResourceAttributes(
   entries: AgentActivityEntry[],
   resourceAttributes: Record<string, JsonValue>,
@@ -1090,6 +1212,9 @@ function attachWakeupResourceAttributes(
   return entries;
 }
 
+/**
+ * 将 Builder 上下文压缩为可持久化形状：小 delta 直接保存，大 delta 改存可重读的源字节范围。
+ */
 function persistedInputContext(
   context: CodexTranscriptInputContext,
   sourceRange: CodexTranscriptSourceRange | undefined,
@@ -1105,6 +1230,7 @@ function persistedInputContext(
   };
 }
 
+/** 验证旧状态中的输入上下文，忽略不认识或类型错误的可选字段。 */
 function parseInputContext(value: unknown): CodexTranscriptInputContext | undefined {
   const context = asRecord(value);
   if (!context || typeof context.hash !== 'string') return undefined;
@@ -1119,10 +1245,12 @@ function parseInputContext(value: unknown): CodexTranscriptInputContext | undefi
   };
 }
 
+/** 把不可信 session ID 清洗为单个安全文件名片段，阻止 `..` 或路径分隔符逃逸目录。 */
 function safeWakeupSessionPart(value: string): string {
   return path.basename(String(value)).replace(/[^a-zA-Z0-9_-]/g, '_') || 'unknown';
 }
 
+/** 根据环境变量或用户主目录计算 Codex wakeup marker 默认目录。 */
 function defaultWakeupDir(): string {
   const dataDir = process.env.LOONGSUITE_PILOT_DATA_DIR || path.join(os.homedir(), '.loongsuite-pilot');
   return path.join(dataDir, 'state', 'codex', 'transcript-wakeups');

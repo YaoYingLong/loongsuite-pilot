@@ -1,6 +1,8 @@
-# Cursor hook entrypoint (Windows) — delegates to cursor-hook-processor.mjs.
+# Cursor Windows Hook 入口：把 stdin JSON 委托给 cursor-hook-processor.mjs。
+# HookManager 将本命令写入 ~/.cursor/hooks.json。processor 先追加 journal，在父 stop 时
+# 组装 ReAct 事件并写 history JSONL。
 #
-# Fail-open: any error outputs "{}" and exits 0.
+# fail-open：任何错误都输出 `{}` 并退出 0；遥测故障不能阻塞 Cursor。
 
 $ErrorActionPreference = "Continue"
 $EMPTY_RESULT = '{}'
@@ -86,14 +88,14 @@ if (-not $nodeBin) {
 }
 
 try {
-    # Read stdin as raw bytes to avoid PowerShell encoding issues (GB2312/ASCII mangles UTF-8)
+    # 原始字节读取避免 PowerShell 的 GB2312/ASCII 文本转换损坏 UTF-8 JSON。
     $stdinStream = [Console]::OpenStandardInput()
     $ms = New-Object System.IO.MemoryStream
     $stdinStream.CopyTo($ms)
     $rawBytes = $ms.ToArray()
     $ms.Dispose()
 
-    # Strip UTF-8 BOM (EF BB BF) before passing to Node.
+    # 传给 Node 前去掉 UTF-8 BOM（EF BB BF）。
     if ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF) {
         $rawBytes = $rawBytes[3..($rawBytes.Length - 1)]
     }

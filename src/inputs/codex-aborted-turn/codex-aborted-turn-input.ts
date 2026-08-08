@@ -1,3 +1,18 @@
+/**
+ * Codex 中断 turn 的旧独立恢复 Input，仅为兼容、迁移参考和现有测试保留。
+ *
+ * 重要边界：当前 `Orchestrator.registerAllInputs()` 不创建或注册本类；当前正常和中断 turn 已统一
+ * 由 `CodexTranscriptInput` 采集。根导出仍保留 `CodexAbortedTurnInput`，旧配置迁移逻辑也仍能识别
+ * `codex-aborted-turn`，但不能据此推断它位于现在的生产调用链。
+ *
+ * 历史流程：`BaseInput` 定时调用 `collect()` -> 递归发现 `~/.codex/sessions` 下 rollout JSONL ->
+ * 按字节 checkpoint 只读取新增完整行 -> 发现目标 `turn_aborted` 后回读该 turn 范围 -> extractor
+ * 聚合语义 -> builder 生成 cancelled 标准事件。首次启动对现有文件只做 baseline，避免重放历史。
+ *
+ * 外部副作用：异步读取 rollout 文件，更新 `StateStore`；恢复失败或正常完成 turn 长期缺少 Hook
+ * 状态时，向 diagnostics 目录追加 JSONL。文件轮转通过 inode 检测并重新 baseline；不完整尾行不会
+ * 推进游标。大多数单文件/诊断错误会记录或跳过，使后续轮询能够继续。
+ */
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import type { Dirent } from 'node:fs';
@@ -23,6 +38,11 @@ const DEFAULT_HOOK_STATE_DIR = '~/.loongsuite-pilot/state/codex/sessions';
 const DEFAULT_DIAGNOSTIC_DIR = '~/.loongsuite-pilot/logs/diagnostics';
 const DEFAULT_HOOK_GAP_GRACE_MS = 60_000;
 
+/**
+ * 旧恢复 Input 的路径与时间配置。
+ * `sessionDir` 是 rollout 根目录，`hookStateDir` 用于判断 Hook 是否已落状态，`diagnosticDir`
+ * 接收异常 JSONL，`hookGapGraceMs` 是完成 turn 等待 Hook 状态的宽限时间。
+ */
 export interface CodexAbortedTurnInputOptions extends InputOptions {
   sessionDir?: string;
   hookStateDir?: string;
@@ -30,12 +50,20 @@ export interface CodexAbortedTurnInputOptions extends InputOptions {
   hookGapGraceMs?: number;
 }
 
+/** 一条已成功解析的完整 JSONL 行，同时保留字节起止位置供 checkpoint 和范围回读使用。 */
 interface JsonLine {
   startOffset: number;
   endOffset: number;
   record: Record<string, unknown>;
 }
 
+/**
+ * 旧版 Codex rollout 增量 tailer 和中断 turn 恢复协调器。
+ *
+ * 类继承 `BaseInput` 的定时器和 entries 事件机制；自身不创建子进程或网络连接。`collecting`
+ * 缓存当前 Promise，避免短轮询间隔导致两个扫描周期并发修改 checkpoint。每个 rollout 文件使用
+ * 独立状态键，因此文件间互不覆盖；停止时由 BaseInput 等待当前异步周期。
+ */
 export class CodexAbortedTurnInput extends BaseInput {
   readonly id = 'codex-aborted-turn';
   readonly agentType = ClientType.CodexCliHook;
@@ -47,6 +75,10 @@ export class CodexAbortedTurnInput extends BaseInput {
   private readonly hookGapGraceMs: number;
   private collecting: Promise<AgentActivityEntry[]> | null = null;
 
+  /**
+   * 保存路径和宽限配置，不立即访问文件系统。
+   * @param opts 状态存储和可选路径；轮询默认 30 秒，Hook 缺失宽限默认 60 秒。
+   */
   constructor(opts: CodexAbortedTurnInputOptions) {
     super({
       stateStore: opts.stateStore,
@@ -58,14 +90,23 @@ export class CodexAbortedTurnInput extends BaseInput {
     this.hookGapGraceMs = opts.hookGapGraceMs ?? DEFAULT_HOOK_GAP_GRACE_MS;
   }
 
+  /** @returns 历史发现服务用于监听的默认 Codex session 目录。 */
   static getWatchPaths(): string[] {
     return [resolveHome(DEFAULT_SESSION_DIR)];
   }
 
+  /**
+   * 异步检查默认 session 目录是否存在。
+   * @returns 目录存在时为 `true`；工具函数把不可访问等情况折叠为 `false`。
+   */
   static async checkAvailability(): Promise<boolean> {
     return directoryExists(resolveHome(DEFAULT_SESSION_DIR));
   }
 
+  /**
+   * 为所有首次见到的 rollout 文件建立文件末尾 baseline，防止启动时回放历史中断 turn。
+   * 已有 checkpoint 的文件会保留 active turn，从而支持进程重启后继续恢复。
+   */
   protected override async onStart(): Promise<void> {
     for (const filePath of await this.discoverSessionFiles()) {
       const key = this.stateKey(filePath);
@@ -74,6 +115,11 @@ export class CodexAbortedTurnInput extends BaseInput {
     }
   }
 
+  /**
+   * BaseInput 定时调用的防重入口；已有扫描在执行时复用同一个 Promise，而不是再次启动扫描。
+   * `finally` 确保成功或异常后都清空标记，async 异常继续传播给 BaseInput 的周期错误处理。
+   * @returns 本轮所有文件恢复出的标准事件。
+   */
   protected override async collect(): Promise<AgentActivityEntry[]> {
     if (this.collecting) return this.collecting;
     this.collecting = this.collectOnce().finally(() => {
@@ -82,6 +128,7 @@ export class CodexAbortedTurnInput extends BaseInput {
     return this.collecting;
   }
 
+  /** 递归发现并按排序顺序串行处理 rollout 文件，汇总每个文件的恢复结果。 */
   private async collectOnce(): Promise<AgentActivityEntry[]> {
     const entries: AgentActivityEntry[] = [];
     for (const filePath of await this.discoverSessionFiles()) {
@@ -90,6 +137,13 @@ export class CodexAbortedTurnInput extends BaseInput {
     return entries;
   }
 
+  /**
+   * 增量扫描一个 rollout 文件并推进 checkpoint。
+   * inode 改变表示文件被替换，先重新 baseline；只消费以换行结束的完整 JSON；正常完成 turn 进入
+   * Hook 缺失观察队列，中断 turn 则触发恢复。文件 `stat` 失败按暂时不可用返回空数组。
+   * @param filePath rollout JSONL 绝对路径。
+   * @returns 本文件本轮恢复出的事件；同时更新内存 StateStore 状态。
+   */
   private async processFile(filePath: string): Promise<AgentActivityEntry[]> {
     const key = this.stateKey(filePath);
     let stat;
@@ -195,6 +249,12 @@ export class CodexAbortedTurnInput extends BaseInput {
     return entries;
   }
 
+  /**
+   * 从 active turn 起始 offset 回读到 abort 行末尾，并调用 extractor + builder 完成恢复。
+   * session meta 从已记录的行位置以 64 KiB 起步按单行长度扩容，不会为该位置之后的整个历史尾部
+   * 一次性分配缓冲区。
+   * @returns 可输出事件；缺少 active turn 或提取失败时返回空数组。
+   */
   private async recoverTurn(
     filePath: string,
     checkpoint: CodexAbortedCheckpoint,
@@ -216,6 +276,10 @@ export class CodexAbortedTurnInput extends BaseInput {
     return turn ? buildCodexAbortedTurnEntries(turn) : [];
   }
 
+  /**
+   * 扫描既有完整行以定位最近 session meta，然后把游标直接放到当前文件末尾。
+   * 这一步只建立起点、不输出历史事件；`stat` 失败时等待以后重新发现。
+   */
   private async baselineFile(filePath: string, key: string): Promise<void> {
     let stat;
     try {
@@ -240,16 +304,22 @@ export class CodexAbortedTurnInput extends BaseInput {
     });
   }
 
+  /** @returns 递归发现并排序后的 `rollout-*.jsonl` 路径，目录不可读时得到空数组。 */
   private async discoverSessionFiles(): Promise<string[]> {
     const files: string[] = [];
     await collectRolloutFiles(this.sessionDir, files);
     return files.sort();
   }
 
+  /** 为每个文件构造独立 StateStore 键，路径参与键值可避免多个 rollout 游标互相覆盖。 */
   private stateKey(filePath: string): string {
     return `${this.id}:${filePath}`;
   }
 
+  /**
+   * 从 StateStore 读取并逐字段校验 checkpoint；不可信或旧版本字段使用安全默认值。
+   * @returns 至少含合法 inode/offset 时返回规范对象，否则返回 `null` 触发初始化。
+   */
   private readCheckpoint(key: string): CodexAbortedCheckpoint | null {
     const raw = this.stateStore.get(key).extra?.codexAbortedTurn;
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
@@ -282,6 +352,10 @@ export class CodexAbortedTurnInput extends BaseInput {
     };
   }
 
+  /**
+   * 把专用 checkpoint 合并到现有 `extra`，并同步 `lastOffset` 供通用状态查看。
+   * 这里只更新 StateStore 内存状态，实际落盘时机由上层状态存储生命周期控制。
+   */
   private saveCheckpoint(key: string, checkpoint: CodexAbortedCheckpoint): void {
     const current = this.stateStore.get(key);
     this.stateStore.update(key, {
@@ -293,6 +367,11 @@ export class CodexAbortedTurnInput extends BaseInput {
     });
   }
 
+  /**
+   * 检查正常完成 turn 是否在宽限期后仍没有对应 Hook 状态，并追加一次诊断 JSONL。
+   * 尚在宽限期或写诊断失败的项目继续留在 pending；已经存在 Hook 状态或诊断成功的项目移除。
+   * 该方法会原地更新传入 checkpoint 的 pending/去重数组。
+   */
   private async emitDueHookGapWarnings(checkpoint: CodexAbortedCheckpoint): Promise<void> {
     const now = Date.now();
     const pending: typeof checkpoint.pendingCompletedTurns = [];
@@ -330,6 +409,10 @@ export class CodexAbortedTurnInput extends BaseInput {
     checkpoint.pendingCompletedTurns = pending;
   }
 
+  /**
+   * 中断行存在但 extractor/builder 无法生成事件时，追加带日期分片的恢复失败诊断。
+   * 诊断写入本身失败只记录 warning，不遮蔽后续文件和轮询周期。
+   */
   private async emitRecoveryFailureDiagnostic(
     filePath: string,
     turnId: string,
@@ -359,6 +442,7 @@ export class CodexAbortedTurnInput extends BaseInput {
     }
   }
 
+  /** 通过访问 `<hookStateDir>/<sessionId>.json` 判断 Hook 是否已成功记录该 session。 */
   private async hasHookState(sessionId: string): Promise<boolean> {
     try {
       await fs.access(path.join(this.hookStateDir, `${sessionId}.json`));
@@ -369,6 +453,10 @@ export class CodexAbortedTurnInput extends BaseInput {
   }
 }
 
+/**
+ * 深度优先递归收集 `rollout-*.jsonl`，结果写入调用方提供的数组。
+ * 目录不存在、权限不足或读取失败时直接返回，使一个坏目录不会终止整轮扫描。
+ */
 async function collectRolloutFiles(dir: string, files: string[]): Promise<void> {
   let entries: Dirent[];
   try {
@@ -386,6 +474,11 @@ async function collectRolloutFiles(dir: string, files: string[]): Promise<void> 
   }
 }
 
+/**
+ * 按字节范围读取 JSONL，只解析最后一个换行之前的完整行。
+ * @returns 成功解析的行及安全的下一 offset；无完整尾行时游标保持不变。
+ * @throws 文件打开或读取失败；`finally` 始终关闭文件句柄。
+ */
 async function readJsonLines(filePath: string, startOffset: number, endOffset: number): Promise<{
   items: JsonLine[];
   nextOffset: number;
@@ -412,7 +505,7 @@ async function readJsonLines(filePath: string, startOffset: number, endOffset: n
             items.push({ startOffset: lineStart, endOffset: lineEnd, record });
           }
         } catch {
-          // Invalid completed lines are ignored but still advance the cursor.
+          // 已完整换行但 JSON 无效的行会被跳过；仍推进游标，避免每轮重复解析同一坏行。
         }
       }
       cursor = newline + 1;
@@ -423,6 +516,10 @@ async function readJsonLines(filePath: string, startOffset: number, endOffset: n
   }
 }
 
+/**
+ * 从指定 offset 回读单行，缓冲区从 64 KiB 按需倍增但不会超过文件剩余大小。
+ * @returns 完整且合法的对象行；没有换行、JSON 无效或 offset 到达末尾时返回 `null`。
+ */
 async function readJsonLineAt(filePath: string, offset: number): Promise<Record<string, unknown> | null> {
   const stat = await fs.stat(filePath);
   const available = stat.size - offset;
@@ -450,6 +547,7 @@ async function readJsonLineAt(filePath: string, offset: number): Promise<Record<
   }
 }
 
+/** 校验旧状态中的 completed turn 数组并裁剪到上限，丢弃字段缺失或类型错误的项目。 */
 function readCompletedTurns(value: unknown): CodexAbortedCheckpoint['pendingCompletedTurns'] {
   if (!Array.isArray(value)) return [];
   return value.flatMap(item => {

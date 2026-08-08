@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 /**
- * Qoder Work hook transcript processor.
+ * Qoder Work / Qoder Work CN 的 Hook transcript 处理器。
  *
- * Parses transcript lines, groups assistant blocks by parentUuid
- * (= one LLM call), merges thinking+text+tool_use into unified
- * multi-part responses, assigns turn.id/step.id per spec.
+ * wrapper 传入 agentId 和 stdin Stop payload；本文件通过共享游标仅读新增 transcript 行，
+ * 按真实 user prompt 切 turn，再以 tool_result 作为 LLM 响应边界，把 thinking/text/tool_use
+ * 合为多 part response，并分配标准 turn.id/step.id。成功追加到
+ * `logs/<agentId>/history/*.jsonl` 后才推进游标。
  *
- * Follows the same architectural pattern as qoder-hook-processor.mjs
- * but adapted for QoderWork's transcript format (no progress events,
- * parentUuid-based grouping).
+ * 它与 qoder-hook-processor 共享持久化/归一化基础层，但 Qoder Work transcript 没有 progress，
+ * 且一个 LLM response 偶尔跨多个 parentUuid，因此不能简单按 parentUuid 切 step。项目真实
+ * cwd 还需从 Qoder Work SQLite 恢复；查询失败时保留 Hook sandbox cwd。所有异常由入口
+ * fail-open，不应阻塞宿主。
  */
 
 import path from 'node:path';
@@ -57,7 +59,7 @@ async function main() {
 
   const parsed = [];
   for (const line of lines) {
-    try { parsed.push(JSON.parse(line)); } catch { /* skip */ }
+    try { parsed.push(JSON.parse(line)); } catch { /* 跳过损坏行，继续处理本批其他记录。 */ }
   }
   if (!parsed.length) {
     updateLineRecord(agentId, transcriptPath, sessionId, endLine);
@@ -81,9 +83,7 @@ function processTranscript(parsed, sessionId, agentId, runtimeConfig, cwd, opts 
   const observedTs = timestampToUnixNanos(Date.now());
   const records = [];
 
-  // Skip review-copy sessions: QoderWork forks a duplicate transcript with an
-  // appended automated review task. The original session already covers the
-  // user conversation, so processing the copy would produce duplicate traces.
+  // Qoder Work 会为自动 review 复制 transcript；原 session 已覆盖用户对话，必须跳过副本防重。
   const isReviewCopy = parsed.some(row =>
     row.type === 'user' &&
     typeof row.message?.content?.[0]?.text === 'string' &&
@@ -94,7 +94,7 @@ function processTranscript(parsed, sessionId, agentId, runtimeConfig, cwd, opts 
     return records;
   }
 
-  // Filter out non-content rows
+  // 过滤元数据、progress、sidechain 和 meta，只保留真实 user/assistant 内容。
   const contentRows = parsed.filter(row => {
     const type = row.type;
     if (!type || type === 'ai-title' || type === 'last-prompt' || type === 'session_meta' || type === 'progress') return false;
@@ -105,7 +105,7 @@ function processTranscript(parsed, sessionId, agentId, runtimeConfig, cwd, opts 
 
   if (!contentRows.length) return records;
 
-  // Split into turns: each user message (non tool_result) starts a new turn
+  // 每条非 tool_result user 消息开启新 turn。
   const allTurns = splitIntoTurns(contentRows);
   const rangeReason = opts.rangeReason || 'incremental';
   const isBootstrap = rangeReason !== 'incremental';
@@ -114,8 +114,7 @@ function processTranscript(parsed, sessionId, agentId, runtimeConfig, cwd, opts 
     logDebug(agentId, `Cursor recovery (${rangeReason}): skipped ${allTurns.length - turns.length} historical turn(s), kept latest turn`);
   }
 
-  // Bootstrap recovery may discard earlier turns, so metadata must come from
-  // the selected turn rather than the beginning of the full transcript.
+  // 冷启动恢复可能丢弃前序 turn，元数据必须从最终选中 turn 获取，而非文件开头。
   const firstRow = turns[0]?.[0] || contentRows[0];
   const userId = resolveUserId(firstRow, runtimeConfig);
   const providerName = inferProviderName({ 'gen_ai.agent.type': agentId });
@@ -185,12 +184,12 @@ function isPureSystemReminder(text) {
 function buildTurnEvents(turnRows, turnId, sessionId, userId, providerName, version, observedTs, runtimeConfig, cwd, agentId) {
   const records = [];
 
-  // Find the user prompt
+  // 找到本 turn 的真实用户 prompt。
   const userRow = turnRows.find(isPromptRow);
   const promptId = userRow?.promptId || turnId;
   const turnMetadata = promptId ? { 'agent.qoderwork.promptId': promptId } : {};
 
-  // User-hook event (no step.id, no model — per §5 of EVENT_LOG_TO_TRACE_SPEC)
+  // user-hook 是 ENTRY 输入，按规范不带 step.id 和 model。
   if (userRow) {
     const userText = extractText(userRow);
     if (userText) {
@@ -210,13 +209,8 @@ function buildTurnEvents(turnRows, turnId, sessionId, userId, providerName, vers
     }
   }
 
-  // Group assistant rows by tool_result boundaries — each group = one LLM call.
-  // Reason: QoderWork sometimes splits one LLM response across multiple assistant
-  // rows with different parentUuids (e.g. thinking row + separate tool_use row).
-  // groupByParentUuid would wrongly split these into multiple "steps" and break
-  // timing (the second half would incorrectly inherit the tool_result's ts as
-  // llm.request time). Tool_result boundaries are the semantically correct split
-  // since the LLM only receives tool outputs and issues a new response at those points.
+  // 以 tool_result 为边界分 assistant 组，每组是一轮 LLM。Qoder Work 可能把同一响应的 thinking
+  // 与 tool_use 写成不同 parentUuid；按 parentUuid 会误拆 step，并把工具执行时间算进下一 LLM。
   const assistantRows = turnRows.filter(r => r.type === 'assistant');
   const toolResultRows = turnRows.filter(r => r.type === 'user' && isToolResult(r));
   const toolResultsByUseId = new Map();
@@ -233,7 +227,7 @@ function buildTurnEvents(turnRows, turnId, sessionId, userId, providerName, vers
 
   const userText = userRow ? extractText(userRow) : '';
   const userTs = userRow ? timestampToUnixNanos(userRow.timestamp) : undefined;
-  let prevToolCalls = []; // tool_call ids from previous step, for building tool_result delta
+  let prevToolCalls = []; // 上一 step 的 tool_call ID，用于构造 tool_result 增量。
   let prevStepLastToolResultTs = undefined; // 上一个 step 最后一个 tool_result 的 nano ts，用于本 step llm.request 时间
 
   let stepCounter = 0;
@@ -241,9 +235,7 @@ function buildTurnEvents(turnRows, turnId, sessionId, userId, providerName, vers
     stepCounter++;
     const stepId = `${turnId}:s${stepCounter}`;
 
-    // Build input.messages_delta for this step's llm.request:
-    // - Step 1: user prompt
-    // - Step N>1: previous step's tool results
+    // llm.request 增量：Step 1 是 user prompt；Step N>1 是前一步工具结果。
     let inputDelta;
     if (stepCounter === 1 && userText) {
       inputDelta = [{ role: 'user', parts: [{ type: 'text', content: userText }] }];
@@ -262,8 +254,7 @@ function buildTurnEvents(turnRows, turnId, sessionId, userId, providerName, vers
       }
     }
 
-    // llm.request time:
-    //   step 1 = user input ts (user message arrival, a reasonable proxy for LLM start)
+    // llm.request 时间：step 1 用 user 消息到达时间近似 LLM 开始；
     //   step N>1 = 上一个 step 最后一个 tool_result ts (工具返回后模型立刻开始处理)
     // 否则用 assistant 行写盘时间会导致 LLM span 退化为 0ms（thinking/tool_use 同毫秒批量 flush）
     const llmRequestTs = stepCounter === 1 ? userTs : prevStepLastToolResultTs;
@@ -271,7 +262,7 @@ function buildTurnEvents(turnRows, turnId, sessionId, userId, providerName, vers
     const stepRecords = buildStepEvents(group, toolResultsByUseId, stepId, turnId, sessionId, userId, providerName, version, observedTs, runtimeConfig, agentId, stepCounter === llmGroups.length, inputDelta, cwd, llmRequestTs, turnMetadata);
     records.push(...stepRecords);
 
-    // Collect this step's tool_calls for next step's input delta
+    // 收集本 step 工具调用，其结果将成为下一 step 输入增量。
     prevToolCalls = [];
     let lastToolResultTsInStep = undefined;
     for (const row of group) {
@@ -303,8 +294,7 @@ function groupByParentUuid(assistantRows) {
   const order = [];
 
   for (const row of assistantRows) {
-    // randomUUID fallback: rows without parentUuid/uuid are treated as individual LLM calls.
-    // In practice QoderWork always sets parentUuid; this is a defensive fallback only.
+    // 缺 parentUuid/uuid 的行用随机 UUID 单独分组；实际通常都有 parentUuid，这只是防御回退。
     const parentUuid = row.parentUuid || row.uuid || crypto.randomUUID();
     if (!grouped.has(parentUuid)) {
       grouped.set(parentUuid, []);
@@ -320,18 +310,12 @@ function groupByParentUuid(assistantRows) {
 }
 
 /**
- * Group consecutive assistant rows between tool_result boundaries.
+ * 按 tool_result 边界合并连续 assistant 行。
  *
- * Each group represents ONE LLM response. A tool_result row marks the
- * boundary because it delivers a tool's output back to the model — the
- * next assistant row is the start of the model's next response.
+ * 每组代表一次 LLM response；tool_result 把工具输出交还模型，之后的 assistant 才是新响应。
  *
- * Why not parentUuid: QoderWork occasionally emits a single LLM response
- * as multiple assistant rows with different parentUuids (e.g. a thinking
- * row + a separate tool_use row). Using parentUuid would incorrectly
- * split them into multiple "steps", and a "prev tool_result ts as
- * llm.request start" rule would then attribute the tool's execution time
- * to the second half's LLM time.
+ * 不按 parentUuid 的原因：一个响应可能以不同 parentUuid 写 thinking 和 tool_use；误拆后，
+ * “前一 tool_result 作为 request 开始”会错误地把工具执行时间归入后半段 LLM。
  */
 function groupAssistantRowsByToolResults(turnRows) {
   const groups = [];
@@ -346,8 +330,7 @@ function groupAssistantRowsByToolResults(turnRows) {
         current = [];
       }
     }
-    // Non-assistant non-tool_result user rows (the prompt) are ignored here;
-    // they don't end an LLM-response group.
+    // prompt 等非 tool_result user 行不结束 LLM response 组，在此忽略。
   }
   if (current.length > 0) groups.push(current);
   return groups;
@@ -367,18 +350,17 @@ function buildStepEvents(group, toolResultsByUseId, stepId, turnId, sessionId, u
   });
   const llmResponseTs = timestampToUnixNanos(thinkingRow ? thinkingRow.timestamp : lastRow.timestamp);
 
-  // Prefer message.id (chatcmpl-xxx, matches qoderwork-intercept.jsonl) for direct token matching.
-  // Fall back to parentUuid for backward compat with older QoderWork versions.
+  // 优先用可直接匹配 intercept token 的 message.id，旧版缺失时回退 parentUuid。
   const responseId = firstRow.message?.id || firstRow.parentUuid || firstRow.uuid;
 
-  // Build merged output parts
+  // 合并本次响应的全部 output part。
   const outputParts = [];
   const toolCalls = [];
 
   for (const row of group) {
     const msg = row.message || {};
     const content = Array.isArray(msg.content) ? msg.content : [];
-    // Derive content type from message.content[0].type (raw transcript has no content_type field)
+    // 原 transcript 没有 content_type，从 message.content[0].type 推导。
     const contentType = row.content_type || (content[0]?.type) || '';
 
     if (contentType === 'thinking') {
@@ -399,16 +381,8 @@ function buildStepEvents(group, toolResultsByUseId, stepId, turnId, sessionId, u
 
   const finishReason = toolCalls.length > 0 ? 'tool_calls' : (isLastStep ? 'end_turn' : 'stop');
 
-  // llm.request for this step.
-  //
-  // Field choice: gen_ai.input.messages_delta (incremental, NOT full).
-  //
-  // Each step's delta contains only the NEW content since the previous step:
-  //   - Step 1: user prompt
-  //   - Step N>1: previous step's tool_results
-  // The converter (@loongsuite/otel-util-genai) accumulates deltas across
-  // steps to reconstruct the full context window for each LLM span, which
-  // is the correct behaviour.
+  // llm.request 使用增量 `gen_ai.input.messages_delta`：Step 1 只有 prompt，后续只有前一步
+  // tool_results；converter 会跨 step 累积，重建各 LLM span 的完整上下文。
   const llmRequestFields = {
     ...turnMetadata,
     'event.name': 'llm.request',
@@ -428,7 +402,7 @@ function buildStepEvents(group, toolResultsByUseId, stepId, turnId, sessionId, u
   }
   records.push(buildRecord(llmRequestFields, firstRow, runtimeConfig, cwd));
 
-  // llm.response (merged multi-parts)
+  // 构造合并多 part 的 llm.response。
   if (outputParts.length > 0) {
     records.push(buildRecord({
       ...turnMetadata,
@@ -450,7 +424,7 @@ function buildStepEvents(group, toolResultsByUseId, stepId, turnId, sessionId, u
     }, firstRow, runtimeConfig, cwd));
   }
 
-  // tool.call + tool.result events
+  // 构造 tool.call 与 tool.result 事件。
   for (const tc of toolCalls) {
     records.push(buildRecord({
       ...turnMetadata,
@@ -469,7 +443,7 @@ function buildStepEvents(group, toolResultsByUseId, stepId, turnId, sessionId, u
       version,
     }, firstRow, runtimeConfig, cwd));
 
-    // Find matching tool_result
+    // 按 tool_use_id 查找对应 tool_result。
     const matchingResult = toolResultsByUseId.get(tc.id);
     if (matchingResult) {
       const { row: resultRow, block: resultBlock } = matchingResult;
@@ -535,12 +509,10 @@ function extractText(row) {
 }
 
 /**
- * Resolve QoderWork sandbox cwd to the real project directory.
+ * 把 Qoder Work sandbox cwd 解析为用户真实项目目录。
  *
- * QoderWork stores the user's chosen project path in SQLite
- * (chats.additional_directories), but the hook payload only contains
- * the internal sandbox path (~/.qoderwork/workspace/<chatId>).
- * We query the DB to recover the real project path.
+ * Hook 只有 `~/.qoderwork/workspace/<chatId>`，真实路径位于 SQLite
+ * `chats.additional_directories`；本函数只读查询恢复它，失败时返回原 cwd。
  */
 function resolveQoderWorkProjectDir(sandboxCwd, agentId) {
   if (!sandboxCwd) return undefined;
@@ -576,4 +548,4 @@ function resolveQoderWorkProjectDir(sandboxCwd, agentId) {
 
 export { extractText, getTurnIdForRows, isSystemInjection, isToolResult, splitIntoTurns };
 
-main().catch(() => { /* fail-open */ });
+main().catch(() => { /* 遵循 fail-open，吞掉采集异常。 */ });

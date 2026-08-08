@@ -1,3 +1,4 @@
+/** Qoder CN 数据库结构专用 token 样本读取器。 */
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -18,6 +19,10 @@ export interface SqliteTokenData {
   model?: string;
 }
 
+/**
+ * 从当前平台的 Qoder CN 数据库查询指定 session 的 assistant token 记录。
+ * 数据库不存在或查询失败时返回空数组，调用方可继续用其他 token 来源。
+ */
 export async function readSqliteTokensForSession(sessionId: string): Promise<SqliteTokenData[]> {
   const dbPath = resolveQoderCnDbPath();
   if (!dbPath) return [];
@@ -75,6 +80,7 @@ export async function readSqliteTokensForSession(sessionId: string): Promise<Sql
   return results;
 }
 
+/** 按平台计算 CN 数据库候选路径，并返回第一个可访问文件。 */
 function resolveQoderCnDbPath(): string | null {
   const appdata = process.env.APPDATA ?? path.join(os.homedir(), 'AppData', 'Roaming');
   const candidates = process.platform === 'darwin'
@@ -94,6 +100,7 @@ function resolveQoderCnDbPath(): string | null {
   return null;
 }
 
+/** 解析 token_info；输入和输出均为 0 时不把它当作有效样本。 */
 function parseTokenInfo(raw: string): { promptTokens: number; completionTokens: number; cachedTokens: number } | null {
   try {
     const obj = JSON.parse(raw);
@@ -107,6 +114,7 @@ function parseTokenInfo(raw: string): { promptTokens: number; completionTokens: 
   }
 }
 
+/** 从 message.model_info JSON 读取 model_key。 */
 function parseModelKey(raw: string | null | undefined): string | undefined {
   if (!raw) return undefined;
   try {
@@ -119,6 +127,7 @@ function parseModelKey(raw: string | null | undefined): string | undefined {
   }
 }
 
+/** model_info 缺失时从关联 record.extra.modelConfig.key 回退读取。 */
 function parseRecordModelKey(raw: string | null | undefined): string | undefined {
   if (!raw) return undefined;
   try {
@@ -130,6 +139,7 @@ function parseRecordModelKey(raw: string | null | undefined): string | undefined
   }
 }
 
+/** 把 sqlite3 只读查询包装为 Promise；查询错误拒绝，关闭错误只写 debug 日志。 */
 function queryReadonly<T>(dbPath: string, sql: string, params: unknown[]): Promise<T[]> {
   return new Promise((resolve, reject) => {
     const db = new sqlite3.Database(dbPath, sqlite3.OPEN_READONLY, (openErr) => {

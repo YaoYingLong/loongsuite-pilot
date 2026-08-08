@@ -1,3 +1,14 @@
+/**
+ * Agent JSON settings 中 Hook 条目的底层读写器。
+ *
+ * HookStrategy 把声明转换为 HookDefinition 后调用本类。它按 JSON 路径读取/创建数组，
+ * 识别本项目 marker，去重安装或精准卸载 flat/nested Hook，并在 Windows 把脚本包装
+ * 成 PowerShell 命令。写入前保留用户已有配置，必要时创建目录和 settings 文件；
+ * Hook 脚本自身位于 `<dataDir>/hooks`，history 日志位于 `<dataDir>/logs`。公开 I/O
+ * 方法会捕获文件错误、记录日志并返回 false，Strategy 再转换为 DeployResult。
+ */
+
+
 import * as fs from 'node:fs/promises';
 import * as fsSync from 'node:fs';
 import * as path from 'node:path';
@@ -14,6 +25,7 @@ const logger = createLogger('HookManager');
 const hookExt = process.platform === 'win32' ? '.ps1' : '.sh';
 const isWin = process.platform === 'win32';
 
+/** Windows 用 PowerShell 包装 ps1；Unix 直接返回脚本与可选参数。 */
 function wrapHookCommand(scriptPath: string, args?: string): string {
   if (!isWin) return args ? `${scriptPath} ${args}` : scriptPath;
   const cmd = `powershell -NoProfile -ExecutionPolicy Bypass -File "${scriptPath}"`;
@@ -21,49 +33,48 @@ function wrapHookCommand(scriptPath: string, args?: string): string {
 }
 
 export interface HookDefinition {
-  /** Agent identifier (e.g. "qoder", "claude"). */
+  /** Agent 稳定 ID，例如 qoder、claude。 */
   agentId: string;
-  /** Path to the agent's settings file (e.g. ~/.qoder/settings.json). */
+  /** Agent settings 文件路径。 */
   settingsPath: string;
-  /** JSON path to inject hooks into (e.g. ["hooks", "PostToolUse"]). */
+  /** 注入数组的 JSON 路径，例如 ["hooks", "PostToolUse"]。 */
   hookJsonPath: string[];
-  /** The hook command to inject. */
+  /** 要写入的完整命令字符串。 */
   hookCommand: string;
-  /** Matcher pattern for the hook. */
+  /** 可选 Hook matcher。 */
   matcher?: string;
-  /** Optional explicit history log directory for agents whose control id differs from storage path. */
+  /** 控制 ID 与存储路径不同时显式指定 history 目录。 */
   historyDir?: string;
-  /** Hook commands that should be removed when installing this definition. */
+  /** 安装当前定义时应移除的历史命令 marker。 */
   replaceHookCommands?: string[];
   /**
-   * If true, use Qoder's nested format:
+   * true 使用 Qoder nested 格式：
    *   { matcher: "...", hooks: [{ command, type }] }
-   * Otherwise use flat format:
+   * false 使用 flat 格式：
    *   { command, type, matcher }
    */
   useNestedFormat?: boolean;
 }
 
 /**
- * Manages installation and removal of hook scripts into AI tools' config files.
+ * 在 AI 工具配置文件中安装和移除 Hook 命令。
  *
- * Hook injection flow:
- *   1. Read tool's settings.json
- *   2. Navigate to the hookJsonPath
- *   3. Append the hook command entry if not already present
- *   4. Write back settings.json
+ * 流程：读取 settings -> 沿 hookJsonPath 创建对象/数组 -> 移除历史命令 -> 幂等追加
+ * 当前 flat/nested 条目 -> 原子写回 -> 确保 Agent history 目录。
  */
 export class HookManager {
   private readonly hookScriptDir: string;
   private readonly logBaseDir: string;
 
+  /** 路径省略时使用默认 Pilot hooks/logs；构造阶段不访问磁盘。 */
   constructor(hookScriptDir?: string, logBaseDir?: string) {
     this.hookScriptDir = hookScriptDir ?? resolveHome('~/.loongsuite-pilot/hooks');
     this.logBaseDir = logBaseDir ?? resolveHome('~/.loongsuite-pilot/logs');
   }
 
   /**
-   * Install a hook into the target tool's configuration.
+   * 安装 Hook；已有相同命令时保持幂等，但若删除过 replaceHookCommands 仍会写回。
+   * @returns 成功 true；所有读写/解析异常捕获后返回 false。
    */
   async installHook(def: HookDefinition): Promise<boolean> {
     try {
@@ -114,7 +125,7 @@ export class HookManager {
       updatedArr.push(hookEntry);
       await writeJsonFile(def.settingsPath, settings);
 
-      // Ensure log directory for this agent
+      // Hook 成功写入后确保对应 Agent history 目录存在。
       await ensureDir(def.historyDir ?? path.join(this.logBaseDir, def.agentId, 'history'));
 
       logger.info('hook installed', { agentId: def.agentId });
@@ -129,7 +140,8 @@ export class HookManager {
   }
 
   /**
-   * Remove a previously installed hook.
+   * 删除当前和历史替换命令；事件数组清空时移除该 JSON key。
+   * @returns settings 不存在也视为幂等成功，异常返回 false。
    */
   async uninstallHook(def: HookDefinition): Promise<boolean> {
     try {
@@ -162,7 +174,7 @@ export class HookManager {
   }
 
   /**
-   * Check if a hook is currently installed.
+   * 只读检查当前命令存在且历史替换命令均不存在；任何异常返回 false 触发修复。
    */
   async isHookInstalled(def: HookDefinition): Promise<boolean> {
     try {
@@ -190,8 +202,7 @@ export class HookManager {
   }
 
   /**
-   * Build hook definitions for Cursor.
-   * Registers cursor-loongsuite-pilot-hook.sh into ~/.cursor/hooks.json for key events.
+   * 为 Cursor 关键事件构造指向 cursor-loongsuite-pilot-hook 的定义数组。
    */
   static buildCursorHooks(loongsuitePilotDir?: string): HookDefinition[] {
     const baseDir = loongsuitePilotDir ?? resolveHome('~/.loongsuite-pilot');
@@ -223,7 +234,7 @@ export class HookManager {
   }
 
   /**
-   * Build hook definitions for Qoder CLI (Stop only).
+   * 构造 Qoder CLI Stop Hook。
    */
   static buildQoderCliHooks(loongsuitePilotDir?: string): HookDefinition[] {
     const baseDir = loongsuitePilotDir ?? resolveHome('~/.loongsuite-pilot');
@@ -243,7 +254,7 @@ export class HookManager {
   }
 
   /**
-   * Build hook definitions for Qoder Work (Stop only).
+   * 构造 Qoder Work Stop Hook。
    */
   static buildQoderWorkHooks(loongsuitePilotDir?: string): HookDefinition[] {
     const baseDir = loongsuitePilotDir ?? resolveHome('~/.loongsuite-pilot');
@@ -272,6 +283,7 @@ export class HookManager {
     ];
   }
 
+  /** 构造 Qoder Work CN Stop Hook，并显式映射其 history 目录。 */
   static buildQoderWorkCNHooks(loongsuitePilotDir?: string): HookDefinition[] {
     const baseDir = loongsuitePilotDir ?? resolveHome('~/.loongsuite-pilot');
     const command = wrapHookCommand(`${baseDir}/hooks/qoderworkcn-loongsuite-pilot-hook${hookExt}`);
@@ -300,15 +312,14 @@ export class HookManager {
   }
 
   /**
-   * @deprecated Use buildQoderCliHooks() instead.
+   * @deprecated 使用 buildQoderCliHooks()；这里只返回数组首项兼容旧调用方。
    */
   static buildQoderCliHook(loongsuitePilotDir?: string): HookDefinition {
     return HookManager.buildQoderCliHooks(loongsuitePilotDir)[1];
   }
 
   /**
-   * Build a standard hook definition for any MCP-compatible tool
-   * that supports PostToolUse hooks.
+   * 为支持 PostToolUse 的 MCP 兼容工具构造通用 flat Hook 定义。
    */
   static buildGenericHook(opts: {
     agentId: string;
@@ -326,8 +337,7 @@ export class HookManager {
   }
 
   /**
-   * Check if a command string exists in a hook array entry,
-   * supporting both flat ({ command }) and nested ({ hooks: [{ command }] }) formats.
+   * 检查单个数组条目是否含精确命令，兼容 flat 与 nested 两种结构。
    */
   private entryMatchesCommand(entry: any, command: string): boolean {
     if (entry.command === command) return true;
@@ -337,16 +347,19 @@ export class HookManager {
     return false;
   }
 
+  /** 判断数组任一条目是否匹配命令。 */
   private isCommandPresent(arr: any[], command: string): boolean {
     return arr.some((entry: any) => this.entryMatchesCommand(entry, command));
   }
 
+  /** 从数组中移除匹配任一命令的 flat/nested 内容，并保留第三方条目。 */
   private removeCommands(arr: any[], commands: string[]): any[] {
     return arr
       .map((entry: any) => this.removeCommandsFromEntry(entry, commands))
       .filter((entry: any) => entry !== null);
   }
 
+  /** nested 子数组删空时返回 null 让外层删除 group；未命中时保留原 entry。 */
   private removeCommandsFromEntry(entry: any, commands: string[]): any | null {
     if (commands.includes(entry.command)) return null;
     if (!Array.isArray(entry.hooks)) return entry;

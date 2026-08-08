@@ -15,6 +15,9 @@
  * 关键 bug fix(均已保留):
  *   9.6 system_instructions / tool.definitions 提取
  *   9.9 byteOffset 增量 + turn_id 关联 + 心跳去重 + total_tokens 用源值
+ *
+ * 注意：当前生产 Hook 只写 wakeup marker，正式解析由 `src/inputs/codex-transcript/` 完成；
+ * 仓库内只有单元测试直接导入本解析器。它可能仍用于外部旧插件兼容，保留原因待确认。
  */
 
 import fs from 'node:fs';
@@ -44,7 +47,7 @@ import fs from 'node:fs';
  * @typedef {object} TranscriptData
  * @property {string} model
  * @property {string} modelProvider
- * @property {TokenUsage[]} tokenEvents 扁平视图(按 transcript 顺序),fallback 用
+ * @property {TokenUsage[]} tokenEvents 按 transcript 顺序排列的扁平视图，供回退路径使用。
  * @property {Map<string, TokenUsage[]>} tokenEventsByTurn 按 turn_id 分组(主消费路径)
  * @property {TokenUsage|null} totalUsage
  * @property {Array<{type:string, content:string}>=} systemInstruction
@@ -56,7 +59,7 @@ import fs from 'node:fs';
  * @property {TokenUsage|null} lastEmittedUsage 跨调用心跳去重锚点
  */
 
-const MAX_TRANSCRIPT_READ_BYTES = 50 * 1024 * 1024; // 50MB
+const MAX_TRANSCRIPT_READ_BYTES = 50 * 1024 * 1024; // 单次最多读取 50 MB。
 
 function parseMaybeJsonValue(value) {
   if (typeof value !== 'string') return value ?? null;
@@ -216,8 +219,7 @@ export function parseTranscript(transcriptPath, byteOffset = 0, initialLastUsage
   // 混入的子 agent pre/post_tool_use 事件。
   const parentToolCallIds = new Set();
 
-  // These turns are exported by the transcript recovery input instead of a
-  // normal Stop hook, preventing duplicate traces if Codex emits both.
+  // 中止 turn 由 transcript recovery input 导出，不走普通 Stop，避免两路同时出现时生成重复 trace。
   const abortedTurnIds = new Set();
 
   // 子 agent 信息列表。从 spawn_agent 的 function_call_output 中提取。
@@ -249,7 +251,7 @@ export function parseTranscript(transcriptPath, byteOffset = 0, initialLastUsage
     const payload = entry.payload;
     if (!payload || typeof payload !== 'object') continue;
 
-    // Track the last non-web_search timestamp for approximating web_search duration
+    // 记录最近一个非 web_search 时间戳，用作推算 web_search 的开始时间。
     const payloadTypeForTs = payload.type;
     if (payloadTypeForTs !== 'web_search_end' && payloadTypeForTs !== 'web_search_call') {
       const ts = entryTimestampSeconds(entry);
@@ -341,7 +343,7 @@ export function parseTranscript(transcriptPath, byteOffset = 0, initialLastUsage
           const usage = parseTokenUsage(info.last_token_usage);
           // 跨 turn 全局去重:与上一次已采纳值相同 → 心跳事件,跳过
           if (lastEmittedUsage && tokenUsageEqual(lastEmittedUsage, usage)) {
-            // skip heartbeat
+            // 与锚点相同的是重复心跳，跳过而不计入本 turn 用量。
           } else {
             const tid = currentTurnId ?? '';
             tokenEvents.push(usage);

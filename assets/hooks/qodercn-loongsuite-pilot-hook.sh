@@ -1,21 +1,21 @@
 #!/usr/bin/env bash
+# 通过 PATH 定位 Bash；严格模式尽早暴露未定义变量、失败命令和失败管道。
 set -euo pipefail
 
 # ============================================================================
-# QoderCN Hook Script — delegates to qoder-hook-processor.mjs
+# Qoder CN Hook 入口：把 stdin JSON 委托给 qoder-hook-processor.mjs。
 # ============================================================================
-# Usage:
+# 调用方式：
 #   qodercn-loongsuite-pilot-hook.sh [agent-id]
 #
-#   agent-id  Optional. Defaults to "qoder-cn".
+#   agent-id  可选，默认 `qoder-cn`，用于选择归一化变体和日志目录。
 #
-# Installation:
-#   HookManager copies this script + qoder-hook-processor.mjs +
-#   shared/hook-processor-base.mjs to ~/.loongsuite-pilot/hooks/
-#   and injects the command into ~/.qoder-cn/settings.json
+# 安装器复制本脚本、processor 和 shared 模块后，HookManager 将命令注入
+# ~/.qoder-cn/settings.json。processor 读取 transcript 增量并写 history JSONL。
+# 所有采集错误最终均以 exit 0 收敛，不能阻塞 Qoder CN。
 # ============================================================================
 
-# Skip immediately when stdin is a terminal (no payload)
+# stdin 是终端表示没有 Hook payload，人工调用时立即成功返回。
 [[ -t 0 ]] && exit 0
 
 AGENT_ID="${1:-qoder-cn}"
@@ -23,7 +23,7 @@ AGENT_ID="${1:-qoder-cn}"
 HOOKS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROCESSOR="$HOOKS_DIR/qoder-hook-processor.mjs"
 
-# Fail silently if the processor is missing
+# processor 不存在时静默退出，部署异常不得影响 Agent。
 [[ -f "$PROCESSOR" ]] || exit 0
 
 MIN_NODE_MAJOR=18
@@ -55,7 +55,7 @@ NODE_PIN_FILE="$HOME/.loongsuite-pilot/node-bin"
 
 NODE_BIN=""
 
-# 1. Try pinned node
+# 1. 优先使用安装器记录在 node-bin 中的 Node。
 if [[ -f "$NODE_PIN_FILE" ]]; then
   pinned="$(cat "$NODE_PIN_FILE" 2>/dev/null | tr -d '[:space:]')"
   if [[ -n "$pinned" ]] && node_is_suitable "$pinned"; then
@@ -63,7 +63,7 @@ if [[ -f "$NODE_PIN_FILE" ]]; then
   fi
 fi
 
-# 2. Fallback search (read-only — does NOT update pin)
+# 2. 只读搜索 nvm/Volta/fnm/PATH，不在 Hook 中修改 node-bin。
 if [[ -z "$NODE_BIN" ]]; then
   nvm_candidates=("$HOME/.nvm/versions/node"/*/bin/node)
   candidates=()

@@ -1,3 +1,14 @@
+/**
+ * Updater 事件、运行状态及 Collector 健康告警记录器。
+ *
+ * Updater 在检查、下载、部署、重启和失败阶段调用 `record()`；本类把事件缓冲后周期
+ * 写本地 JSONL/内部 sender，并持续检查 Collector PID、命令行和启动崩溃 breadcrumb。
+ * 连续健康失败达到阈值才告警，且有一小时冷却，避免短暂重启造成噪声。`start()` 创建
+ * 多个 timer，`stop()` 清理并 flush；发送失败被记录但不改变更新事务结果。
+ */
+
+
+
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { appendLine, ensureDir } from '../utils/fs-utils.js';
@@ -50,6 +61,12 @@ export interface UpdaterMetricsOptions {
   collectorLiveness?: (pidFile: string) => ProcessLiveness;
 }
 
+/**
+ * Updater 专用事件/告警缓冲器和 Collector 活性探针。
+ *
+ * 事件先进入内存队列，每 30 秒 flush 到本地 metric_alarm JSONL 并调用内部 sender；
+ * Collector 每分钟检查，启动宽限 3 分钟、连续两次失败、一小时告警冷却。
+ */
 export class UpdaterMetrics {
   private readonly logsDir: string;
   private readonly dataDir: string;
@@ -67,6 +84,7 @@ export class UpdaterMetrics {
   private collectorConsecutiveFailures = 0;
   private lastCollectorAlarmAt = 0;
 
+  /** 保存路径、身份和可注入活性探针；构造阶段不创建 timer。 */
   constructor(opts: UpdaterMetricsOptions) {
     this.logsDir = path.join(opts.dataDir, 'logs', 'metric_alarm');
     this.dataDir = opts.dataDir;
@@ -78,6 +96,7 @@ export class UpdaterMetrics {
     this.ip = resolveLocalIp();
   }
 
+  /** 确保日志目录并启动 unref 健康/flush timer，随后立即检查一次 Collector。 */
   async start(): Promise<void> {
     this.startedAt = Date.now();
     await ensureDir(this.logsDir);
@@ -91,6 +110,7 @@ export class UpdaterMetrics {
     void this.checkCollectorHealth();
   }
 
+  /** 清 timer 并等待最后一批队列 flush。 */
   async stop(): Promise<void> {
     if (this.healthTimer) {
       clearInterval(this.healthTimer);
@@ -103,6 +123,7 @@ export class UpdaterMetrics {
     await this.flush();
   }
 
+  /** 组装公共 version/user/ip/秒时间戳并入事件队列；不立即 I/O。 */
   writeEvent(
     eventType: UpdaterEventType,
     extra?: Partial<Omit<UpdaterEvent, 'event_type' | 'version' | 'user_id' | 'ip' | '__time__'>>,
@@ -117,6 +138,7 @@ export class UpdaterMetrics {
     });
   }
 
+  /** 组装统一 AlarmEntry 并入告警队列。 */
   writeAlarm(type: AlarmType, level: AlarmLevel, message: string): void {
     this.alarmQueue.push({
       alarm_type: type,
@@ -130,6 +152,10 @@ export class UpdaterMetrics {
     });
   }
 
+  /**
+   * 首次检测可疑 userId 后补告警，交换队列快照，再分别写本地并调用 sender。写盘失败只
+   * 告警，队列不会回放；sender 的错误语义由内部实现负责。
+   */
   private async flush(): Promise<void> {
     if (!this.userIdAlarmEmitted && /^\{.*\}$/.test(this.userId)) {
       this.userIdAlarmEmitted = true;
@@ -174,6 +200,10 @@ export class UpdaterMetrics {
     }
   }
 
+  /**
+   * 结合 PID 文件和进程扫描判断 Collector。恢复时清失败计数；宽限后连续失败达阈值且
+   * 超过冷却才排入 SERVICE_NOT_RUNNING_ALARM。
+   */
   private checkCollectorHealth(): void {
     const liveness = this.collectorLiveness(this.collectorPidFile);
     if (liveness.running) {
@@ -211,8 +241,8 @@ export class UpdaterMetrics {
     );
   }
 
-  // Enrich the not-running alarm (after #133 debounce has confirmed absence) with the
-  // real startup-failure cause the dying collector recorded — message only, no schema change.
+  // 活性防抖确认缺失后，把 Collector 写下的真实启动原因补进 message，不改变告警 schema。
+  /** 读取 startup crash breadcrumb 并拼稳定 cause/detail/phase/version。 */
   private buildNotRunningMessage(livenessReason: string): string {
     const base = `loongsuite-pilot collector process is not running after ${this.collectorConsecutiveFailures} checks: ${livenessReason}`;
     const breadcrumb = readStartupCrash(this.dataDir);

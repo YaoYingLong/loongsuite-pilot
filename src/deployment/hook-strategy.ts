@@ -1,3 +1,14 @@
+/**
+ * Hook 模式 Agent 的部署、修复与卸载策略。
+ *
+ * DeploymentManager 调用本类把 agents.d 中的事件声明转换为 HookDefinition，再由
+ * HookManager 修改 Agent settings。部署会移除 retired/replaced 命令、按平台包装
+ * PowerShell、为事件附加子命令，并为 Codex 额外写 trust hash；Kiro 还有 Agent 配置
+ * 文件与默认 Agent 的兼容步骤。`needsDeploy()` 供启动和 Watchdog 判断自愈，单个设置
+ * 文件异常转成 DeployResult 或由上层 best-effort 隔离。
+ */
+
+
 import * as path from 'node:path';
 import type {
   AgentDefinition,
@@ -28,9 +39,8 @@ function eventToSubcommand(event: string): string {
 }
 
 /**
- * On Windows, .ps1 scripts must be invoked via `powershell -File` for stdin
- * piping to work correctly.  Bare `.ps1` paths fail to receive stdin when
- * spawned through cmd.exe / child_process.
+ * Windows 必须用 `powershell -File` 调用 ps1 才能正确接收 stdin；经 cmd/child_process
+ * 直接执行裸 ps1 路径会丢失管道输入。
  */
 function wrapPs1Command(cmd: string): string {
   if (process.platform !== 'win32') return cmd;
@@ -61,17 +71,28 @@ function formatHookCommand(
   return cmd;
 }
 
+/**
+ * agents.d Hook 声明的 DeployStrategy 实现。
+ *
+ * detect/needsDeploy 只读检查；deploy/undeploy 通过 HookManager 修改 Agent JSON，Codex
+ * 还同步 config.toml trust，Kiro 使用专用 flat Agent 文件格式。
+ */
 export class HookStrategy implements DeployStrategy {
   private readonly hookManager: HookManager;
 
+  /** @param hookManager 负责 settings JSON 具体数组读写。 */
   constructor(hookManager: HookManager) {
     this.hookManager = hookManager;
   }
 
+  /** 按声明路径/命令判断 Agent 是否存在。 */
   async detect(def: AgentDefinition): Promise<boolean> {
     return detectAgent(def.detection);
   }
 
+  /**
+   * 检查专用设置结构、预期 Hook、retired Hook 和 Codex version 字段；任一不符合即需修复。
+   */
   async needsDeploy(def: AgentDefinition, _record?: DeployedAgentRecord): Promise<boolean> {
     if (await this.needsSettingsRepairForCodex(def)) {
       return true;
@@ -95,6 +116,7 @@ export class HookStrategy implements DeployStrategy {
     return false;
   }
 
+  /** Codex hooks.json 只能有 hooks 顶层字段；存在历史 version 或结构损坏时需要修复。 */
   private async needsSettingsRepairForCodex(def: AgentDefinition): Promise<boolean> {
     const settingsPath = def.hook?.settingsPath;
     if (!settingsPath) return false;
@@ -106,6 +128,10 @@ export class HookStrategy implements DeployStrategy {
     return existing?.version !== undefined;
   }
 
+  /**
+   * 确保 settings 文件，移除 retired/replaced Hook，安装当前事件，合并可选 env，最后为
+   * Codex 写 trust。Kiro 分支采用专用格式并提前返回。
+   */
   async deploy(def: AgentDefinition): Promise<DeployResult> {
     const hookConfig = def.hook;
     if (!hookConfig) {
@@ -117,11 +143,8 @@ export class HookStrategy implements DeployStrategy {
 
       // Kiro CLI: settingsPath 是整个 Agent 定义 JSON，需要顶层 name + tools +
       // hooks:<event>:[{command, matcher}]（flat，无 type 字段）。
-      // NOTE: this branch returns early — it does NOT run retiredEvents cleanup
-      // or env injection (applyEnvToSettings). kiro-cli.json currently declares
-      // neither field, so this is a no-op today; if retiredEvents/env are added
-      // later, deployKiroAgent must handle them explicitly (or route through the
-      // standard flow) — don't assume the shared path covers them.
+      // 此分支提前返回，不执行共享 retiredEvents/env。当前 Kiro 声明没有这两项；未来
+      // 若增加，必须在 deployKiroAgent 显式实现，不能假设共享路径会覆盖。
       if (hookConfig.kiroAgent) {
         await this.deployKiroAgent(def);
         logger.info('hooks deployed', { agentId: def.id, events: hookConfig.events.length });
@@ -149,8 +172,7 @@ export class HookStrategy implements DeployStrategy {
         try {
           await this.applyEnvToSettings(hookConfig.settingsPath, hookConfig.env);
         } catch (err) {
-          // env injection failure must not block hook deployment — pilot can still
-          // collect the basic transcript-based events without preload.
+          // env 注入失败不阻断 Hook；无 preload 时仍可采集基础 transcript 事件。
           logger.warn('settings.env merge failed (non-blocking)', {
             agentId: def.id,
             error: String(err),
@@ -264,6 +286,7 @@ export class HookStrategy implements DeployStrategy {
     }
   }
 
+  /** 卸载当前、retired 及 replaceHookCommands 匹配项；Codex 同时移除 trust block。 */
   async undeploy(def: AgentDefinition): Promise<boolean> {
     const hookDefs = this.buildHookDefinitions(def);
     let allOk = true;
@@ -307,14 +330,14 @@ export class HookStrategy implements DeployStrategy {
         const cmd = formatHookCommand(hookCommand, event, def.hook!.eventSubcommand);
         for (let i = 0; i < arr.length; i++) {
           const entry = arr[i];
-          // nested: {hooks: [{command}]}
+          // nested 结构：{hooks: [{command}]}。
           if (Array.isArray(entry?.hooks)) {
             if (entry.hooks.some((h: any) => h.command === cmd)) {
               result[event] = i;
               break;
             }
           }
-          // flat: {command}
+          // flat 结构：{command}。
           if (entry?.command === cmd) {
             result[event] = i;
             break;
@@ -322,12 +345,13 @@ export class HookStrategy implements DeployStrategy {
         }
       }
     } catch {
-      // 读取失败时 fallback 全 0(首次安装、无其他 hook 时是对的)
+      // 读取失败时回退下标 0；首次安装且无第三方 Hook 时成立。
     }
 
     return result;
   }
 
+  /** 把当前事件逐一转换为 HookDefinition，并按 eventSubcommand 拼出精确命令。 */
   private buildHookDefinitions(def: AgentDefinition): HookDefinition[] {
     const hookConfig = def.hook;
     if (!hookConfig) return [];
@@ -345,6 +369,7 @@ export class HookStrategy implements DeployStrategy {
     }));
   }
 
+  /** 把 retiredEvents 转换为仅用于卸载的 HookDefinition。 */
   private buildRetiredHookDefinitions(def: AgentDefinition): HookDefinition[] {
     const hookConfig = def.hook;
     if (!hookConfig?.retiredEvents?.length) return [];
@@ -365,25 +390,18 @@ export class HookStrategy implements DeployStrategy {
   }
 
   /**
-   * Merge env entries from the agent hook config into the settings file's
-   * top-level `env` block. Supports `$PILOT_DATA` token expansion.
+   * 把 Hook 声明 env 合并进 settings 顶层 env。
    *
-   * Idempotency:
-   *   - Regular keys overwrite if already present.
-   *   - `BUN_OPTIONS` is treated as a space-separated flag list. If the
-   *     existing value already contains the same `--preload=<path>` we are
-   *     about to add, the write is skipped (allows coexistence with user's
-   *     own preload scripts).
+   * 幂等规则：普通 key 覆盖旧值；BUN_OPTIONS 视为空格分隔 flag，若已含相同 preload
+   * token 则不重复追加，以便与用户 preload 共存。
    *
-   * Failure here is non-fatal — caller in deploy() wraps in try/catch.
+   * 失败为非致命，deploy 调用方负责捕获。
    */
   private async applyEnvToSettings(
     settingsPath: string,
     env: Record<string, string>,
   ): Promise<void> {
-    // NOTE: $PILOT_DATA tokens in `env` values are already resolved by
-    // AgentDefLoader.resolveVariables() before the config reaches here
-    // (see agent-def-loader.ts), so no further expansion is needed.
+    // `$PILOT_DATA` 已由 AgentDefLoader 递归展开，此处不再处理。
     const existing =
       (await readJsonFile<Record<string, unknown>>(settingsPath)) ?? {};
     const envBlock =
@@ -394,13 +412,11 @@ export class HookStrategy implements DeployStrategy {
       if (key === 'BUN_OPTIONS') {
         const current = envBlock[key];
         if (typeof current === 'string' && current.length > 0) {
-          // Match against full whitespace-delimited tokens to avoid a
-          // superstring false-positive (e.g., `...intercept.mjs-debug`
-          // would otherwise be treated as already containing our path).
+          // 按完整空白分隔 token 匹配，避免 `intercept.mjs-debug` 之类超字符串误判。
           const ourTokens = value.split(/\s+/).filter(Boolean);
           const currentTokens = current.split(/\s+/).filter(Boolean);
           if (ourTokens.every((t) => currentTokens.includes(t))) {
-            continue; // already injected (exact tokens present)
+            continue; // 精确 token 已存在，说明无需重复注入。
           }
           envBlock[key] = `${current} ${value}`.trim();
           changed = true;
@@ -464,28 +480,21 @@ export class HookStrategy implements DeployStrategy {
     merged['hooks'] = hooks;
     await writeJsonFile(settingsPath, merged);
 
-    // Make pilot-kiro the default agent so users can run `kiro-cli` without
-    // `--agent pilot-kiro`. Only set when missing — don't override a user's
-    // explicit choice (they can still pass --agent for a one-off override).
+    // 仅在缺失时设默认 pilot-kiro，不覆盖用户显式选择；用户仍可临时传 --agent。
     await this.setKiroDefaultAgentIfMissing(agent.name);
   }
 
   /**
-   * Set `chat.defaultAgent = <agentName>` in ~/.kiro/settings/cli.json when not
-   * already set, so kiro-cli launches with the pilot agent by default.
+   * ~/.kiro/settings/cli.json 尚未设置时写 chat.defaultAgent，使 Kiro 默认加载 Pilot Agent。
    */
   private async setKiroDefaultAgentIfMissing(agentName: string): Promise<void> {
-    // NOTE: distinct from hookConfig.settingsPath (~/.kiro/agents/pilot-kiro.json).
-    // This is Kiro's CLI-level settings file — a different concern (default-agent
-    // selection, not the agent definition). Kiro fixes both paths; if the config
-    // root ever moves, update this literal alongside settingsPath rather than
-    // coupling them via a new config field (they're not 1:1 related).
+    // 这是 CLI 默认选择文件，不是 hookConfig.settingsPath 的 Agent 定义；两路径并非一一对应。
     const cliSettingsPath = resolveHome('~/.kiro/settings/cli.json');
     try {
       await ensureDir(path.dirname(cliSettingsPath));
       const cli = (await readJsonFile<Record<string, unknown>>(cliSettingsPath)) ?? {};
       const cur = cli['chat.defaultAgent'];
-      if (typeof cur === 'string' && cur.length > 0) return; // respect existing choice
+      if (typeof cur === 'string' && cur.length > 0) return; // 保留用户已有选择。
       cli['chat.defaultAgent'] = agentName;
       await writeJsonFile(cliSettingsPath, cli);
       logger.info('kiro default agent set', { path: cliSettingsPath, agent: agentName });
@@ -494,6 +503,7 @@ export class HookStrategy implements DeployStrategy {
     }
   }
 
+  /** 验证 Kiro Agent 文件的 name、tools 和每个事件 flat command 是否完整。 */
   private async kiroAgentNeedsDeploy(def: AgentDefinition): Promise<boolean> {
     const hookConfig = def.hook!;
     const settings = await readJsonFile<Record<string, unknown>>(resolveHome(hookConfig.settingsPath));
@@ -512,9 +522,8 @@ export class HookStrategy implements DeployStrategy {
   }
 
   /**
-   * Ensure the settings file exists with a valid structure.
-   * Cursor's hooks.json requires a `version` field; Codex's does NOT
-   * (Codex uses `#[serde(deny_unknown_fields)]` and only allows `hooks`).
+   * 确保 settings 文件存在且顶层结构有效。Cursor hooks.json 需要 version；Codex 使用
+   * deny_unknown_fields，只允许 hooks，必须移除旧版注入的 version。
    */
   private async ensureSettingsFile(settingsPath: string): Promise<void> {
     const isHooksJson = settingsPath.endsWith('hooks.json');
@@ -533,8 +542,7 @@ export class HookStrategy implements DeployStrategy {
       existing.version = 1;
       await writeJsonFile(settingsPath, existing);
     } else if (isHooksJson && settingsPath.includes('.codex') && existing.version !== undefined) {
-      // Clean up stale `version` field previously injected by older pilot versions.
-      // Codex uses #[serde(deny_unknown_fields)] and rejects any key other than `hooks`.
+      // 清理旧 Pilot 注入的 version，否则 Codex 会拒绝整个文件。
       delete existing.version;
       await writeJsonFile(settingsPath, existing);
     }

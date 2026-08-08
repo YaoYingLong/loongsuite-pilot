@@ -1,3 +1,11 @@
+/**
+ * 独立 Pipeline 的动态配置发现与生命周期管理器。
+ *
+ * Orchestrator 可选启动本类；它扫描 pipeline-configs JSON、校验配置、按 Type 创建文件或
+ * Qoder API Pipeline，并监听配置新增/修改/删除。fs.watch 仅用于低延迟提示，每 60 秒 rescan
+ * 是最终兜底；相同配置通过稳定 JSON hash 避免无意义重建。
+ */
+
 import * as fs from 'node:fs';
 import * as fsPromises from 'node:fs/promises';
 import * as path from 'node:path';
@@ -11,8 +19,10 @@ import { ensureDir } from '../utils/fs-utils.js';
 const logger = createLogger('PipelineManager');
 
 const RESCAN_INTERVAL_MS = 60_000;
+/** configName 同时用于状态文件和 topic，只允许安全文件名字符。 */
 const VALID_CONFIG_NAME = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
 
+/** 管理运行中的 configName -> Pipeline 实例集合。 */
 export class PipelineManager {
   private readonly configDir: string;
   private readonly stateDir: string;
@@ -25,9 +35,11 @@ export class PipelineManager {
   private rescanTimer: ReturnType<typeof setInterval> | null = null;
   private readonly sleepDetector = new SleepDetector();
   private running = false;
+  /** rescanInProgress/Queued 把 watcher、timer、wake 的并发请求合并成串行扫描。 */
   private rescanInProgress = false;
   private rescanQueued = false;
 
+  /** @param opts 配置/状态/失败目录、数据根及 file/qoderApi 子开关。 */
   constructor(opts: PipelineManagerOptions) {
     this.configDir = opts.configDir;
     this.stateDir = opts.stateDir;
@@ -36,6 +48,7 @@ export class PipelineManager {
     this.pipelineConfig = opts.pipelineConfig;
   }
 
+  /** 创建/迁移目录，首轮扫描，建立 watcher/周期扫描，并在 macOS 启动睡眠探测。 */
   async start(): Promise<void> {
     if (this.running) return;
     this.running = true;
@@ -50,6 +63,7 @@ export class PipelineManager {
 
     try {
       this.watcher = fs.watch(this.configDir, (_event, filename) => {
+        // 只对 JSON 文件提示触发；完整 rescan 会重新读取整个目录处理删除/改名。
         if (filename && filename.endsWith('.json')) {
           void this.fullRescan();
         }
@@ -72,6 +86,7 @@ export class PipelineManager {
       RESCAN_INTERVAL_MS,
     );
 
+    // 当前只在 macOS 启用睡眠探测；其他平台依赖定时 rescan/各 Pipeline polling。
     if (process.platform === 'darwin') {
       this.sleepDetector.on('wake', (event: WakeEvent) => void this.handleWake(event));
       this.sleepDetector.start();
@@ -83,6 +98,7 @@ export class PipelineManager {
     });
   }
 
+  /** 停止探测/watcher/timer，并行尽力关闭全部 Pipeline 后清内存状态。 */
   async stop(): Promise<void> {
     if (!this.running) return;
     this.running = false;
@@ -118,9 +134,8 @@ export class PipelineManager {
   }
 
   /**
-   * One-time migration: if the old state/file-collection/ directory exists and
-   * state/pipeline/ does not, rename it so existing file-pipeline checkpoints
-   * are preserved across the upgrade.
+   * 一次性兼容迁移：旧 `state/file-collection` 存在且新 `state/pipeline` 不存在时 rename，
+   * 保留升级前文件 checkpoint。迁移失败只告警，随后仍创建新目录继续启动。
    */
   private async migrateStateDir(): Promise<void> {
     const oldDir = this.stateDir.replace(/[/\\]pipeline$/, '/file-collection');
@@ -144,9 +159,7 @@ export class PipelineManager {
   }
 
   /**
-   * One-time migration: if the old logs/file-collection-failed/ directory exists
-   * and logs/pipeline-failed/ does not, rename it so existing failed logs are
-   * not orphaned after the upgrade.
+   * 一次性迁移旧 `logs/file-collection-failed` 到 `logs/pipeline-failed`，避免升级后诊断孤立。
    */
   private async migrateFailedLogDir(): Promise<void> {
     const oldDir = this.failedLogDir.replace(/[/\\]pipeline-failed$/, '/file-collection-failed');
@@ -169,6 +182,7 @@ export class PipelineManager {
     }
   }
 
+  /** 并行通知所有支持 handleWake 的 Pipeline 恢复，随后触发完整配置重扫。 */
   private async handleWake(event: WakeEvent): Promise<void> {
     if (!this.running) return;
     logger.info('handling system wake, recovering pipelines', {
@@ -193,6 +207,7 @@ export class PipelineManager {
     void this.fullRescan();
   }
 
+  /** 串行化完整重扫；扫描期间的新请求只设置 queued，结束后再补一轮。 */
   private async fullRescan(): Promise<void> {
     if (this.rescanInProgress) {
       this.rescanQueued = true;
@@ -212,6 +227,7 @@ export class PipelineManager {
     }
   }
 
+  /** 对比磁盘配置与运行实例：删除缺失、创建新增、hash 变化时停止后重建。 */
   private async doRescan(): Promise<void> {
     if (!this.running) return;
 
@@ -225,6 +241,7 @@ export class PipelineManager {
     }
 
     for (const config of diskConfigs) {
+      // stableStringify 忽略对象 key 原始顺序，避免格式化 JSON 引起重建。
       const configJson = stableStringify(config);
       const existingHash = this.configHashes.get(config.configName);
 
@@ -244,6 +261,7 @@ export class PipelineManager {
     }
   }
 
+  /** 读取目录内所有 `.json`，逐个解析/校验；单文件损坏不影响其他配置。 */
   private async scanConfigDir(): Promise<PipelineConfig[]> {
     let entries: string[];
     try {
@@ -271,6 +289,7 @@ export class PipelineManager {
     return configs;
   }
 
+  /** 校验安全 configName、至少一个 input/flusher 和各类型必填字段。 */
   private validateConfig(config: PipelineConfig, fileName: string): boolean {
     if (!config.configName) {
       logger.warn('config missing configName', { file: fileName });
@@ -292,6 +311,7 @@ export class PipelineManager {
       return false;
     }
 
+    // 当前实现只消费 inputs[0] 和 flushers[0]，额外条目不会创建多路 Pipeline。
     const input = config.inputs[0];
     const flusher = config.flushers[0];
     if (!flusher.Endpoint || !flusher.Project || !flusher.Logstore) {
@@ -320,10 +340,11 @@ export class PipelineManager {
     }
   }
 
+  /** 根据 input Type 和子开关构造、启动并登记 Pipeline；失败只影响该配置。 */
   private async createPipeline(config: PipelineConfig): Promise<void> {
     const inputType = config.inputs[0].Type;
 
-    // Check sub-switch
+    // 总开关由 Orchestrator 决定是否创建 Manager，这里再执行类型子开关。
     if (inputType === 'input_file' && !this.pipelineConfig.file.enabled) {
       logger.info('file pipeline disabled, skipping', { configName: config.configName });
       return;
@@ -368,6 +389,7 @@ export class PipelineManager {
     }
   }
 
+  /** 幂等停止并移除指定实例及其配置 hash。 */
   private async destroyPipeline(configName: string): Promise<void> {
     const pipeline = this.pipelines.get(configName);
     if (!pipeline) return;
@@ -385,6 +407,7 @@ export class PipelineManager {
   }
 }
 
+/** 对普通对象递归按 key 排序后 JSON.stringify，用作配置内容稳定指纹。 */
 function stableStringify(obj: unknown): string {
   return JSON.stringify(obj, (_key, value) => {
     if (value && typeof value === 'object' && !Array.isArray(value)) {

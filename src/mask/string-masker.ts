@@ -1,3 +1,11 @@
+/**
+ * 单字符串敏感信息扫描器。
+ *
+ * 小字符串直接运行已预编译规则；超过阈值时先用低成本 prefilter 找关键词附近窗口，再只扫描
+ * 合并后的窗口，避免对巨型工具结果反复执行全量正则。所有命中先记录原始坐标，最后从后向前
+ * 替换，防止前一次替换改变后续区间下标。
+ */
+
 import type {
   CompiledMaskRule,
   MaskRange,
@@ -9,25 +17,40 @@ import {
   MASKED_TOKEN_PATTERN,
 } from './types.js';
 
+/** 先宽松提取 URL 候选，之后再交给 WHATWG URL 与 scheme 白名单精确判断。 */
 const URL_CANDIDATE_PATTERN = /\b[a-z][a-z0-9+.-]*:\/\/[A-Za-z0-9._~:/?#\[\]@!$&()*+,;=%-]+/gi;
 
+/**
+ * @returns 字符串 UTF-8 字节数是否严格超过阈值；中文字符不能用 length 代替字节数。
+ */
 export function isLargeString(value: string, thresholdBytes: number): boolean {
   return Buffer.byteLength(value, 'utf8') > thresholdBytes;
 }
 
+/**
+ * 按一组编译规则脱敏字符串。
+ *
+ * @param value 原始字符串。
+ * @param rules RuleLoader 生成的规则；可同时包含 regex/block/url 类型。
+ * @param options 大字符串和块大小限制。
+ * @returns 无命中时返回原字符串，有命中时返回替换后的新字符串。
+ */
 export function maskString(
   value: string,
   rules: readonly CompiledMaskRule[],
   options: StringMaskOptions = {},
 ): string {
+  // 空值、空规则或完整占位符均无需重复扫描，后者保证幂等。
   if (value.length === 0 || rules.length === 0 || MASKED_TOKEN_PATTERN.test(value)) {
     return value;
   }
 
   const resolvedOptions = resolveStringMaskOptions(options);
+  // prefilter 统一小写，正式正则仍在原字符串上执行以保留精确坐标和大小写。
   const normalizedValue = value.toLowerCase();
   if (!hasAnyPrefilter(normalizedValue, rules)) return value;
 
+  // 巨型内容只扫描关键词附近窗口；普通内容扫描完整字符串。
   const ranges = isLargeString(value, resolvedOptions.largeStringThresholdBytes)
     ? collectLargeStringRanges(value, normalizedValue, rules, resolvedOptions)
     : collectRangesForSegment(value, normalizedValue, 0, rules, resolvedOptions);
@@ -35,6 +58,7 @@ export function maskString(
   return applyMaskRanges(value, ranges);
 }
 
+/** 用默认值补齐可选配置，避免深层函数反复处理 undefined。 */
 function resolveStringMaskOptions(options: StringMaskOptions): ResolvedStringMaskOptions {
   return {
     largeStringThresholdBytes:
@@ -46,6 +70,7 @@ function resolveStringMaskOptions(options: StringMaskOptions): ResolvedStringMas
   };
 }
 
+/** 任一规则的任一预筛关键词存在时才进入成本更高的正式匹配。 */
 function hasAnyPrefilter(
   normalizedValue: string,
   rules: readonly CompiledMaskRule[],
@@ -56,10 +81,12 @@ function hasAnyPrefilter(
   return false;
 }
 
+/** 判断当前规则是否可能命中已小写的字符串片段。 */
 function ruleHasPrefilter(normalizedValue: string, rule: CompiledMaskRule): boolean {
   return rule.normalizedPrefilter.some(keyword => normalizedValue.includes(keyword));
 }
 
+/** 对大字符串构建并扫描关键词窗口，返回相对于原字符串的全局区间。 */
 function collectLargeStringRanges(
   value: string,
   normalizedValue: string,
@@ -71,6 +98,7 @@ function collectLargeStringRanges(
 
   const ranges: MaskRange[] = [];
   for (const window of windows) {
+    // segment 用原文匹配，normalizedSegment 只用于低成本 prefilter。
     const segment = value.slice(window.start, window.end);
     const normalizedSegment = normalizedValue.slice(window.start, window.end);
     ranges.push(
@@ -80,6 +108,11 @@ function collectLargeStringRanges(
   return ranges;
 }
 
+/**
+ * 找出每个唯一关键词周围的上下文窗口，并合并相交/相邻窗口。
+ *
+ * @returns 按 start 升序、互不重叠的半开区间数组。
+ */
 function buildKeywordWindows(
   normalizedValue: string,
   rules: readonly CompiledMaskRule[],
@@ -90,6 +123,7 @@ function buildKeywordWindows(
 
   for (const rule of rules) {
     for (const keyword of rule.normalizedPrefilter) {
+      // 多条规则可共享关键词，同一关键词只扫描一遍位置。
       if (seenKeywords.has(keyword)) continue;
       seenKeywords.add(keyword);
 
@@ -98,6 +132,7 @@ function buildKeywordWindows(
         const index = normalizedValue.indexOf(keyword, fromIndex);
         if (index === -1) break;
         windows.push({
+          // 在关键词两侧保留固定上下文，确保完整密钥/私钥块进入正式匹配段。
           start: Math.max(0, index - contextWindow),
           end: Math.min(normalizedValue.length, index + keyword.length + contextWindow),
         });
@@ -112,6 +147,7 @@ function buildKeywordWindows(
   const merged: Array<{ start: number; end: number }> = [];
   for (const window of windows) {
     const previous = merged[merged.length - 1];
+    // 交叠窗口合并，避免同一密钥被重复扫描并产生重叠范围。
     if (previous && window.start <= previous.end) {
       previous.end = Math.max(previous.end, window.end);
     } else {
@@ -121,6 +157,7 @@ function buildKeywordWindows(
   return merged;
 }
 
+/** 在单个片段内按规则 kind 分派匹配器，并把 offset 加回全局坐标。 */
 function collectRangesForSegment(
   segment: string,
   normalizedSegment: string,
@@ -130,6 +167,7 @@ function collectRangesForSegment(
 ): MaskRange[] {
   const ranges: MaskRange[] = [];
   for (const rule of rules) {
+    // 当前片段不含此规则关键词时跳过正式正则。
     if (!ruleHasPrefilter(normalizedSegment, rule)) continue;
 
     if (rule.kind === 'regex' && rule.regex) {
@@ -143,12 +181,14 @@ function collectRangesForSegment(
   return ranges;
 }
 
+/** 收集普通正则的全部非空命中，并重置共享 RegExp 的 lastIndex。 */
 function collectRegexRanges(
   segment: string,
   offset: number,
   rule: CompiledMaskRule,
 ): MaskRange[] {
   const ranges: MaskRange[] = [];
+  // 编译阶段已保证 regex 存在；非空断言在 kind 分支后成立。
   const regex = rule.regex!;
   regex.lastIndex = 0;
 
@@ -166,6 +206,7 @@ function collectRegexRanges(
   return ranges;
 }
 
+/** 收集跨行块命中；超过字节上限的块不替换，避免异常输入造成巨额复制。 */
 function collectBlockRanges(
   segment: string,
   offset: number,
@@ -178,6 +219,7 @@ function collectBlockRanges(
 
   for (const match of segment.matchAll(regex)) {
     if (match.index === undefined || match[0].length === 0) continue;
+    // 私钥块按 UTF-8 字节限制，而不是 JavaScript UTF-16 code unit 数。
     if (Buffer.byteLength(match[0], 'utf8') > blockLimit) continue;
     ranges.push({
       start: offset + match.index,
@@ -191,6 +233,7 @@ function collectBlockRanges(
   return ranges;
 }
 
+/** 提取带密码且 scheme 在规则白名单中的数据库 URL。 */
 function collectUrlWithPasswordRanges(
   segment: string,
   offset: number,
@@ -201,6 +244,7 @@ function collectUrlWithPasswordRanges(
 
   for (const match of segment.matchAll(URL_CANDIDATE_PATTERN)) {
     if (match.index === undefined || match[0].length === 0) continue;
+    // 文本标点先从候选末尾移除，防止把句号/括号一起替换。
     const candidate = trimUrlCandidate(match[0]);
     if (!candidate || !isDatabaseUrlWithPassword(candidate, rule)) continue;
     ranges.push({
@@ -215,10 +259,12 @@ function collectUrlWithPasswordRanges(
   return ranges;
 }
 
+/** 删除自然语言中紧跟 URL 的常见右侧标点。 */
 function trimUrlCandidate(candidate: string): string {
   return candidate.replace(/[),.;\]}]+$/g, '');
 }
 
+/** 使用标准 URL 解析器确认协议白名单和非空 password；畸形 URL 返回 false。 */
 function isDatabaseUrlWithPassword(candidate: string, rule: CompiledMaskRule): boolean {
   try {
     const parsed = new URL(candidate);
@@ -230,11 +276,19 @@ function isDatabaseUrlWithPassword(candidate: string, rule: CompiledMaskRule): b
   }
 }
 
+/**
+ * 规范化命中区间后，从字符串末尾向前应用替换。
+ *
+ * @param value 原始字符串。
+ * @param ranges 以原字符串坐标表示的候选命中。
+ * @returns 替换后的字符串；没有合法区间时保持原引用。
+ */
 export function applyMaskRanges(value: string, ranges: readonly MaskRange[]): string {
   const normalizedRanges = normalizeMaskRanges(value.length, ranges);
   if (normalizedRanges.length === 0) return value;
 
   let result = value;
+  // 倒序替换保证较后位置的坐标不受较前替换文本长度影响。
   for (let i = normalizedRanges.length - 1; i >= 0; i--) {
     const range = normalizedRanges[i];
     result = `${result.slice(0, range.start)}${range.replacement}${result.slice(range.end)}`;
@@ -242,6 +296,7 @@ export function applyMaskRanges(value: string, ranges: readonly MaskRange[]): st
   return result;
 }
 
+/** 过滤越界/空区间，排序并采用最先区间消除重叠命中。 */
 function normalizeMaskRanges(
   valueLength: number,
   ranges: readonly MaskRange[],
@@ -253,6 +308,7 @@ function normalizeMaskRanges(
   const result: MaskRange[] = [];
   let lastEnd = -1;
   for (const range of sorted) {
+    // 重叠时保留排序后更早、同起点更长的区间，避免重复替换。
     if (range.start < lastEnd) continue;
     result.push(range);
     lastEnd = range.end;

@@ -1,3 +1,13 @@
+/**
+ * 已部署 Hook、插件注入与附加拦截能力的自愈巡检器。
+ *
+ * `Orchestrator` 根据 DeploymentManager 的声明构造目标并启动本类。启动延迟后，
+ * Watchdog 周期读取 Agent 配置；marker 缺失时调用直接 repairFn，或用 spawn 执行
+ * 外部安装命令。修复受冷却时间、每日次数和超时限制，单个目标失败不会阻断其他目标
+ * 或 Collector。`stop()` 清 timer，但已启动的异步检查会按自身超时结束。
+ */
+
+
 import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import * as fs from 'node:fs/promises';
@@ -18,14 +28,14 @@ export interface PluginCheckTarget {
   agentId: string;
   settingsPath: string;
   expectedHooks: string[];
-  /** Substrings that identify our hook command in settings.json */
+  /** settings.json 中用于识别本项目 Hook 命令的子串。 */
   markers: string[];
 
-  /** External command binary path (for plugin-type repair). Required if repairFn is not set. */
+  /** 插件型修复的外部命令；未提供 repairFn 时必填。 */
   binPath?: string;
-  /** Arguments for the external install command. */
+  /** 外部安装命令参数。 */
   installArgs?: string[];
-  /** Direct repair function (for hook-type repair via HookManager). Takes precedence over binPath. */
+  /** HookManager 直接修复函数，优先于 binPath。 */
   repairFn?: () => Promise<boolean>;
 }
 
@@ -35,27 +45,20 @@ export interface InterceptCheckTarget {
   repair: () => Promise<void>;
   precondition: () => Promise<boolean>;
   /**
-   * Whether the owning agent is enabled by the user's selection
-   * (config.agents[<id>].enabled). When this returns false the target is not
-   * (re)injected — instead cleanup() runs (if provided) so the intercept is
-   * removed rather than merely left in place. Omitted → treated as enabled
-   * (backward compatible).
+   * 所属 Agent 是否被用户配置启用。返回 false 时不注入，而调用可选 cleanup 删除旧
+   * 拦截；省略时为兼容旧调用方而视为启用。
    */
   enabled?: () => boolean | Promise<boolean>;
   /**
-   * Idempotent removal of an already-installed intercept, invoked when
-   * enabled() is false. Lets "config disable" actually stop collection (not
-   * just stop self-healing) — otherwise a wrapper written on a prior run would
-   * keep intercepting for an agent the user has since turned off. Omitted →
-   * disabled targets are simply skipped.
+   * enabled=false 时幂等删除已安装拦截，使配置禁用真正停止采集，而不只是停止自愈。
+   * 省略时仅跳过禁用目标。
    */
   cleanup?: () => Promise<void>;
 }
 
 /**
- * Remove a marker-delimited block (inclusive of the BEGIN/END marker lines)
- * from rc-file content. Any line containing `begin` starts the cut and any
- * line containing `end` ends it; non-block lines are preserved verbatim.
+ * 从 shell rc 文本中删除含 BEGIN/END marker 的整个区块。包含 begin 的行开始跳过，
+ * 包含 end 的行结束跳过，其余行原样保留。
  */
 export function stripMarkerBlock(content: string, begin: string, end: string): string {
   const out: string[] = [];
@@ -83,14 +86,12 @@ export interface TargetResult {
 }
 
 /**
- * Periodically verifies that our hook commands are still registered in agent
- * settings files. Supports two repair strategies:
+ * 周期验证本项目 Hook 是否仍注册在 Agent settings 中，支持两类修复：
  *
- * - Command-based (plugin agents): spawns an external install command
- * - Function-based (hook agents): calls HookManager.deploy() directly
+ * - 插件 Agent：spawn 外部安装命令；
+ * - Hook Agent：直接调用 HookManager 部署函数。
  *
- * When hooks go missing (e.g. overwritten by another tool sharing the same
- * settings file), the watchdog detects and restores them.
+ * 共享 settings 被其他工具覆盖时检测并恢复；每目标失败相互隔离。
  */
 export class HookWatchdog {
   private readonly config: HookWatchdogConfig;
@@ -102,6 +103,10 @@ export class HookWatchdog {
   private startupTimer: ReturnType<typeof setTimeout> | null = null;
   private intervalTimer: ReturnType<typeof setInterval> | null = null;
 
+  /**
+   * @param targets Hook/插件配置目标；省略时使用兼容默认目标。
+   * @param interceptTargets shell rc、launchctl 等额外拦截目标。
+   */
   constructor(
     config: HookWatchdogConfig,
     targets?: PluginCheckTarget[],
@@ -112,6 +117,7 @@ export class HookWatchdog {
     this.interceptTargets = interceptTargets ?? [];
   }
 
+  /** 配置开启时延迟 30 秒首检，再按 intervalMs 周期执行。 */
   start(): void {
     if (!this.config.enabled) {
       logger.info('hook-watchdog disabled');
@@ -130,6 +136,7 @@ export class HookWatchdog {
     }, STARTUP_DELAY_MS);
   }
 
+  /** 清除尚未执行的启动与周期 timer。 */
   stop(): void {
     if (this.startupTimer) {
       clearTimeout(this.startupTimer);
@@ -141,6 +148,10 @@ export class HookWatchdog {
     }
   }
 
+  /**
+   * 顺序检查 Hook 目标，再检查 intercept 目标。
+   * @returns checked/repaired/skipped 汇总；单目标异常只记录，不 reject 整轮。
+   */
   async runCheck(): Promise<CheckResult> {
     const summary: CheckResult = { checked: 0, repaired: 0, skipped: 0 };
 
@@ -167,6 +178,7 @@ export class HookWatchdog {
     return summary;
   }
 
+  /** 检查单 Agent settings、marker 和冷却时间，必要时执行修复并返回结构化状态。 */
   private async checkTarget(target: PluginCheckTarget): Promise<TargetResult> {
     const settingsDirOk = await directoryExists(path.dirname(target.settingsPath));
     if (!settingsDirOk) {
@@ -238,6 +250,7 @@ export class HookWatchdog {
     return { agentId: target.agentId, status: 'repaired', missing };
   }
 
+  /** 返回 settings.hooks 中缺失本项目 marker 的事件名。 */
   private findMissingHooks(
     settings: Record<string, unknown> | null,
     target: PluginCheckTarget,
@@ -258,6 +271,7 @@ export class HookWatchdog {
     return missing;
   }
 
+  /** 同时兼容 flat `{command}` 与 nested `{hooks:[{command}]}` 条目。 */
   private entryContainsMarker(entry: unknown, markers: string[]): boolean {
     if (!entry || typeof entry !== 'object') return false;
     const e = entry as Record<string, unknown>;
@@ -276,6 +290,7 @@ export class HookWatchdog {
     return false;
   }
 
+  /** 优先调用直接修复函数；否则退到受超时保护的外部命令。 */
   private async repairTarget(target: PluginCheckTarget): Promise<boolean> {
     if (target.repairFn) {
       try {
@@ -291,6 +306,10 @@ export class HookWatchdog {
     return this.repairViaCommand(target);
   }
 
+  /**
+   * 启动外部安装子进程，清空 NODE_OPTIONS 防止继承旧 preload；收集有限 stderr。
+   * 30 秒未退出则 SIGKILL，并以 false 兑现而非 reject。
+   */
   private repairViaCommand(target: PluginCheckTarget): Promise<boolean> {
     return new Promise(resolve => {
       let settled = false;
@@ -345,18 +364,15 @@ export class HookWatchdog {
     });
   }
 
-  // ─── Intercept self-healing ─────────────────────────────────────────────
+  // 以下处理不在 Agent JSON hooks 中的 shell/launchctl 拦截自愈。
 
+  /** 对附加拦截执行启用门控、前置条件、健康检查、冷却和每日三次限流。 */
   private async checkInterceptTargets(summary: CheckResult): Promise<void> {
     this.resetDailyCounterIfNeeded();
 
     for (const target of this.interceptTargets) {
       try {
-        // User-selection gate, checked before any check/repair so a disabled
-        // agent never (re)injects and does not consume the cooldown / daily
-        // budget. When disabled we also run cleanup() (idempotent) so an
-        // intercept written on a prior run is removed — "config disable" stops
-        // collection, not just self-healing.
+        // 用户禁用门控先于检查/修复，避免消耗限流额度，并清除历史拦截以真正停止采集。
         if (target.enabled && !(await target.enabled())) {
           if (target.cleanup) {
             try {
@@ -411,6 +427,7 @@ export class HookWatchdog {
     }
   }
 
+  /** UTC 日期变化时清空每目标修复次数。 */
   private resetDailyCounterIfNeeded(): void {
     const today = new Date().toISOString().slice(0, 10);
     if (today !== this.dailyRepairResetDate) {
@@ -419,8 +436,9 @@ export class HookWatchdog {
     }
   }
 
-  // ─── Default targets (hardcoded, matching existing style) ───────────────
+  // 兼容默认目标；生产通常传入由当前 Agent 声明构造的目标。
 
+  /** 返回无外部注入时使用的 Claude/Codex 兼容插件目标。 */
   static defaultTargets(): PluginCheckTarget[] {
     return [
       {
@@ -457,25 +475,17 @@ export class HookWatchdog {
   }
 
   /**
-   * Shell-rc intercept block definitions (qodercli + claude-code).
+   * qodercli 与 claude-code 的 shell rc 拦截块定义。
    *
-   * blockFn must stay byte-identical to the block written by the installer
-   * (deploy/installer-opensource.sh inject_*), so the marker-based idempotency
-   * checks agree. The `if ! alias ... eval '...'` shape guards against
-   * clobbering a user's own alias/function AND avoids a parse error: a bare
-   * `<cli>()` token would fail to parse under an active alias because
-   * interactive shells expand aliases at parse time (before the guard runs), so
-   * the definition is deferred behind eval.
+   * blockFn 必须与 installer 写入内容逐字节一致。`if ! alias ... eval '...'` 既避免
+   * 覆盖用户 alias/function，也绕开交互 shell 在解析阶段先展开 alias 的语法问题。
    *
-   * Exposed as a pure, static seam so tests can render the exact block for any
-   * path without touching HOME/fs (see hook-watchdog-intercept-shell.test.ts).
+   * 静态纯函数让测试能为任意路径渲染精确文本，而无需触碰真实 HOME/文件系统。
    *
-   * `signature` is a substring unique to the CURRENT block shape (the guard
-   * line). check()/repair() use it — not just `marker` — to detect and migrate
-   * an older block that shares the same marker (e.g. the released bare
-   * `<cli>() {...}` form). Keep it byte-identical to the installer's grep.
-   * `endMarker` bounds the block for removal/migration.
+   * signature 是当前形状独有子串；同时验证 marker 与 signature 才能识别并迁移共用旧
+   * marker 的历史块。endMarker 界定删除范围。
    */
+  /** 返回 shell rc 拦截块的纯描述，不触碰文件系统。 */
   static interceptRcBlockDefs(): Array<{
     id: string;
     agentId: string;
@@ -521,18 +531,20 @@ export class HookWatchdog {
     ];
   }
 
+  /**
+   * 构造 macOS launchctl 与 shell rc 的附加拦截目标。rcPathsOverride 仅供测试把真实
+   * check/repair/cleanup 闭包指向临时文件。
+   */
   static defaultInterceptTargets(
     dataDir: string,
     isAgentEnabled: (agentId: string) => boolean = () => true,
-    // rcPaths is injectable so tests can exercise the real check()/repair()/
-    // cleanup() closures against a temp dir instead of the developer's real rc
-    // files. Production omits it and uses ~/.zshrc + ~/.bashrc.
+    // 测试可注入 rcPaths 使用临时目录；生产省略并使用 ~/.zshrc、~/.bashrc。
     rcPathsOverride?: string[],
   ): InterceptCheckTarget[] {
     const targets: InterceptCheckTarget[] = [];
     const home = os.homedir();
 
-    // ── qoderwork-env: launchctl env + LaunchAgent plist (macOS only) ──
+    // macOS：同时维护 qoderwork 的 launchctl 环境变量与 LaunchAgent plist。
     if (process.platform === 'darwin') {
       const wrapperPath = path.join(dataDir, 'hooks', 'qoderwork-runtime-wrapper.mjs');
       const plistPath = path.join(home, 'Library', 'LaunchAgents', 'com.loongsuite-pilot.qoderwork-env.plist');
@@ -551,7 +563,7 @@ export class HookWatchdog {
           try {
             const { stdout } = await execFileAsync('launchctl', ['getenv', 'QODER_WORKER_RUNTIME_PATH']);
             if (stdout.trim() !== wrapperPath) return false;
-            // Also verify plist exists — without it, env is lost on reboot.
+            // 同时验证 plist；否则环境变量重启后会丢失。
             return fileExists(plistPath);
           } catch {
             return false;
@@ -581,23 +593,19 @@ export class HookWatchdog {
           ].join('\n');
           await fs.mkdir(path.dirname(plistPath), { recursive: true });
           await fs.writeFile(plistPath, plistContent);
-          // NOTE: launchctl load/unload is deprecated since macOS 10.11 in
-          // favour of `launchctl bootstrap/bootout gui/<uid>`. We keep
-          // load/unload for now because it still works reliably across all
-          // supported macOS versions and avoids the uid lookup complexity.
+          // load/unload 虽已被 bootstrap/bootout 取代，但跨支持版本更稳定且无需查 uid。
           await execFileAsync('launchctl', ['unload', plistPath]).catch(() => {});
           await execFileAsync('launchctl', ['load', plistPath]).catch(() => {});
         },
         cleanup: async () => {
-          // Mirror installer remove_qoderwork_runtime_wrapper: drop the env only
-          // if it still points at our wrapper, and remove the LaunchAgent plist.
+          // 与 installer 对称：仅当 env 仍指向本项目 wrapper 时删除，并移除 plist。
           try {
             const { stdout } = await execFileAsync('launchctl', ['getenv', 'QODER_WORKER_RUNTIME_PATH']);
             if (stdout.trim() === wrapperPath) {
               await execFileAsync('launchctl', ['unsetenv', 'QODER_WORKER_RUNTIME_PATH']).catch(() => {});
             }
           } catch {
-            // getenv fails when unset — nothing to drop.
+            // 未设置时 getenv 非零退出，无需清理。
           }
           if (await fileExists(plistPath)) {
             await execFileAsync('launchctl', ['unload', plistPath]).catch(() => {});
@@ -607,10 +615,7 @@ export class HookWatchdog {
       });
     }
 
-    // ── Shell rc intercept targets (qodercli + claude-code) ──
-    // Check BOTH .zshrc and .bashrc regardless of daemon's $SHELL — the
-    // daemon is launchd-started and its $SHELL may not match the user's
-    // interactive shell. Installer's remove function also scans all rc files.
+    // 无论 daemon 的 SHELL 为何都检查 zshrc/bashrc；launchd 环境可能不同于交互终端。
     const rcPaths = rcPathsOverride ?? [
       path.join(home, '.zshrc'),
       path.join(home, '.bashrc'),
@@ -623,19 +628,11 @@ export class HookWatchdog {
         id: rc.id,
         enabled: () => isAgentEnabled(rc.agentId),
         precondition: async () => {
-          // Only check if the hook script was deployed by the installer.
-          // We intentionally do NOT run `which <cli>` — the daemon process
-          // is launchd-started with a minimal PATH that likely doesn't
-          // include ~/.local/bin or npm global dirs, and shell wrapper
-          // functions (qodercli/claude) are invisible to /usr/bin/which
-          // in a non-interactive subprocess. Hook script existence is a
-          // sufficient signal that the installer set this agent up.
+          // Hook 脚本存在即可；daemon 最小 PATH 和非交互 shell 无法可靠使用 which。
           return fileExists(scriptPath);
         },
         check: async () => {
-          // Health is keyed on block CONTENT, not just the marker: an older
-          // released block shares the same marker but lacks `signature`, and
-          // must be migrated. A stale block anywhere → unhealthy (repair).
+          // 健康判断必须看当前 signature；任一 rc 含旧形状都触发迁移。
           let anyCurrent = false;
           let anyRcExists = false;
           for (const rcPath of rcPaths) {
@@ -644,21 +641,20 @@ export class HookWatchdog {
             const content = await fs.readFile(rcPath, 'utf-8');
             if (content.includes(rc.marker)) {
               if (content.includes(rc.signature)) anyCurrent = true;
-              else return false; // marker present but old shape → migrate
+              else return false; // marker 存在但结构已过时，需要迁移。
             }
           }
           if (anyCurrent) return true;
-          // No block present anywhere. If no rc files exist, nothing to repair
-          // into → healthy; otherwise repair() will append.
+          // 无块且无 rc 文件时无处可写，视为健康；有 rc 时 repair 会追加。
           return !anyRcExists;
         },
         repair: async () => {
           for (const rcPath of rcPaths) {
-            if (!await fileExists(rcPath)) continue; // never create rc files
+            if (!await fileExists(rcPath)) continue; // 绝不替用户创建不存在的 rc 文件。
             const content = await fs.readFile(rcPath, 'utf-8');
             if (content.includes(rc.marker)) {
-              if (content.includes(rc.signature)) continue; // already current
-              // Stale block: strip the old marker region, then append fresh.
+              if (content.includes(rc.signature)) continue; // 当前结构已生效，无需修复。
+              // 删除旧 marker 区域，再追加当前形状。
               const stripped = stripMarkerBlock(content, rc.marker, rc.endMarker).replace(/\n+$/, '\n');
               await fs.writeFile(rcPath, stripped + rc.blockFn(scriptPath) + '\n');
             } else {
@@ -667,7 +663,7 @@ export class HookWatchdog {
           }
         },
         cleanup: async () => {
-          // Disabled agent: remove our block from every rc file (idempotent).
+          // Agent 禁用时从所有 rc 幂等移除本项目区块。
           for (const rcPath of rcPaths) {
             if (!await fileExists(rcPath)) continue;
             const content = await fs.readFile(rcPath, 'utf-8');

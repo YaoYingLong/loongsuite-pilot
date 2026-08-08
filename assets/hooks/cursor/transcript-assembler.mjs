@@ -2,22 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * transcript-assembler.mjs — Cursor Windows transcript-driven output assembly.
+ * Cursor Windows 的 transcript 驱动输出组装器。
  *
- * Called on stop event (Windows only). Parses Cursor's agent-transcript JSONL
- * which is always valid UTF-8, then aligns with journal hook events to produce
- * correctly structured output records without any GB18030 garbling.
+ * `cursor-hook-processor.mjs` 在 stop 时仅于 Windows 优先调用本模块。Cursor 的
+ * agent-transcript JSONL 是可靠 UTF-8，本模块解析当前 turn，再与 event journal 对齐，既保留
+ * transcript 中未损坏的文本，又补上 journal 提供的工具 ID、token、时间戳和模型。
  *
- * Key design decisions:
- * - Only processes the CURRENT turn (after the second-to-last turn_ended marker)
- * - Tool calls are assigned positionally (transcript has no tool IDs)
- * - Journal provides: tool IDs, token counts, timestamps, model info
- * - Transcript provides: correct UTF-8 text content
- *
- * Known limitation: subagent/child sessions are not handled here. When a turn
- * contains Subagent/Task tool calls, their child session records are not
- * included. The fallback assembleTurn path handles subagents via scanSubagentDir.
- * TODO: Add subagent support in a future iteration.
+ * 设计约束：只处理最近一个 turn（最后两个 `turn_ended` 边界之间）；transcript 没有工具 ID，
+ * 因而工具只能按位置匹配；journal 时序竞争导致工具事件缺失时会合成稳定 ID。已知限制是这里
+ * 不组装子 Agent/子会话；含 Subagent/Task 的 turn 应由回退 `assembleTurn()` 通过扫描
+ * `subagents/` 处理。并行或中断工具数量不一致时位置匹配也可能错位，此限制尚未解决。
  */
 
 import crypto from 'node:crypto';
@@ -32,15 +26,14 @@ import {
   inferProviderName,
 } from '../agent-event-normalizer.mjs';
 
-// ─── Public API ───
+// ─── 对外 API ───
 
 /**
- * Build output records from transcript + journal hook events.
- *
- * @param {string}   transcriptPath - Cursor agent-transcript JSONL path
- * @param {object[]} journalEvents  - All journal events for this turn
- * @param {object}   options        - { runtimeConfig, stopConversationId }
- * @returns {object[]|null}  records, or null to trigger assembleTurn fallback
+ * 结合 transcript 与 journal 构造标准输出记录。
+ * @param {string} transcriptPath Cursor agent-transcript JSONL 路径。
+ * @param {object[]} journalEvents 本次 journal 快照的全部事件。
+ * @param {{runtimeConfig?: object, stopConversationId?: string}} options 内容策略和 stop 会话 ID。
+ * @returns {object[] | null} 标准记录；无法可靠解析时返回 null，通知调用方走回退 assembler。
  */
 export function buildCursorRecordsFromTranscript(transcriptPath, journalEvents, options = {}) {
   if (!transcriptPath || !fs.existsSync(transcriptPath)) return null;
@@ -66,12 +59,12 @@ export function buildCursorRecordsFromTranscript(transcriptPath, journalEvents, 
     .filter(e => e.hook_event !== 'sessionStart')
     .sort((a, b) => tsMs(a) - tsMs(b));
 
-  // T5: Resolve model from journal events (afterAgentThought/Response carry real model)
+  // 从 journal 推断模型，afterAgentThought/Response 通常携带真实值。
   const model = parentEvents.find(e =>
     e.model && e.model !== 'unknown' && e.model !== ''
   )?.model || promptEvent?.model || 'unknown';
 
-  // T2: baseFields includes gen_ai.agent.id
+  // 所有记录共享会话、turn、trace、Agent 和用户字段。
   const baseFields = {
     trace_id: traceId,
     'gen_ai.session.id': parentConvId,
@@ -84,7 +77,7 @@ export function buildCursorRecordsFromTranscript(transcriptPath, journalEvents, 
   const records = [];
   const userText = turn.userText || promptEvent.prompt;
 
-  // Entry event (other): user prompt, no step_id
+  // 用户 prompt 是 turn 入口 `other` 事件，不属于任一 ReAct step，因此没有 step_id。
   if (userText) {
     records.push(applyPolicy({
       time_unix_nano: eventTs(promptEvent),
@@ -101,7 +94,7 @@ export function buildCursorRecordsFromTranscript(transcriptPath, journalEvents, 
     }, runtimeConfig));
   }
 
-  // Build per-step records
+  // 每个对齐后的 step 依次构造 request、tool 对和 response。
   const steps = alignSteps(turn.assistantEntries, parentEvents, turnId);
   const stopEvent = parentEvents.find(e => e.hook_event === 'stop');
   let prevToolResults = [];
@@ -111,16 +104,14 @@ export function buildCursorRecordsFromTranscript(transcriptPath, journalEvents, 
     const stepId = `${turnId}:s${i + 1}`;
     const isLast = i === steps.length - 1;
 
-    // T2: shared responseId between llm.request and llm.response
+    // 同一步 request/response 共用 responseId，便于下游配对。
     const responseId = crypto.randomUUID();
 
-    // T4: Precise request timestamp
-    // s1: prefer thought event duration backtrack (actual LLM start); fallback to prompt time
-    // s2+: use end time of previous step's last tool result
+    // 精确请求时间：s1 优先用 thought.duration 反推真实开始，失败时用 prompt；
+    // s2+ 使用上一步最后一个工具结果的结束时间。
     let reqTs;
     if (i === 0) {
-      // Use thought event duration to backtrack to LLM start time if available
-      // This gives a different (later) timestamp than the 'other' entry event
+      // thought 有时长时反推 LLM 开始；它通常晚于 turn 入口的 `other` 事件。
       reqTs = step.thoughtEvent?.duration_ms != null
         ? timestampToUnixNanos(durationStartMs(step.thoughtEvent))
         : eventTs(promptEvent);
@@ -133,15 +124,14 @@ export function buildCursorRecordsFromTranscript(transcriptPath, journalEvents, 
           : eventTs(step.thoughtEvent || promptEvent));
     }
 
-    // llm.request.model from step events
+    // step 事件中的模型比 turn 级回退值更精确。
     const stepModel = step.thoughtEvent?.model || step.responseEvent?.model || model;
 
     const inputMessages = [];
     if (i === 0 && userText) {
       inputMessages.push({ role: 'user', parts: [{ type: 'text', content: userText }] });
     } else if (prevToolResults.length > 0) {
-      // NOTE: tool_output from journal postToolUse may contain GB18030-garbled text.
-      // Omit response content to avoid garbled data in output; structure is preserved.
+      // journal postToolUse 的 tool_output 可能已被 GB18030 损坏；省略内容但保留结构。
       inputMessages.push({
         role: 'tool',
         parts: prevToolResults.map(tr => ({
@@ -152,7 +142,7 @@ export function buildCursorRecordsFromTranscript(transcriptPath, journalEvents, 
       });
     }
 
-    // ── llm.request ──
+    // ── 构造 llm.request ──
     const reqSource = step.thoughtEvent || step.responseEvent || promptEvent;
     records.push(applyPolicy({
       time_unix_nano: reqTs,
@@ -171,9 +161,9 @@ export function buildCursorRecordsFromTranscript(transcriptPath, journalEvents, 
         : (steps[i - 1].toolResults.length > 0 ? 'previous_step_end' : undefined),
     }, runtimeConfig));
 
-    // ── tool.call records ──
+    // ── 构造 tool.call 记录 ──
     for (const tc of step.toolCalls) {
-      // Synthetic entries have no real timestamp — use step request time
+      // 合成工具没有真实时间戳，使用 step request 时间。
       const tcTs = tc._synthetic ? reqTs : eventTs(tc);
       records.push(applyPolicy({
         time_unix_nano: tcTs,
@@ -189,7 +179,7 @@ export function buildCursorRecordsFromTranscript(transcriptPath, journalEvents, 
       }, runtimeConfig));
     }
 
-    // ── tool.result records (journal only — transcript has no tool results) ──
+    // ── tool.result（仅 journal 提供，transcript 没有工具结果） ──
     for (const tr of step.toolResults) {
       const isFailure = tr.hook_event === 'postToolUseFailure';
       records.push(applyPolicy({
@@ -210,18 +200,18 @@ export function buildCursorRecordsFromTranscript(transcriptPath, journalEvents, 
       }, runtimeConfig));
     }
 
-    // ── llm.response ──
-    // T1: finish_reason is 'tool_calls' when this step has tool calls
+    // ── 构造 llm.response ──
+    // step 声明工具调用时 finish_reason 为 `tool_calls`，否则由最终状态决定。
     const finishReason = step.toolCalls.length > 0 ? 'tool_calls' : 'stop';
 
-    // T4: Response timestamp from thoughtEvent or responseEvent
+    // response 时间优先取 thoughtEvent，最终 step 则可取 responseEvent。
     const respSource = isLast
       ? (step.responseEvent || stopEvent)
       : (step.thoughtEvent || null);
     const respTs = respSource ? eventTs(respSource) : reqTs;
 
-    // T1: Build output.messages parts: text + tool_call parts for each tool
-    // Non-final steps use 'reasoning' type (matches react-assembler afterAgentThought behavior)
+    // output.messages 包含文本及每个工具的 tool_call；非最终 step 文本标为 reasoning，
+    // 与 react-assembler 对 afterAgentThought 的处理保持一致。
     const textPartType = isLast ? 'text' : 'reasoning';
     const outputParts = [];
     if (step.text) outputParts.push({ type: textPartType, content: step.text });
@@ -260,8 +250,7 @@ export function buildCursorRecordsFromTranscript(transcriptPath, journalEvents, 
         : undefined,
     }, runtimeConfig);
 
-    // T3: Only the last step carries real tokens; intermediate steps are set to 0
-    // This prevents AGENT span double-counting (EVENT_LOG_TO_TRACE_SPEC §3.4)
+    // 只有最后一步携带真实 token，中间步置 0，防止 AGENT span 重复汇总。
     if (isLast) {
       mergeTokens(respRecord, step.responseEvent || stopEvent);
     } else {
@@ -279,20 +268,18 @@ export function buildCursorRecordsFromTranscript(transcriptPath, journalEvents, 
   return records.length > 0 ? records : null;
 }
 
-// ─── Transcript Parser ───
+// ─── Transcript 解析 ───
 
 /**
- * Parse Cursor transcript, returning ONLY the current turn's content.
- *
- * Cursor appends multiple turns to the same file, separated by turn_ended markers.
- * We must filter to the CURRENT turn only (between the last two turn_ended markers).
+ * 解析 Cursor transcript，且只返回当前 turn。
+ * Cursor 把多个 turn 追加到同一文件，以 `turn_ended` 分隔；必须裁剪到最后两个边界之间。
  */
 function parseCursorTranscript(transcriptPath) {
   try {
     const content = fs.readFileSync(transcriptPath, 'utf-8');
     const lines = content.trim().split('\n').filter(Boolean);
 
-    // Collect all turn_ended positions to determine current turn boundaries
+    // 先收集所有 turn_ended 位置，用于确定当前 turn 边界。
     const turnEndedPositions = [];
     for (let i = 0; i < lines.length; i++) {
       try {
@@ -301,7 +288,7 @@ function parseCursorTranscript(transcriptPath) {
       } catch {}
     }
 
-    // Determine whether the last line is a turn_ended
+    // 最后一行是否为 turn_ended 决定当前 turn 已结束还是仍写入中。
     let lastEntry = null;
     for (let i = lines.length - 1; i >= 0; i--) {
       try { lastEntry = JSON.parse(lines[i]); break; } catch {}
@@ -311,15 +298,15 @@ function parseCursorTranscript(transcriptPath) {
     let currentTurnStart, currentTurnEnd;
 
     if (endsWithTurnEnded && turnEndedPositions.length >= 1) {
-      // Current (most recent) turn: from after the previous turn_ended to before last turn_ended
+      // 已结束：取倒数第二个边界之后到最后边界之前。
       const lastPos = turnEndedPositions[turnEndedPositions.length - 1];
       const prevPos = turnEndedPositions.length >= 2
         ? turnEndedPositions[turnEndedPositions.length - 2]
         : -1;
       currentTurnStart = prevPos + 1;
-      currentTurnEnd = lastPos; // exclusive
+      currentTurnEnd = lastPos; // 结束位置不包含在当前区间内。
     } else {
-      // Turn still in progress: from after last turn_ended to EOF
+      // 仍进行中：取最后边界之后到 EOF。
       const lastPos = turnEndedPositions.length > 0
         ? turnEndedPositions[turnEndedPositions.length - 1]
         : -1;
@@ -348,7 +335,7 @@ function parseCursorTranscript(transcriptPath) {
         const toolUseParts = entry.message.content.filter(p => p.type === 'tool_use');
         const rawText = textParts.map(p => p.text).join('');
         const text = isUsableText(rawText) ? rawText : null;
-        // Extract tool_use details: name and input (transcript has no tool IDs)
+        // 提取工具名和参数；transcript 本身不提供 tool ID。
         const toolUses = toolUseParts.map(p => ({
           name: p.name || '',
           input: p.input || {},
@@ -364,27 +351,21 @@ function parseCursorTranscript(transcriptPath) {
   }
 }
 
-/** Text is usable if non-empty after stripping [REDACTED] markers */
+/** 去除 `[REDACTED]` 标记后仍有非空内容，才视为可用文本。 */
 function isUsableText(text) {
   if (!text || !text.trim()) return false;
   return text.replace(/\[REDACTED\]/g, '').trim().length > 0;
 }
 
-// ─── Step Alignment ───
+// ─── Step 对齐 ───
 
 /**
- * Align transcript assistant entries with journal hook events to build steps.
+ * 对齐 transcript assistant 与 journal Hook 事件以构造 step。
  *
- * Transcript is source of truth for tool identity (name, input, count).
- * Journal preToolUse provides timing and real IDs when available.
- * When journal tools are absent (Cursor hook timing race), synthetic tool
- * entries are created from transcript data so tool.call records always exist.
- *
- * Known limitation: positional matching assumes transcript toolUseCount and
- * journal preToolUse count are consistent. If a tool was interrupted (preToolUse
- * without postToolUse) or Cursor retried internally (extra transcript tool_use),
- * subsequent steps may get misaligned tool assignments. This is an inherent
- * tradeoff — Cursor transcript lacks tool IDs for reliable matching.
+ * transcript 决定工具身份、参数和数量；journal 的 preToolUse 在可用时提供真实 ID 与时序。
+ * journal 因并发竞争缺失工具时从 transcript 合成条目，保证至少存在 tool.call。
+ * 已知限制：位置匹配假设两路工具数量一致；中断工具或 Cursor 内部重试会使后续分配错位，
+ * transcript 缺少工具 ID，当前无法可靠消除此问题。
  */
 function alignSteps(assistantEntries, parentEvents, turnId) {
   const sortedJournalCalls = parentEvents
@@ -419,24 +400,22 @@ function alignSteps(assistantEntries, parentEvents, turnId) {
     const count = entry.toolUseCount || 0;
     const isFinal = i === assistantEntries.length - 1;
 
-    // Build tool call entries: prefer journal (real ID + timing), fall back to transcript
+    // 优先采用 journal 的真实 ID/时间，缺失时从 transcript 合成工具调用。
     const stepToolCalls = [];
     for (let j = 0; j < count; j++) {
       const journalEvent = sortedJournalCalls[journalCallIdx + j];
       const transcriptTool = entry.toolUses?.[j];
       if (journalEvent) {
-        // Journal has real timing and tool_use_id; use transcript input (correct UTF-8)
-        // because journal's tool_input may contain GB18030-garbled Chinese
+        // journal 提供真实时序和 ID，参数仍用 transcript 的正确 UTF-8，避免中文乱码。
         stepToolCalls.push({
           ...journalEvent,
           tool_input: transcriptTool ? JSON.stringify(transcriptTool.input) : journalEvent.tool_input,
         });
       } else if (transcriptTool) {
-        // No journal event — synthesize from transcript
-        // Stable synthetic ID: <turnId>:s<step>:t<toolIndex>
+        // 没有 journal 事件时用 transcript 合成，稳定 ID 格式为 <turnId>:s<step>:t<toolIndex>。
         const syntheticId = `${turnId}:s${i + 1}:t${j + 1}`;
         stepToolCalls.push({
-          _journal_ts: null, // no real timestamp available
+          _journal_ts: null, // 没有可用的真实时间戳。
           hook_event: 'preToolUse',
           tool_name: transcriptTool.name,
           tool_use_id: syntheticId,
@@ -462,7 +441,7 @@ function alignSteps(assistantEntries, parentEvents, turnId) {
   return steps;
 }
 
-// ─── Helpers ───
+// ─── 辅助函数 ───
 
 function mergeTokens(rec, ev) {
   if (!ev) return;

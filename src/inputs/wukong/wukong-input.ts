@@ -1,3 +1,19 @@
+/**
+ * Wukong 本地 CLI API 轮询采集器，是当前 Orchestrator 会实际创建并注册的主实现。
+ *
+ * 所属位置：输入源模块。`Orchestrator.registerAllInputs()` 在发现 Wukong 可用后创建本类，
+ * `BaseInput` 再通过定时器调用 `collect()`，并把返回的 `AgentActivityEntry` 以 `entries` 事件交给
+ * `InputManager`，最终进入统一归一化与输出链路。
+ *
+ * 数据来源：使用 Node.js `child_process.execFile` 启动 `wukong-cli` 子进程，先分页调用
+ * `list_tasks`，再按会话调用 `get_spark_agui_messages`。本文件使用 ES Module `import`；源码中
+ * 的 `.js` 后缀对应 TypeScript 编译后的模块名，`import type` 只参与类型检查、运行时不会加载。
+ *
+ * 状态与生命周期：首次 `start()` 只记录既有消息数量，避免重放历史；运行中保存每个 session
+ * 已处理条数和暂时消失次数；`stop()` 会通过 `AbortController` 取消尚未退出的 CLI 子进程。
+ * CLI 不可用、响应为空或单个任务解析失败时尽量 fail-open，让下一轮轮询恢复；真正的响应结构
+ * 错误会抛给当前任务或轮询层记录。所有子进程都有超时和最大输出缓冲限制。
+ */
 import * as crypto from 'node:crypto';
 import { execFile as execFileCb } from 'node:child_process';
 import { promises as fsp } from 'node:fs';
@@ -17,12 +33,12 @@ const MAX_TASKS = 500;
 const BASELINE_CONCURRENCY = 5;
 const COLLECT_CONCURRENCY = 5;
 const DAEMON_SOCK_REL = '.real/daemon.sock';
-// Number of consecutive list_tasks cycles a session must be absent before pruning its cursor.
-// Prevents churn when sessions transiently fall off pagination or the daemon flakes.
+// 会话连续多次未出现在 list_tasks 中才删除游标，避免分页抖动或 daemon 短暂异常造成重复采集。
 const STALE_PRUNE_THRESHOLD = 5;
-// listAllTasks may return large payloads with full task metadata; align maxBuffer with getMessages.
+// listAllTasks 可能返回完整任务元数据的大 JSON，maxBuffer 与 getMessages 保持同一上限。
 const CLI_MAX_BUFFER = 10 * 1024 * 1024;
 
+/** `list_tasks` 返回的原始任务 DTO；时间字段均由 Wukong CLI 提供，单位为毫秒。 */
 interface WukongTask {
   id: string;
   session_id: string | null;
@@ -41,14 +57,17 @@ interface WukongTask {
   };
 }
 
+/** 经过空值过滤后的任务类型；后续读取消息时可安全把 `session_id` 当作字符串。 */
 type ValidWukongTask = WukongTask & { session_id: string };
 
+/** `list_tasks` 单页响应；`hasMore/nextCursor` 控制下一次子进程调用的分页参数。 */
 interface ListTasksResponse {
   hasMore: boolean;
   items: WukongTask[];
   nextCursor?: string;
 }
 
+/** 一个会话中的原始消息；assistant 的 `events` 是转换 LLM、step 和工具事件的主要输入。 */
 interface WukongMessage {
   id: string;
   conversationId: string;
@@ -61,16 +80,19 @@ interface WukongMessage {
   userMsgId?: string;
 }
 
+/** Wukong 使用的 AG-UI 事件开放结构；不同 `type` 会携带不同扩展字段。 */
 interface AguiEvent {
   type: string;
   timestamp: number;
   [key: string]: unknown;
 }
 
+/** `get_spark_agui_messages` 的最小响应结构。 */
 interface GetMessagesResponse {
   messages: WukongMessage[];
 }
 
+/** assistant turn 转换期间的当前 step 上下文，只在一次同步转换调用内存在。 */
 interface StepContext {
   stepIndex: number;
   stepId: string;
@@ -80,6 +102,7 @@ interface StepContext {
   stepSpanId: string;
 }
 
+/** 将 Wukong activity 类型映射为标准化事件使用的稳定工具名。 */
 const ACTIVITY_TYPE_TO_TOOL_NAME: Record<string, string> = {
   TERMINAL: 'terminal',
   FILE_WRITE: 'file_write',
@@ -91,10 +114,25 @@ const ACTIVITY_TYPE_TO_TOOL_NAME: Record<string, string> = {
   ARTIFACT: 'artifact',
 };
 
+/**
+ * Wukong 采集器配置。
+ * `cliPath` 主要用于非默认安装位置和测试；其余轮询、日志、状态存储配置继承自 `InputOptions`。
+ */
 export interface WukongInputOptions extends InputOptions {
   cliPath?: string;
 }
 
+/**
+ * 通过 Wukong CLI API 增量采集会话并转换为标准活动事件。
+ *
+ * 类由 Orchestrator 创建，由 `BaseInput.start()/stop()` 管理生命周期。实例不维护常驻子进程；
+ * 每次 API 请求临时创建一个 `wukong-cli` 子进程。`_collectInFlight` 防止慢请求造成轮询重入，
+ * `_abortController` 让停止流程可以取消本轮所有尚未完成的子进程。
+ *
+ * 典型流程：`onStart()` 建立历史基线 -> 定时 `collect()` -> `doCollect()` 分页列任务并并发读取消息
+ * -> `transformMessages()` 生成事件 -> BaseInput 发出 `entries` 并持久化 StateStore -> `onStop()`
+ * 取消并等待正在执行的轮询。
+ */
 export class WukongInput extends BaseInput {
   readonly id = 'wukong';
   readonly agentType = ClientType.Wukong;
@@ -105,12 +143,20 @@ export class WukongInput extends BaseInput {
   private _abortController = new AbortController();
   private _lastSkipWarnAt = 0;
 
+  /**
+   * 创建采集器，但此时不访问文件、网络或 CLI。
+   * @param opts 状态存储、日志和轮询配置；未指定 `cliPath` 时按当前平台选择默认命令。
+   */
   constructor(opts: WukongInputOptions) {
     super(opts);
     this.cliPath = opts.cliPath ?? WukongInput.getCliPath();
     this.pollIntervalMs = opts.pollIntervalMs ?? 60_000;
   }
 
+  /**
+   * 解析默认 CLI 可执行文件：macOS 使用应用包内绝对路径，其他平台依赖 `PATH` 查找。
+   * @returns 传给 `execFile` 的可执行文件路径或命令名。
+   */
   static getCliPath(): string {
     if (process.platform === 'darwin') {
       return '/Applications/Wukong.app/Contents/MacOS/wukong-cli';
@@ -118,10 +164,19 @@ export class WukongInput extends BaseInput {
     return 'wukong-cli';
   }
 
+  /**
+   * 向发现服务声明 Wukong daemon socket；路径出现后才值得进一步做可用性探测。
+   * @returns 当前用户主目录下 daemon socket 的绝对路径数组。
+   */
   static getWatchPaths(): string[] {
     return [path.join(os.homedir(), DAEMON_SOCK_REL)];
   }
 
+  /**
+   * 检查 daemon socket 是否存在，并执行 `wukong-cli service status` 确认服务处于 running。
+   * @returns 异步返回可用状态；文件不存在、命令失败、超时或输出不匹配均返回 `false`，不向上抛错。
+   * @remarks 会读取文件系统并创建一个短生命周期子进程。
+   */
   static async checkAvailability(): Promise<boolean> {
     const sockPath = path.join(os.homedir(), DAEMON_SOCK_REL);
     try {
@@ -140,6 +195,12 @@ export class WukongInput extends BaseInput {
     }
   }
 
+  /**
+   * 首次启动时建立消息数量基线，避免把安装前的全部历史会话当作新增数据发送。
+   * 已存在 `seenCounts` 时说明曾初始化过，直接沿用持久化游标。任务按五个一组并发读取；
+   * 单个会话失败记为 0，整体列举失败则写入空基线，使后续轮询仍可自恢复。
+   * @returns 初始化完成后兑现的 Promise；不返回业务事件。
+   */
   protected override async onStart(): Promise<void> {
     const state = this.stateStore.get(this.id);
     if (state.extra?.seenCounts != null && typeof state.extra.seenCounts === 'object') return;
@@ -171,9 +232,15 @@ export class WukongInput extends BaseInput {
     }
   }
 
+  /**
+   * BaseInput 定时器调用的单轮入口。
+   * 如果上一轮仍在执行则立即返回空数组，避免两个轮次同时读写同一游标；否则等待 `doCollect()`。
+   * `finally` 无论成功或异常都会清除进行中标记，异常会按 async/await 规则继续交给 BaseInput 处理。
+   * @returns 本轮新增的标准事件 Promise。
+   */
   protected async collect(): Promise<AgentActivityEntry[]> {
     if (this._collectInFlight) {
-      // Observability: a previous cycle is still running. Rate-limit warnings to once per minute.
+      // 上一轮尚未结束时跳过本轮；告警限制为每分钟一次，避免慢 CLI 持续刷日志。
       const now = Date.now();
       if (now - this._lastSkipWarnAt > 60_000) {
         this._lastSkipWarnAt = now;
@@ -200,20 +267,31 @@ export class WukongInput extends BaseInput {
     }
   }
 
+  /**
+   * 停止阶段先触发 AbortSignal 终止 CLI 子进程，再等待当前轮询释放资源。
+   * 已在采集层记录的异常不会在停止时重复抛出；最后重建控制器以支持同一实例再次启动。
+   * @returns 所有在途采集结束后的 Promise。
+   */
   protected override async onStop(): Promise<void> {
-    // Abort in-flight execFile children and wait for the cycle to settle.
+    // 先通过 AbortController 取消正在运行的 execFile 子进程，再等待当前轮询完成收尾。
     this._abortController.abort();
     if (this._collectInFlight) {
       try {
         await this._collectInFlight;
       } catch {
-        // ignore — already logged inside doCollect
+        // 异常已在 doCollect 内记录，停止阶段不重复抛出或打印。
       }
     }
-    // Reset for potential subsequent start()
+    // 重建 AbortController，使同一实例后续再次 start() 时仍可调用 CLI。
     this._abortController = new AbortController();
   }
 
+  /**
+   * 执行真正的轮询：复制持久化游标、分页取任务、分批并发取消息、转换事件并清理陈旧会话。
+   * 单个任务失败由 `Promise.allSettled` 隔离；daemon 暂停导致的列任务失败按空结果处理。
+   * 状态只在整轮末尾更新，随后由 BaseInput 的周期逻辑统一保存，减少频繁磁盘同步。
+   * @returns 本轮所有成功任务产生的标准事件。
+   */
   private async doCollect(): Promise<AgentActivityEntry[]> {
     const state = this.stateStore.get(this.id);
     const seenCounts: Record<string, number> =
@@ -234,10 +312,9 @@ export class WukongInput extends BaseInput {
     const entries: AgentActivityEntry[] = [];
     let stateChanged = false;
 
-    // Process tasks in concurrent batches (parallel within batch, sequential between batches)
-    // — mirrors the BASELINE_CONCURRENCY pattern in onStart.
+    // 任务按固定大小分批：批内并发、批间串行，与首次 baseline 的并发策略一致。
     for (let i = 0; i < tasks.length; i += COLLECT_CONCURRENCY) {
-      // Cooperative cancellation: stop processing more batches if shutdown signaled
+      // 收到停止信号后协作式退出，不再启动后续批次的子进程。
       if (!this.running) break;
       const batch = tasks.slice(i, i + COLLECT_CONCURRENCY);
       const results = await Promise.allSettled(
@@ -262,14 +339,10 @@ export class WukongInput extends BaseInput {
         }
       }
       if (batchChanged) stateChanged = true;
-      // Note: stateStore.save() is called once per cycle by BaseInput.runCycle
-      // after collect() returns. Mid-cycle batch progress is held in memory only
-      // and committed atomically at end-of-cycle (no per-batch disk fsync).
+      // BaseInput.runCycle 只在 collect() 返回后保存一次 StateStore；批次中间进度仅驻留内存，整轮结束时原子提交，避免每批 fsync。
     }
 
-    // Prune seenCounts entries for tasks no longer returned by the API.
-    // Use a grace window: only delete after STALE_PRUNE_THRESHOLD consecutive
-    // missed cycles, to avoid churn when sessions transiently fall off pagination.
+    // 清理 API 不再返回的 seenCounts 时保留宽限窗口：连续达到阈值才删除，避免分页暂时漏项造成游标反复重建。
     const staleCounters: Record<string, number> =
       (state.extra?.staleCounters != null && typeof state.extra.staleCounters === 'object')
         ? { ...(state.extra.staleCounters as Record<string, number>) }
@@ -293,7 +366,7 @@ export class WukongInput extends BaseInput {
         stateChanged = true;
       }
     }
-    // Drop staleCounters that are no longer tied to any tracked seenCounts entry
+    // 移除已不对应任何 seenCounts 游标的 staleCounters，防止状态长期膨胀。
     for (const key of Object.keys(staleCounters)) {
       if (seenCounts[key] === undefined) {
         delete staleCounters[key];
@@ -307,6 +380,13 @@ export class WukongInput extends BaseInput {
     return entries;
   }
 
+  /**
+   * 根据会话游标截取一个任务的新增消息，并只提交已经完整结束且完成 user/assistant 配对的前缀。
+   * @param task 已确认带有 `session_id` 的任务。
+   * @param prevCount 上轮已消费的消息条数，必须是非负游标。
+   * @returns 有可提交消息时返回事件和新游标；没有新增或末尾仍在流式写入时返回 `null`。
+   * @throws CLI 执行失败或响应结构无效；调用方用 `Promise.allSettled` 隔离该任务。
+   */
   private async processOneTask(
     task: ValidWukongTask,
     prevCount: number,
@@ -318,8 +398,7 @@ export class WukongInput extends BaseInput {
 
     const newMessages = messages.slice(prevCount);
 
-    // Only process completed messages to avoid the token race condition.
-    // An incomplete assistant message (still streaming) will be retried next poll.
+    // 只处理已完整结束的消息，避免 assistant 仍在流式写入时读取到不完整 token；下一轮会重试。
     const lastCompleteIdx = findLastCompleteIndex(newMessages);
     if (lastCompleteIdx < 0) return null;
 
@@ -328,6 +407,13 @@ export class WukongInput extends BaseInput {
     return { entries, newSeenCount: prevCount + processable.length };
   }
 
+  /**
+   * 把一个任务的完整消息前缀按 turn 组织，并为每条 assistant 消息调用细粒度事件转换。
+   * 连续 user 内容会合并到下一条 assistant 的首个 `llm.request`；单条转换失败只记录并跳过。
+   * @param task 提供 session、Agent 和模型元数据。
+   * @param messages 已通过完整性检查的新增消息。
+   * @returns 可交给归一化/输出链路的事件数组；该函数同步执行且不读写外部资源。
+   */
   private transformMessages(task: ValidWukongTask, messages: WukongMessage[]): AgentActivityEntry[] {
     const entries: AgentActivityEntry[] = [];
     const sessionId = task.session_id;
@@ -344,14 +430,12 @@ export class WukongInput extends BaseInput {
       'gen_ai.session.id': sessionId,
       'gen_ai.agent.type': ClientType.Wukong,
       'gen_ai.agent.id': task.id,
-      // Use the agent type as the stable name for OTLP grouping.
-      // task.name is the user-created session title (changes per conversation)
-      // which would cause consistent_agent_name validation to fail.
+      // 使用稳定的 Agent 类型作为 OTLP agent.name；用户会话标题 task.name 会变化，否则一致性校验会失败。
       'gen_ai.agent.name': ClientType.Wukong,
       ...(provider ? { 'gen_ai.provider.name': provider } : {}),
     } as const;
 
-    // Process messages in pairs: user messages get linked to the next assistant's trace
+    // 将连续 user 消息暂存并关联到下一条 assistant 的 trace，保证一个 turn 的输入输出在同一棵树中。
     let pendingUserMessages: WukongMessage[] = [];
 
     for (const msg of messages) {
@@ -364,7 +448,7 @@ export class WukongInput extends BaseInput {
         if (msg.role !== 'assistant') continue;
         const events = msg.events;
         if (!events || events.length === 0) {
-          // Assistant with no events — defer user messages, don't emit orphans
+          // assistant 没有可转换事件时丢弃待配对 user，避免把它错误关联到后续 turn。
           pendingUserMessages = [];
           continue;
         }
@@ -373,16 +457,12 @@ export class WukongInput extends BaseInput {
         const userContent = pendingUserMessages.map(m => m.content).filter(Boolean).join('\n');
         const turnEntries = this.transformAssistantMessage(task, msg, events, model, turnId, commonFields, userContent);
 
-        // If this assistant produced no entries (e.g., RUN_ERROR with no content),
-        // keep pending user messages for the next assistant. Don't emit orphans.
+        // assistant 未生成 entry（例如没有内容的 RUN_ERROR）时，把待处理 user 消息留给下一条 assistant。
         if (turnEntries.length === 0) {
           continue;
         }
 
-        // User content is already merged into step 1's llm.request gen_ai.input.messages_delta.
-        // The OTLP converter falls back to that for ENTRY input.messages. So we don't
-        // emit a separate user-hook llm.request — this avoids events without step.id
-        // and keeps llm.request field-coverage at 100%.
+        // user 内容已合并到 step 1 的 llm.request messages_delta，OTLP converter 会据此恢复 ENTRY 输入；不再额外生成缺少 step.id 的 user-hook 请求。
         pendingUserMessages = [];
 
         entries.push(...turnEntries);
@@ -396,16 +476,24 @@ export class WukongInput extends BaseInput {
       }
     }
 
-    // Skip pending user messages without subsequent assistant — these are
-    // incomplete sessions (user wrote but assistant hasn't responded yet).
-    // Don't emit them as orphan ENTRY/AGENT spans with 0 duration.
-    // They'll be processed on the next poll when the assistant responds.
-    // Note: We still need to NOT advance seenCounts past them, but the slicing
-    // logic in doCollect already handles this via isMessageComplete checks.
+    // 尾部尚无 assistant 回复的 user 消息属于未完成会话，本轮不生成零时长孤立 ENTRY/AGENT；doCollect 的完整性游标会让下轮继续处理。
 
     return entries;
   }
 
+  /**
+   * 将一条 assistant 消息的 AG-UI 事件流还原为 trace -> step -> LLM/tool 的标准事件树。
+   * 方法会处理显式/合成 step、流式文本、token、工具参数增量、activity 快照、错误和时间修正，
+   * 并补齐下游 OTLP 校验需要的父子 Span、工具响应增量和结束原因。
+   * @param task 当前 Wukong 任务。
+   * @param msg assistant 原始消息。
+   * @param events 按 Wukong 返回顺序排列的 AG-UI 事件。
+   * @param model 从任务元数据解析的模型名。
+   * @param turnId 当前 turn 的稳定标识。
+   * @param common 所有输出事件共享的主机、服务、session 和 Agent 字段。
+   * @param userContent 应写入首个 step 请求的用户内容。
+   * @returns 当前 assistant turn 产生的标准事件；不执行异步 I/O。
+   */
   private transformAssistantMessage(
     task: ValidWukongTask,
     msg: WukongMessage,
@@ -418,16 +506,16 @@ export class WukongInput extends BaseInput {
     const entries: AgentActivityEntry[] = [];
     const sessionId = task.session_id;
 
-    // Generate trace-level IDs for this turn
+    // 为当前 turn 生成 trace 级 ID，后续所有 step/tool entry 共用。
     const traceId = generateTraceId();
     const agentSpanId = generateSpanId();
 
-    // Step tracking
+    // 跟踪当前 step 的序号、稳定 ID、父 Span 和开始时间。
     let stepIndex = 0;
     let currentStep: StepContext | null = null;
     const hasStepEvents = events.some(e => e.type === 'STEP_STARTED');
 
-    // Per-step accumulators (reset on each new step)
+    // 以下累加器只属于当前 step；进入新 step 时全部重置。
     let runId: string | undefined;
     let textContent = '';
     let usageEvent: AguiEvent | undefined;
@@ -444,6 +532,7 @@ export class WukongInput extends BaseInput {
     const toolNames = new Map<string, string>();
     const toolCallParts: Array<{ type: string; id: string; name: string }> = [];
 
+    /** 根据 `STEP_STARTED` 创建新的 step 上下文，并清空只属于上一步的累加器。 */
     const startNewStep = (evt: AguiEvent): void => {
       stepIndex++;
       const stepSpanId = generateSpanId();
@@ -455,20 +544,17 @@ export class WukongInput extends BaseInput {
         startTimestamp: evt.timestamp,
         stepSpanId,
       };
-      // Reset per-step accumulators
+      // 开始新 step 时重置文本、token、工具和错误累加状态。
       textContent = '';
       usageEvent = undefined;
       firstTokenEvent = undefined;
       toolCallParts.length = 0;
-      // Tool timestamp arrays are per-step (not turn-level) so flushStepLlm
-      // computes the correct response timestamp for the CURRENT step's tools.
+      // 工具时间数组按 step 隔离，flushStepLlm 才能为当前 step 计算正确响应时间。
       allToolStartTimes.length = 0;
       allToolEndTimes.length = 0;
     };
 
-    // Determine if we need to pre-create initial step s1.
-    // Required when: no STEP_STARTED events, OR meaningful events occur before
-    // the first STEP_STARTED (e.g., early ACTIVITY_SNAPSHOT).
+    // 没有 STEP_STARTED，或首个 STEP_STARTED 前已有有效事件时，预创建合成 step s1 承接这些事件。
     const firstStepStartedIdx = events.findIndex(e => e.type === 'STEP_STARTED');
     const eventsBeforeFirstStep = firstStepStartedIdx >= 0
       ? events.slice(0, firstStepStartedIdx)
@@ -488,14 +574,14 @@ export class WukongInput extends BaseInput {
       };
     }
 
-    // Track step.ids that have been flushed by flushStepLlm so the post-loop
-    // main emit block does not double-emit for those steps.
+    // 记录已由 flushStepLlm 输出的 step.id，避免循环结束后的主输出块重复生成 LLM 对。
     const flushedStepIds = new Set<string>();
 
-    // flushStepLlm: emit the paired llm.request + llm.response for the current step
-    // using the currently-accumulated step state, then clear per-step accumulators.
-    // Called from STEP_FINISHED so each step gets its own real token/text/error data
-    // (instead of only the last step capturing it). Returns true if it emitted.
+    // flushStepLlm 使用当前累加状态为一个 step 成对生成 llm.request/response，然后清空 step 状态；STEP_FINISHED 调用它可保留每步真实 token、文本和错误。
+    /**
+     * 把当前累积状态配对输出为 `llm.request/llm.response`，随后重置 step 局部状态。
+     * @returns 实际输出事件时为 `true`；没有当前 step 或没有内容时为 `false`。
+     */
     const flushStepLlm = (): boolean => {
       if (!currentStep) return false;
       const hasContent = !!textContent || !!usageEvent || toolCallParts.length > 0 || !!runError;
@@ -510,7 +596,7 @@ export class WukongInput extends BaseInput {
       const totalTokens = numOr(usageEvent?.total_tokens) ?? (inputTokens + outputTokens);
 
       const requestTimestamp = Math.max(currentStep.startTimestamp, runStartedTs ?? 0) || msg.createdAt;
-      // For tool-calling step: response just before first tool. Else: max of req+1, runFinishedTs.
+      // 工具型 step 的 LLM 响应放在第一个工具前；纯文本 step 至少比请求晚 1ms，并采用 runFinishedTs。
       let responseTimestamp: number;
       if (currentStep.hasToolCalls && allToolStartTimes.length > 0) {
         const firstToolTs = minOf(allToolStartTimes);
@@ -521,7 +607,7 @@ export class WukongInput extends BaseInput {
         responseTimestamp = Math.max(requestTimestamp + 1, runFinishedTs ?? msg.createdAt);
       }
 
-      // Only inject userContent on step 1 (it's a turn-level prompt, not per-step)
+      // userContent 是 turn 级 prompt，只注入第一个 step，后续 step 使用上一轮工具结果增量。
       const includeUserContent = !!userContent && currentStep.stepIndex === 1;
 
       entries.push(buildAgentActivityEntry({
@@ -551,9 +637,7 @@ export class WukongInput extends BaseInput {
       for (const tc of toolCallParts) {
         outputParts.push({ type: tc.type, id: tc.id, name: tc.name });
       }
-      // For RUN_ERROR-only turns (no text, no tools), still populate
-      // output.messages with the error info so the LLM span has both
-      // input and output (satisfies semantic.llm_has_input_output).
+      // 只有 RUN_ERROR、没有文本/工具时，也把错误写入 output.messages，满足 LLM 同时具有输入和输出的语义约束。
       if (outputParts.length === 0 && runError) {
         outputParts.push({ type: 'text', content: `[error] ${runError.code}: ${runError.message}` });
       }
@@ -599,19 +683,19 @@ export class WukongInput extends BaseInput {
         },
       }));
 
-      // Clear per-step accumulators so the next step starts fresh.
+      // 输出完成后清空当前 step 累加器，下一 step 从干净状态开始。
       flushedStepIds.add(currentStep.stepId);
       textContent = '';
       usageEvent = undefined;
       firstTokenEvent = undefined;
       toolCallParts.length = 0;
-      // runError stays cleared too: it belongs to the step that just ended.
+      // runError 也保持清空，因为它只属于刚结束的 step。
       runError = undefined;
       return true;
     };
 
     for (const rawEvt of events) {
-      // Defensive: AGUI is external data. Sanitize timestamp before any use.
+      // AGUI 是外部输入，时间戳在参与排序和时长计算前必须先规范化。
       const sanitizedTs = numOr(rawEvt.timestamp) ?? msg.createdAt;
       const evt: AguiEvent = sanitizedTs === rawEvt.timestamp ? rawEvt : { ...rawEvt, timestamp: sanitizedTs };
       switch (evt.type) {
@@ -620,10 +704,7 @@ export class WukongInput extends BaseInput {
           break;
 
         case 'STEP_FINISHED':
-          // Emit the paired llm.request + llm.response for this step before the
-          // next STEP_STARTED resets per-step accumulators. This ensures every
-          // step gets its own real tokens / text / error info instead of only
-          // the last step capturing them.
+          // STEP_STARTED 重置累加器前先输出上一 step 的 LLM 对，确保每步保留自己的 token、文本和错误。
           flushStepLlm();
           break;
 
@@ -678,13 +759,13 @@ export class WukongInput extends BaseInput {
           const tcId = (evt.toolCallId as string | undefined) ?? `idx-${toolStartCount - 1}`;
           const startTs = toolStartTimestamps.get(tcId);
           const startEvtTimestamp = startTs ?? evt.timestamp;
-          // Ensure tool result is at least 1ms after tool start (non-zero span duration)
+          // 工具结果至少比开始晚 1ms，避免生成零时长 Span。
           const adjustedEndTs = Math.max(evt.timestamp, startEvtTimestamp + 1);
           const duration = startTs ? adjustedEndTs - startTs : undefined;
           const toolName = toolNames.get(tcId) ?? (evt.toolName as string | undefined) ?? (evt.name as string | undefined) ?? '';
           const args = toolArgsAccumulator.get(tcId);
 
-          // Emit tool.call (deferred from TOOL_CALL_START to capture accumulated args)
+          // tool.call 延迟到此处生成，以收集 TOOL_CALL_START 后逐步到达的完整参数。
           const syntheticStartEvt = { ...evt, timestamp: startEvtTimestamp, toolCallId: evt.toolCallId, toolName };
           entries.push(this.buildToolCallEntry(
             task, msg, syntheticStartEvt, model, turnId, toolIdx, common,
@@ -692,7 +773,7 @@ export class WukongInput extends BaseInput {
           ));
           toolIdx++;
 
-          // Emit tool.result with adjusted timestamp
+          // 使用修正后的结束时间生成 tool.result。
           const syntheticEndEvt = { ...evt, timestamp: adjustedEndTs };
           entries.push(this.buildToolResultEntry(
             task, msg, syntheticEndEvt, model, turnId, toolIdx, common, duration,
@@ -704,9 +785,7 @@ export class WukongInput extends BaseInput {
         }
 
         case 'TOOL_CALL_RESULT': {
-          // TOOL_CALL_RESULT provides richer content than TOOL_CALL_END.
-          // Match by toolCallId rather than "last tool.result" to avoid
-          // mis-attributing results when tools complete out of order.
+          // TOOL_CALL_RESULT 比 TOOL_CALL_END 内容更完整；按 toolCallId 回填对应结果，避免并发工具乱序时误写到最后一个工具。
           const tcId = evt.toolCallId as string | undefined;
           if (!tcId) break;
           const match = findEntryByToolCallId(entries, 'tool.result', tcId);
@@ -716,8 +795,7 @@ export class WukongInput extends BaseInput {
               match['gen_ai.tool.call.result'] = toJsonValue(content);
             }
             if (evt.is_error === true) {
-              // Use canonical field — `tool.result.status` is a legacy alias
-              // that the entry-builder already stripped during construction.
+              // TOOL_CALL_END 已确定结果状态；这里根据更完整的 RESULT 事件补充标准错误类型。
               match['error.type'] = match['error.type'] ?? '_OTHER';
             }
           }
@@ -748,10 +826,7 @@ export class WukongInput extends BaseInput {
       }
     }
 
-    // For synthetic-step messages with tools, split into:
-    //   step 1: LLM (declares tools, has tool_call parts, finish_reasons=tool_calls) → tools execute
-    //   step 2: LLM (final answer text only, no tool_call parts, finish_reasons=stop/end_turn)
-    // This satisfies both last_step_no_tool_call and tool_matches_llm_output rules.
+    // 合成 step 中同时有工具和最终文本时拆为两步：step 1 声明并执行工具，step 2 只输出最终答案，从而同时满足工具配对与末步无 tool_call 规则。
     if (!hasStepEvents && currentStep && currentStep.hasToolCalls && allToolStartTimes.length > 0) {
       const midLlmSpanId = generateSpanId();
       const midOutputParts: Array<Record<string, string>> = [];
@@ -763,7 +838,7 @@ export class WukongInput extends BaseInput {
       const lastToolTs = maxOf(allToolStartTimes, allToolEndTimes);
       const midRespTs = Math.max(midReqTs + 1, firstToolTs - 1);
 
-      // Emit step 1 llm.request + llm.response (tool-calling)
+      // 生成 step 1 的工具调用型 llm.request/response。
       entries.push(buildAgentActivityEntry({
         timestamp: midReqTs,
         'event.id': hashId([sessionId, msg.id, 'request', String(currentStep.stepIndex)]),
@@ -810,7 +885,7 @@ export class WukongInput extends BaseInput {
         attributes: { source: 'wukong', message_id: msg.id, conversation_id: msg.conversationId },
       }));
 
-      // Start step 2 (final answer) AFTER all tools complete
+      // 所有工具完成后再开始 step 2，承载最终答案。
       stepIndex++;
       const finalStepStart = lastToolTs + 1;
       currentStep = {
@@ -822,14 +897,13 @@ export class WukongInput extends BaseInput {
         stepSpanId: generateSpanId(),
       };
       toolCallParts.length = 0;
-      // Override runFinishedTs to ensure final step's response timing
+      // 覆盖 runFinishedTs，使最终 step 的响应时间严格晚于工具。
       if (!runFinishedTs || runFinishedTs <= finalStepStart) {
         runFinishedTs = finalStepStart + 1;
       }
     }
 
-    // Emit llm.response for the current (possibly only) step.
-    // Skip if STEP_FINISHED already flushed this step.
+    // 为当前（也可能是唯一）step 生成 LLM 对；已在 STEP_FINISHED flush 的 step 必须跳过。
     const alreadyFlushed = currentStep && flushedStepIds.has(currentStep.stepId);
     const shouldEmitFinalLlm = !alreadyFlushed && currentStep && (
       textContent || usageEvent || toolCallParts.length > 0
@@ -845,20 +919,15 @@ export class WukongInput extends BaseInput {
       const cachedTokens = numOr(usageEvent?.cached_tokens) ?? 0;
       const totalTokens = numOr(usageEvent?.total_tokens) ?? (inputTokens + outputTokens);
 
-      // Timestamp logic:
-      //   - tool-calling step: request=runStartedTs, response=just before first tool starts
-      //     (so LLM span has non-zero duration AND starts before tool spans)
-      //   - text-only final step: request=runStartedTs, response=runFinishedTs
-      // Use max(currentStep.startTimestamp, runStartedTs) — for split step 2, currentStep.startTimestamp
-      // is set to lastToolTs+1 which is later than the original runStartedTs.
+      // 时间策略：工具型 step 的响应位于首个工具前且时长非零；纯文本最终 step 使用 runFinishedTs；拆分出的 step 2 从最后工具之后开始。
       const requestTimestamp = Math.max(currentStep.startTimestamp, runStartedTs ?? 0) || msg.createdAt;
       let responseTimestamp: number;
       if (currentStep.hasToolCalls && allToolStartTimes.length > 0) {
-        // Find earliest tool timestamp (across TOOL_CALL_START and ACTIVITY_SNAPSHOT)
+        // 从 TOOL_CALL_START 与 ACTIVITY_SNAPSHOT 中取最早工具时间。
         const firstToolTs = minOf(allToolStartTimes);
         responseTimestamp = Math.max(requestTimestamp + 1, firstToolTs - 1);
       } else if (currentStep.hasToolCalls) {
-        // Tool-calling step but no tool timestamps available; fallback
+        // 工具型 step 缺少工具时间时使用安全回退时间，仍保持非零时长。
         responseTimestamp = requestTimestamp + 1;
       } else {
         responseTimestamp = Math.max(requestTimestamp + 1, runFinishedTs ?? msg.createdAt);
@@ -885,7 +954,7 @@ export class WukongInput extends BaseInput {
         },
       }));
 
-      // Build output message parts: text + tool_call declarations
+      // output message parts 同时包含可选文本和工具调用声明。
       const outputParts: Array<Record<string, string>> = [];
       if (textContent) {
         outputParts.push({ type: 'text', content: textContent });
@@ -893,8 +962,7 @@ export class WukongInput extends BaseInput {
       for (const tc of toolCallParts) {
         outputParts.push({ type: tc.type, id: tc.id, name: tc.name });
       }
-      // For RUN_ERROR-only turns, populate output.messages with error info
-      // so the LLM span has both input and output (validator constraint).
+      // 仅 RUN_ERROR 的 turn 也写 error output.messages，满足 validator 的输入/输出约束。
       if (outputParts.length === 0 && runError) {
         outputParts.push({ type: 'text', content: `[error] ${runError.code}: ${runError.message}` });
       }
@@ -944,9 +1012,7 @@ export class WukongInput extends BaseInput {
       entries.push(responseEntry);
     }
 
-    // Detect steps that have tool entries but no llm.request/response pair.
-    // For each such orphan step, emit a synthetic LLM pair declaring its tools.
-    // This satisfies structure.step_has_one_llm validation.
+    // 检测只有工具 entry、没有 LLM 对的 step，并合成声明这些工具的 request/response，满足每 step 一个 LLM 的结构规则。
     const stepsWithLlm = new Set<string>();
     const stepsWithTools = new Map<string, AgentActivityEntry[]>();
     for (const entry of entries) {
@@ -963,7 +1029,7 @@ export class WukongInput extends BaseInput {
     }
     for (const [stepId, toolEntries] of stepsWithTools) {
       if (stepsWithLlm.has(stepId)) continue;
-      // This step has tools but no LLM. Synthesize one.
+      // 当前 step 有工具但没有 LLM，补一个合成 LLM 对。
       const callEntries = toolEntries.filter(e => e['event.name'] === 'tool.call');
       const synthOutputParts: Array<Record<string, string>> = [];
       for (const ce of callEntries) {
@@ -973,12 +1039,12 @@ export class WukongInput extends BaseInput {
           name: String(ce['gen_ai.tool.name'] ?? ''),
         });
       }
-      // Compute timing from tool entries
+      // 从工具 entry 推导合成 LLM 的请求/响应时间。
       const toolTimes = toolEntries.map(e => Number(e['time_unix_nano'] ?? 0) / 1e6);
       const synthReqTs = minOf(toolTimes) - 1;
       const synthRespTs = maxOf(toolTimes) + 1;
       const synthLlmSpanId = generateSpanId();
-      // Find the parent_span_id from one of the tool entries (they all share step's parent)
+      // 从任一工具 entry 取得共享的 step parent_span_id。
       const stepParentSpanId = (toolEntries[0]['parent_span_id'] as string | undefined) ?? agentSpanId;
 
       entries.push(buildAgentActivityEntry({
@@ -1024,9 +1090,7 @@ export class WukongInput extends BaseInput {
       }));
     }
 
-    // Backfill trace_id on any entries that lack it.
-    // Also backfill step.id on tool entries that lack one — use the FIRST step.id
-    // (not currentStep which may be a later step).
+    // 为缺少 trace_id 的 entry 回填当前 turn trace；缺少 step.id 的工具归入第一个 step，而不是可能已推进的 currentStep。
     let firstStepId: string | undefined;
     for (const entry of entries) {
       const sid = entry['gen_ai.step.id'];
@@ -1041,8 +1105,7 @@ export class WukongInput extends BaseInput {
       }
     }
 
-    // Enrich llm.request messages_delta with tool_call_response messages from prior step's tools.
-    // This makes messages_delta truly incremental: step 1 = user input, step 2+ = prior tool results.
+    // 将上一 step 的 tool_call_response 注入下一 step 的 llm.request messages_delta：step 1 是用户输入，step 2+ 是前一步工具结果。
     const toolResultsByStep = new Map<string, Array<{ id: string; name: string; result: unknown }>>();
     for (const entry of entries) {
       if (entry['event.name'] !== 'tool.result') continue;
@@ -1056,7 +1119,7 @@ export class WukongInput extends BaseInput {
       });
       toolResultsByStep.set(sid, arr);
     }
-    // Get sorted step.ids by stepIndex (parsed from suffix :sN)
+    // 从 :sN 后缀解析 stepIndex，并按序取得 step.id。
     const stepIds = Array.from(new Set(entries
       .map(e => e['gen_ai.step.id'])
       .filter((s): s is string => typeof s === 'string' && !!s)
@@ -1065,7 +1128,7 @@ export class WukongInput extends BaseInput {
       const nb = parseInt(b.match(/:s(\d+)$/)?.[1] ?? '0', 10);
       return na - nb;
     });
-    // For each step N>=2, prepend tool_call_response from step N-1 to its llm.request messages_delta
+    // 对每个 N>=2 的 step，把 N-1 的工具响应前置到其 llm.request messages_delta。
     for (let i = 1; i < stepIds.length; i++) {
       const prevStepId = stepIds[i - 1];
       const curStepId = stepIds[i];
@@ -1079,7 +1142,7 @@ export class WukongInput extends BaseInput {
           response: typeof t.result === 'string' ? t.result : JSON.stringify(t.result ?? ''),
         }],
       }));
-      // Find the llm.request for this step
+      // 查找当前 step 对应的 llm.request entry。
       for (const entry of entries) {
         if (entry['event.name'] !== 'llm.request') continue;
         if (entry['gen_ai.step.id'] !== curStepId) continue;
@@ -1093,6 +1156,10 @@ export class WukongInput extends BaseInput {
     return entries;
   }
 
+  /**
+   * 按错误和工具状态推导标准 LLM 结束原因。
+   * @returns 出错为 `stop`，有工具为 `tool_calls`，否则为 `end_turn`。
+   */
   private inferFinishReasons(
     hasToolCalls: boolean,
     runError: { code: string; message: string } | undefined,
@@ -1102,6 +1169,11 @@ export class WukongInput extends BaseInput {
     return ['end_turn'];
   }
 
+  /**
+   * 把 `TOOL_CALL_START` 及后续累积参数构建为一条标准 `tool.call`。
+   * 参数缺失时保持字段省略；本函数只创建对象，不执行工具或外部 I/O。
+   * @returns 带 trace、step 和父 Span 关联的工具调用事件。
+   */
   private buildToolCallEntry(
     task: ValidWukongTask,
     msg: WukongMessage,
@@ -1145,6 +1217,10 @@ export class WukongInput extends BaseInput {
     });
   }
 
+  /**
+   * 把 `TOOL_CALL_END` 构建为标准 `tool.result`，并结合开始时间计算持续时长和规范化状态。
+   * @returns 工具结果事件；找不到开始事件时仍使用安全时间和已知名称生成可关联记录。
+   */
   private buildToolResultEntry(
     task: ValidWukongTask,
     msg: WukongMessage,
@@ -1189,6 +1265,11 @@ export class WukongInput extends BaseInput {
     });
   }
 
+  /**
+   * 将 Wukong 聚合型 `ACTIVITY_SNAPSHOT` 拆成成对的 `tool.call/tool.result`。
+   * 不同 activity 类型在此提取各自参数、结果、错误和时间，未知类型使用通用 input/output 字段。
+   * @returns 始终包含调用和结果两条标准事件的数组。
+   */
   private transformActivitySnapshot(
     task: ValidWukongTask,
     msg: WukongMessage,
@@ -1207,13 +1288,13 @@ export class WukongInput extends BaseInput {
 
     const startTime = numOr(content?.start_time) ?? evt.timestamp;
     const rawFinishTime = numOr(content?.finish_time) ?? evt.timestamp;
-    // Ensure tool span has non-zero duration (start != end)
+    // 保证 activity 转换出的工具 Span 起止时间不同。
     const finishTime = rawFinishTime > startTime ? rawFinishTime : startTime + 1;
     const duration = finishTime > startTime ? finishTime - startTime : undefined;
 
     const toolCallId = `activity-${msg.id}-${toolIdx}`;
 
-    // Extract arguments based on activity type
+    // 按 activity 类型提取并规范化工具参数。
     let args: unknown | undefined;
     let result: unknown | undefined;
 
@@ -1319,6 +1400,12 @@ export class WukongInput extends BaseInput {
     return [toolCallEntry, toolResultEntry];
   }
 
+  /**
+   * 通过多个短生命周期 `wukong-cli ... list_tasks` 子进程拉取全部任务页。
+   * 每页最多 50 条，总量达到 500 时截断并告警；缺少 `session_id` 的任务会被过滤。
+   * @returns 有效任务数组，按 CLI 分页顺序排列。
+   * @throws 子进程失败、超时、取消、非 JSON 输出或响应结构不符合约定时抛错。
+   */
   private async listAllTasks(): Promise<Array<WukongTask & { session_id: string }>> {
     const allTasks: Array<WukongTask & { session_id: string }> = [];
     let cursor: string | undefined;
@@ -1362,6 +1449,13 @@ export class WukongInput extends BaseInput {
     return allTasks;
   }
 
+  /**
+   * 调用 `get_spark_agui_messages` 读取一个会话的完整消息列表。
+   * 空标准输出按“暂无消息”处理；标准错误只截取前 256 字符写日志，避免日志膨胀。
+   * @param conversationId Wukong session/conversation 标识。
+   * @returns CLI 响应 Promise。
+   * @throws 子进程失败、超时、取消、JSON 无法解析或缺少 `messages` 数组时抛错。
+   */
   private async getMessages(conversationId: string): Promise<GetMessagesResponse> {
     const { stdout, stderr } = await execFile(
       this.cliPath,
@@ -1390,6 +1484,7 @@ export class WukongInput extends BaseInput {
   }
 }
 
+/** 使用 NUL 分隔输入并计算 SHA-256，生成可重复的事件 ID，避免普通拼接产生边界歧义。 */
 function hashId(parts: Array<string | number | undefined>): string {
   return crypto
     .createHash('sha256')
@@ -1397,15 +1492,18 @@ function hashId(parts: Array<string | number | undefined>): string {
     .digest('hex');
 }
 
+/** 仅接受有限数值，过滤 `NaN`、无穷值和错误类型，供不可信 CLI 字段安全取值。 */
 function numOr(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
+/** 删除 `null/undefined` 字段；全部为空时返回 `undefined`，从而让构建器省略该属性。 */
 function compactObject(fields: Record<string, unknown>): Record<string, unknown> | undefined {
   const entries = Object.entries(fields).filter(([, value]) => value !== undefined && value !== null);
   return entries.length > 0 ? Object.fromEntries(entries) : undefined;
 }
 
+/** 综合 exit code、错误文本和状态字符串，归一化 activity 的三态结果。 */
 function resolveActivityResultStatus(content: Record<string, unknown> | undefined): 'success' | 'failure' | 'cancelled' {
   if (!content) return 'success';
   if (content.exit_code !== undefined && content.exit_code !== 0) return 'failure';
@@ -1418,20 +1516,24 @@ function resolveActivityResultStatus(content: Record<string, unknown> | undefine
   return 'success';
 }
 
+/** 优先使用非负 `turnIndex` 生成稳定 turn ID；旧消息没有索引时退回消息 ID。 */
 function resolveTurnId(sessionId: string, msg: WukongMessage): string {
   if (msg.turnIndex >= 0) return `${sessionId}:t${msg.turnIndex}`;
   return `${sessionId}:${msg.id}`;
 }
 
+/** 生成 16 字节随机数对应的 32 位十六进制 trace ID。 */
 function generateTraceId(): string {
   return crypto.randomBytes(16).toString('hex');
 }
 
+/** 生成 8 字节随机数对应的 16 位十六进制 span ID。 */
 function generateSpanId(): string {
   return crypto.randomBytes(8).toString('hex');
 }
 
-// Iterative min/max to avoid spread-arg call stack limits on large arrays.
+// 使用迭代 min/max，避免大数组展开为函数参数时超过调用栈/参数数量限制。
+/** 迭代求最小时间；调用方应传入非空数组，空数组会得到正无穷。 */
 function minOf(arr: ReadonlyArray<number>): number {
   let m = Number.POSITIVE_INFINITY;
   for (let i = 0; i < arr.length; i++) {
@@ -1441,6 +1543,7 @@ function minOf(arr: ReadonlyArray<number>): number {
   return m;
 }
 
+/** 在一个或多个数组中迭代求最大时间；全部为空时返回负无穷。 */
 function maxOf(...arrs: ReadonlyArray<ReadonlyArray<number>>): number {
   let m = Number.NEGATIVE_INFINITY;
   for (const arr of arrs) {
@@ -1452,14 +1555,19 @@ function maxOf(...arrs: ReadonlyArray<ReadonlyArray<number>>): number {
   return m;
 }
 
+/** 判断消息能否推进持久化游标：assistant 必须没有事件，或已出现 `RUN_FINISHED/RUN_ERROR`。 */
 function isMessageComplete(msg: WukongMessage): boolean {
   if (msg.role !== 'assistant') return true;
   if (!msg.events || msg.events.length === 0) return true;
   return msg.events.some(e => e.type === 'RUN_FINISHED' || e.type === 'RUN_ERROR');
 }
 
+/**
+ * 查找从数组开头连续可提交的最后一个索引，并剔除没有 assistant 配对的尾部 user 消息。
+ * @returns 可提交索引；`-1` 表示当前没有任何消息可以安全推进游标。
+ */
 function findLastCompleteIndex(messages: WukongMessage[]): number {
-  // First find the last index where all messages 0..i are complete (no streaming)
+  // 先找到从 0 到 i 全部结束流式写入的最后位置。
   let lastComplete = messages.length - 1;
   for (let i = 0; i < messages.length; i++) {
     if (!isMessageComplete(messages[i])) {
@@ -1467,14 +1575,17 @@ function findLastCompleteIndex(messages: WukongMessage[]): number {
       break;
     }
   }
-  // Then trim trailing user messages that don't have a paired assistant.
-  // These would create orphan ENTRY/AGENT spans with no LLM children.
+  // 再去掉没有配对 assistant 的尾部 user 消息，避免生成没有 LLM 子节点的孤立 ENTRY/AGENT。
   while (lastComplete >= 0 && messages[lastComplete].role === 'user') {
     lastComplete--;
   }
   return lastComplete;
 }
 
+/**
+ * 从后向前查找同一工具调用最近生成的指定事件，供后到达的 RESULT 事件补写结果和错误信息。
+ * @returns 匹配事件；尚未生成对应调用时返回 `undefined`。
+ */
 function findEntryByToolCallId(
   entries: AgentActivityEntry[],
   eventName: string,

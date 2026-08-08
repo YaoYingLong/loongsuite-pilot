@@ -6,6 +6,7 @@
  *
  * 移植自 claude-code-plugin .../src/hooks.js 的 extractToolResult / extractToolError。
  * 仅保留 JSONL 输出需要的归一化函数,丢弃 OTel 事件构造 + UI 友好截断函数。
+ * 这些纯函数由 Claude processor 构造 tool.result 时调用，不读写文件也不修改外部状态。
  */
 
 /**

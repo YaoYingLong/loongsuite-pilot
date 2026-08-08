@@ -1,3 +1,18 @@
+/**
+ * Hook 原始事件到统一 Agent 事件字段的轻量归一化器。
+ *
+ * 本文件位于部署到用户目录的 Hook 运行资产中，不依赖主 Collector bundle。Cursor、Qoder、
+ * Qoder Work 等 processor 会直接导入这里的纯函数，把各产品不同命名的 stdin/transcript
+ * 记录转换为接近 `AgentActivityEntry` 的扁平对象，再写入 history JSONL；随后 `src/inputs/*`
+ * 读取这些文件并进入统一脱敏、扇出和 Trace 转换流程。
+ *
+ * 主要职责包括：安全 JSON 化、纳秒时间戳转换、provider/user 推断、读取运行时配置、执行
+ * `captureMessageContent` 内容策略、保留未映射的 Agent 私有字段，以及构造 Cursor/Qoder 记录。
+ * 所有函数均同步且无网络访问；配置或内容解析失败时采用保守默认值，避免 Hook 异常影响宿主。
+ * 本文件使用 ES Module 的命名导出，调用方通过 `import { ... }` 只加载所需 API。
+ */
+
+// Node.js 内置模块：分别用于哈希/UUID、配置文件读取、主机身份和跨平台路径。
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -143,6 +158,11 @@ export function sanitizeObject(obj) {
   return Object.keys(out).length > 0 ? out : undefined;
 }
 
+/**
+ * 字符串看起来是 JSON 时解析它，否则保留原值。
+ * @param {unknown} value Hook 字段原值。
+ * @returns {unknown} JSON 解析结果、原始非 JSON 字符串，或空字符串对应的 undefined。
+ */
 export function parseMaybeJson(value) {
   if (typeof value !== 'string') return value;
   const trimmed = value.trim();
@@ -154,6 +174,13 @@ export function parseMaybeJson(value) {
   }
 }
 
+/**
+ * 把 Date、ISO 字符串、秒/毫秒/纳秒数字统一成十进制纳秒字符串。
+ *
+ * 使用字符串承载是为了避免 JavaScript Number 超过安全整数范围；无法识别的输入回退到当前时间。
+ * @param {Date|string|number} value 原始时间值。
+ * @returns {string} Unix epoch 纳秒字符串。
+ */
 export function timestampToUnixNanos(value = Date.now()) {
   if (value instanceof Date) return `${value.getTime()}000000`;
   if (typeof value === 'string') {
@@ -216,6 +243,14 @@ export function hashJson(value) {
   }
 }
 
+/**
+ * 读取 Hook 运行所需的最小配置。
+ *
+ * `AGENT_DATA_COLLECTION_CONFIG` 可覆盖默认 `<dataDir>/config.json`；用户 ID 又可被
+ * `LOONGSUITE_PILOT_USER_ID` 覆盖。读取或 JSON.parse 失败时返回空配置而不是抛错。
+ * @param {string} dataDir Pilot 数据目录。
+ * @returns {{userId: string, agents: Record<string, object>}} 用户标识与逐 Agent 内容策略。
+ */
 export function loadHookRuntimeConfig(dataDir) {
   const configPath = process.env.AGENT_DATA_COLLECTION_CONFIG
     || path.join(dataDir || path.join(os.homedir(), '.loongsuite-pilot'), 'config.json');
@@ -265,6 +300,12 @@ export function inferProviderName(record) {
   return 'unknown';
 }
 
+/**
+ * 按“事件显式字段 -> 运行时配置 -> 主机名”的优先级解析用户标识。
+ * @param {Record<string, unknown>} record 原始或半归一化事件。
+ * @param {{userId?: string}} runtimeConfig Hook 运行时配置。
+ * @returns {string} 非空用户标识。
+ */
 export function resolveUserId(record, runtimeConfig = {}) {
   return getStringValue(record, 'user.id')
     || getStringValue(record, 'user_id')
@@ -360,13 +401,13 @@ export function mapSourceHookEventToEventName(sourceEvent) {
 
 const DEFAULT_CURSOR_MODEL = 'composer-2.5';
 
-/** Coerce raw model string to a concrete model name. */
+/** 把空值、`default` 和 `unknown` 归为 Cursor 当前默认模型名。 */
 export function resolveCursorModel(rawModel) {
   if (!rawModel || rawModel === 'default' || rawModel === 'unknown') return DEFAULT_CURSOR_MODEL;
   return rawModel;
 }
 
-/** Whether this event type carries user input messages (prompt). */
+/** 判断该标准事件类型是否应携带用户输入消息。 */
 export function hasInputMessages(eventName) {
   return eventName === 'llm.request' || eventName === 'other';
 }
@@ -380,7 +421,7 @@ export function buildCursorHookRecord(payload, options = {}) {
   const model = resolveCursorModel(rawModel);
   const toolOutput = parseMaybeJson(payload.tool_output ?? payload.result_json ?? payload.tool_results);
   const toolArguments = parseMaybeJson(payload.tool_input);
-  // Stop events duplicate token/cost data already reported by afterAgentResponse
+  // Stop 会重复携带 afterAgentResponse 已报告的 token/cost，必须清空以免下游重复汇总。
   const isStopEvent = sourceEvent.toLowerCase() === 'stop';
   const record = {
     'event.id': getStringValue(payload, 'event.id') || crypto.randomUUID(),
@@ -609,7 +650,7 @@ function inferQoderVariant(row, sourceAgentId, sessionId) {
   ) {
     return 'qoder-cli';
   }
-  // DB-based detection via shared helper
+  // transcript 无法区分 Desktop/IntelliJ 时，再用共享 SQLite helper 判定来源。
   if (sessionId) {
     const result = isQoderIdeaSession(sessionId);
     if (result === true) return 'qoder-idea';

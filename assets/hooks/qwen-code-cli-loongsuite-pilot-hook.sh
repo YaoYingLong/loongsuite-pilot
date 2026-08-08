@@ -1,22 +1,24 @@
 #!/usr/bin/env bash
+# 通过 PATH 选择 Bash；严格模式把未定义变量、命令或管道失败交给后续 fail-open 处理。
 set -euo pipefail
 
-# Qwen Code CLI hook entrypoint — delegates to qwen-code-cli-hook-processor.mjs.
+# Qwen Code CLI Hook 入口：把 stdin JSON 委托给 qwen-code-cli-hook-processor.mjs。
 #
-# Usage (registered in ~/.qwen/settings.json by pilot HookStrategy):
+# HookStrategy 将下列命令注册到 ~/.qwen/settings.json：
 #   $PILOT_DATA/hooks/qwen-code-cli-loongsuite-pilot-hook.sh <subcommand>
 #
-# Subcommand (v2: 只处理 3 个):
+# v2 只处理三个子命令：
 #   stop / subagent-start / subagent-stop
 #
-# Fail-open 原则: 任何错误都输出 "{}" 并 exit 0,不阻塞宿主 agent。
+# stop 解析 transcript 并写 JSONL；subagent 事件先累积 state。任何故障输出 `{}` 且
+# exit 0，遥测不能阻塞宿主 Agent。
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROCESSOR="$SCRIPT_DIR/qwen-code-cli-hook-processor.mjs"
 EMPTY_RESULT='{}'
 SUBCOMMAND="${1:-unknown}"
 
-# Only process registered subcommands; early-return for legacy/unregistered ones.
+# 仅分派当前注册的子命令；未知/旧版事件直接返回空 JSON。
 case "$SUBCOMMAND" in
   stop|subagent-start|subagent-stop)
     ;;
@@ -85,7 +87,7 @@ node_is_suitable() {
 NODE_PIN_FILE="$HOME/.loongsuite-pilot/node-bin"
 NODE_BIN=""
 
-# 1. pinned node
+# 1. 优先使用安装器固定的 Node。
 if [[ -f "$NODE_PIN_FILE" ]]; then
   pinned="$(cat "$NODE_PIN_FILE" 2>/dev/null | tr -d '[:space:]')"
   if [[ -n "$pinned" ]] && node_is_suitable "$pinned"; then
@@ -93,7 +95,7 @@ if [[ -f "$NODE_PIN_FILE" ]]; then
   fi
 fi
 
-# 2. fallback search (read-only)
+# 2. 固定路径不可用时只读搜索常见 Node 安装位置。
 if [[ -z "$NODE_BIN" ]]; then
   nvm_candidates=("$HOME/.nvm/versions/node"/*/bin/node)
   candidates=()
@@ -125,7 +127,7 @@ if [[ -z "$NODE_BIN" ]]; then
   exit 0
 fi
 
-# Hook stdin payload 通过管道转发给 processor
+# processor 直接继承 Hook 的 stdin 管道，避免 Shell 解码/重编码 JSON。
 if ! "$NODE_BIN" "$PROCESSOR" "$SUBCOMMAND"; then
   echo "[qwen-code-cli-hook] processor failed (subcommand=$SUBCOMMAND)" >&2
   log_error "processor_failed" "hook processor exited non-zero (subcommand=$SUBCOMMAND)"

@@ -1,3 +1,4 @@
+/** Qoder CLI session 文件轮询备用 Input；从本地对话记录增量构建标准事件。 */
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
@@ -22,15 +23,17 @@ export interface QoderCliSessionInputOptions extends Omit<SessionInputOptions, '
 }
 
 /**
- * Qoder CLI — native session segment token usage input.
+ * Qoder CLI 原生 session segment token usage 输入。
  *
- * Reads Qoder's own session segment JSONL files and emits only token usage
- * records from model response completion events.
+ * BaseSessionInput 按 offset tail `segments` 目录下的 JSONL；本类只把
+ * `model.response.completed` 转为 llm.response，其他 session 事件忽略。首次启动 baseline 到现有
+ * 文件 EOF，不回放安装前历史。该来源主要补充 token 用量，不尝试伪造 prompt 或工具事件。
  */
 export class QoderCliSessionInput extends BaseSessionInput {
   readonly id = 'qoder-cli-session';
   readonly agentType = ClientType.QoderCli;
 
+  /** 配置 session 根目录、glob 文件模式和轮询间隔；文件读取由 BaseSessionInput 启动后执行。 */
   constructor(opts: QoderCliSessionInputOptions) {
     super({
       stateStore: opts.stateStore,
@@ -41,14 +44,19 @@ export class QoderCliSessionInput extends BaseSessionInput {
     });
   }
 
+  /** 返回 Qoder CLI session 根目录，供发现服务监听。 */
   static getWatchPaths(): string[] {
     return [resolveHome(DEFAULT_SESSION_DIR)];
   }
 
+  /** 检查默认 session 目录是否存在。 */
   static async checkAvailability(): Promise<boolean> {
     return directoryExists(resolveHome(DEFAULT_SESSION_DIR));
   }
 
+  /**
+   * 枚举启动时已有 segment，并把每个文件 offset 设置到当前大小，同时记录 inode 供轮转检测。
+   */
   protected override async onStart(): Promise<void> {
     const files = await this.discoverSessionFiles();
     for (const filePath of files) {
@@ -58,17 +66,22 @@ export class QoderCliSessionInput extends BaseSessionInput {
         this.stateStore.setOffset(stateKey, stat.size);
         this.stateStore.update(stateKey, { extra: { inode: (stat as any).ino } });
       } catch {
-        // File may disappear while Qoder rotates or removes session data.
+        // Qoder 可能在 stat 前后轮转或删除 session 文件；忽略本次，后续发现周期会重新扫描。
       }
     }
   }
 
+  /** 按 cwd/session/segments 三层结构发现 JSONL，并排序以获得稳定处理顺序。 */
   protected async discoverSessionFiles(): Promise<string[]> {
     const files: string[] = [];
     await collectSegmentFiles(this.sessionDir, files);
     return files.sort();
   }
 
+  /**
+   * 将一条 model.response.completed 转为 token usage 事件；其他类型返回 null。
+   * 文件路径提供 session/cwd key，event.id 由稳定源字段哈希得到，便于重试去重。
+   */
   protected async processSessionLine(
     record: Record<string, unknown>,
     filePath: string,
@@ -119,11 +132,13 @@ export class QoderCliSessionInput extends BaseSessionInput {
     });
   }
 
+  /** 为每个 segment 文件生成独立 StateStore key。 */
   private stateKey(filePath: string): string {
     return `${this.id}:${filePath}`;
   }
 }
 
+/** 按 Qoder 的 cwd/session 目录结构递归到 segments，并把发现结果追加到 files。 */
 async function collectSegmentFiles(dir: string, files: string[]): Promise<void> {
   let cwdDirs: Dirent[];
   try {
@@ -153,6 +168,7 @@ async function collectSegmentFiles(dir: string, files: string[]): Promise<void> 
   }
 }
 
+/** 收集单个 segments 目录中的 `.jsonl` 普通文件；目录不可读时按空目录处理。 */
 async function collectJsonlFilesInSegments(dir: string, files: string[]): Promise<void> {
   let entries: Dirent[];
   try {
@@ -168,6 +184,7 @@ async function collectJsonlFilesInSegments(dir: string, files: string[]): Promis
   }
 }
 
+/** 从 `<cwdKey>/<sessionId>/segments/<file>.jsonl` 路径反向取得 session 和 cwd key。 */
 function extractSessionInfo(filePath: string): { sessionId: string; cwdKey: string } {
   const segmentsDir = path.dirname(filePath);
   const sessionDir = path.dirname(segmentsDir);
@@ -178,6 +195,7 @@ function extractSessionInfo(filePath: string): { sessionId: string; cwdKey: stri
   };
 }
 
+/** 用文件、序号、请求和 turn 等稳定字段计算 SHA-256 event ID。 */
 function buildDeterministicEventId(
   filePath: string,
   record: Record<string, unknown>,
@@ -199,6 +217,7 @@ function buildDeterministicEventId(
     .digest('hex');
 }
 
+/** 兼容 number、数字字符串和日期字符串；全部无效时使用当前时间。 */
 function parseTimestamp(value: unknown): number {
   if (typeof value === 'number' && Number.isFinite(value)) return value;
   if (typeof value !== 'string') return Date.now();
@@ -210,31 +229,37 @@ function parseTimestamp(value: unknown): number {
   return Number.isNaN(parsed) ? Date.now() : parsed;
 }
 
+/** 把普通对象原样返回，其余值转换为空对象。 */
 function asRecord(value: unknown): Record<string, unknown> {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
 }
 
+/** 只接受非空字符串。 */
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
+/** 将可用于稳定 ID 的字符串或有限数字转为字符串，其他值退回空串。 */
 function stableValue(value: unknown): string {
   if (typeof value === 'string') return value;
   if (typeof value === 'number' && Number.isFinite(value)) return String(value);
   return '';
 }
 
+/** 仅保留有限 number。 */
 function finiteNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
+/** 两个 token 分项均存在时才生成总数。 */
 function sumIfPresent(left: number | undefined, right: number | undefined): number | undefined {
   if (left === undefined || right === undefined) return undefined;
   return left + right;
 }
 
+/** 只在值不为 undefined 时写入 attributes，避免输出无意义空字段。 */
 function addIfPresent(
   target: Record<string, JsonValue>,
   key: string,

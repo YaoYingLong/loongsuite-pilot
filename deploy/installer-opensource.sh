@@ -3,6 +3,10 @@
 #
 # 本脚本同时负责首次安装、重新安装、升级和卸载。它使用了 Bash 数组、[[ ]]
 # 条件表达式和 local 等 Bash 专有语法，因此必须由 Bash 执行，不能改用 sh。
+# 安装链为：解析参数/Node → 下载解压 → cli-probe 探测 Agent → 部署版本目录与 current 指针
+# → npm production 依赖/postinstall 资产 → 合并 config.json → 安装稳定 CLI → 注册并启动系统服务。
+# 升级保留 previous 并在健康检查失败时 rollback；卸载还会清理各 Agent Hook/插件配置。
+# 网络、文件、npm、systemd/launchd/init.d 均是外部副作用；严格模式下未处理失败会返回非零退出码。
 #
 # 首次安装（Install）：
 #   curl -fsSL https://loongcollector-community-edition.oss-cn-shanghai.aliyuncs.com/loongsuite-pilot/installer.sh | bash
@@ -209,6 +213,7 @@ _resolve_realpath() {
     realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || echo "$1"
 }
 
+# 只读判断 _node_is_app_bundle 对应条件，以 Shell 退出码 0/非 0 表示真/假。
 _node_is_app_bundle() {
     # 返回码 0 表示 Node 位于 macOS .app 包内，这种 Node 不适合作为常驻服务运行时。
     local resolved
@@ -226,6 +231,7 @@ _node_is_app_bundle() {
     return 1
 }
 
+# 只读判断 _node_is_suitable 对应条件，以 Shell 退出码 0/非 0 表示真/假。
 _node_is_suitable() {
     # 入参 $1：Node 候选路径；成功返回 0，任何条件不满足都返回 1。
     local bin="$1"
@@ -240,6 +246,7 @@ _node_is_suitable() {
     return 0
 }
 
+# 按 pin、版本管理器、常见安装路径和 PATH 依次寻找 Node.js 18+，并返回绝对路径。
 resolve_node() {
     # 输出：第一个满足条件的 Node 绝对路径；找不到时不输出并返回 1。
     # 定义局部空数组
@@ -278,6 +285,7 @@ resolve_node() {
     return 1
 }
 
+# 检查 curl/wget、tar、Node、npm 等安装前置条件，缺失时终止安装。
 check_deps() {
     # 副作用：设置全局 NODE_BIN/NODE_MAJOR/NPM_BIN，并写入 $DATA_DIR/node-bin。
     msg "==> 检查依赖..." "==> Checking dependencies..."
@@ -396,6 +404,7 @@ download_and_extract() {
 # ============================================================
 PROBE_RESULT="[]"
 
+# 调用发布包 cli-probe.cjs 探测本机 Agent，并把结果交给安装选择流程。
 probe_agents() {
     # 探测失败属于可降级错误：保留空数组并继续安装，而不是让严格模式终止脚本。
     msg "==> 探测 AI Agent..." "==> Probing AI Agents..."
@@ -718,6 +727,9 @@ deploy_package() {
     msg "==> 部署 hook 脚本..." "==> Deploying hook scripts..."
     # 注意：这里判断的是安装器进程当前目录$HOME/.loongsuite-pilot/versions/1.0.0_d066770下的scripts/postinstall.js。
     if [ -f scripts/postinstall.js ]; then
+        # 当前安装器的 DATA_DIR Shell 变量不会自动成为子进程的 LOONGSUITE_PILOT_DATA_DIR。
+        # 因此使用自定义 --data-dir 时，postinstall 的 Hook/Plugin/Skill 实际落点需后续核实；
+        # 未确认前不能假定它与 config.json 中 dataDir 一致。
         # 执行postinstall脚本，作用是将项目下的assets目录中的hooks、plugins、skills目录中的内容拷贝到$HOME/.loongsuite-pilot/的hooks、plugins、skills目录中
         # 且给hooks目录下的所有sh脚本或者ps1脚本添加读和执行权限755，防止执行时无权限
         "$NODE_BIN" scripts/postinstall.js
@@ -978,6 +990,7 @@ _sed_inplace() {
     fi
 }
 
+# 以幂等方式执行 inject_qodercli_token_intercept 的 Agent 配置注入，并尽量保留用户原配置。
 inject_qodercli_token_intercept() {
     # 未选择 qoder 时先清除历史注入；命令或拦截脚本不存在时直接跳过。
     if ! echo "$SELECTED_AGENTS" | grep -q 'qoder'; then remove_qodercli_token_intercept; return 0; fi
@@ -1037,6 +1050,7 @@ INTERCEPTBLOCK
     echo ""
 }
 
+# 以 best-effort 方式执行 remove_qodercli_token_intercept 清理，目标不存在时保持可重复调用。
 remove_qodercli_token_intercept() {
     # 在所有常见 rc 文件中按成对 marker 删除托管 block；文件不存在则跳过。
     for file in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.profile"; do
@@ -1111,6 +1125,7 @@ PLIST
     echo ""
 }
 
+# 以 best-effort 方式执行 remove_qoderwork_runtime_wrapper 清理，目标不存在时保持可重复调用。
 remove_qoderwork_runtime_wrapper() {
     # 只在 macOS 清理本脚本创建的 plist，以及值中含 loongsuite-pilot 的会话变量。
     if [ "$(uname)" != "Darwin" ]; then return 0; fi
@@ -1155,6 +1170,7 @@ _rc_user_override_present() {
     return 1
 }
 
+# 以幂等方式执行 inject_claude_code_fetch_intercept 的 Agent 配置注入，并尽量保留用户原配置。
 inject_claude_code_fetch_intercept() {
     # 未选择 claude-code 时清除历史 block；claude 或拦截脚本不存在时跳过。
     # 如果用户选中的代理列表里不包含 claude-code 组件，就执行清理函数删掉 Claude 相关的拦截注入配置，然后直接结束当前函数（正常返回）；
@@ -1281,6 +1297,7 @@ get_installed_version() {
     fi
 }
 
+# 读取并展示 get_version_from_dir 对应的版本或运行信息，不改变服务状态。
 get_version_from_dir() {
     # 入参 $1：包目录；输出 version= 后的值，缺失时输出空字符串。
     local vf="$1/VERSION"
@@ -1291,6 +1308,7 @@ get_version_from_dir() {
     fi
 }
 
+# 读取并展示 get_commit_from_dir 对应的版本或运行信息，不改变服务状态。
 get_commit_from_dir() {
     # 入参 $1：包目录；输出 git_commit= 后的值。
     local vf="$1/VERSION"
@@ -1301,6 +1319,7 @@ get_commit_from_dir() {
     fi
 }
 
+# 读取并展示 show_version_info 对应的版本或运行信息，不改变服务状态。
 show_version_info() {
     # 将三个字段格式化为面向用户的单行版本摘要。
     local dir="$1"
@@ -1536,6 +1555,7 @@ try {
     fi
 }
 
+# 读取并展示 print_summary 对应的版本或运行信息，不改变服务状态。
 print_summary() {
     # 入参 $1 仅允许 install/upgrade；打印版本、目录、SLS 和常用命令。
     local action="$1"  # install / upgrade

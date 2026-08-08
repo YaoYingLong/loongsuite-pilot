@@ -14,6 +14,9 @@
  *     说明 LLM 又调了一次 → 关闭当前 step 进入下一个
  *   - 末尾如果有 last_assistant_message,补一个 final step(无 tools)
  *
+ * 当前仓库生产入口未发现对本模块的引用；现行 Codex rollout 由 `src/inputs/codex-transcript/`
+ * 解析和构造事件。本文件可能为旧插件兼容资产，保留原因待确认。
+ *
  * @typedef {object} ToolRecord
  * @property {string} tool_name
  * @property {string} tool_use_id

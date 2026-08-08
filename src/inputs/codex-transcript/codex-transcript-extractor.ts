@@ -1,3 +1,9 @@
+/**
+ * Codex rollout JSONL 到 session/turn/step/tool 语义模型的解析器。
+ *
+ * 它识别 task_started/turn_context/terminal 边界，将 LLM 响应波次、token 样本与工具结果关联，
+ * 并判断非 terminal 时哪些 leading steps 已闭合可增量提交。本文件不创建输出事件或写 checkpoint。
+ */
 import * as path from 'node:path';
 import type { JsonValue } from '../../types/index.js';
 import type {
@@ -13,6 +19,10 @@ import type {
 } from './codex-transcript-types.js';
 import { timestampMs } from './codex-transcript-utils.js';
 
+/**
+ * 从 `session_meta` 记录提取会话 ID、provider、基础指令和动态工具定义。
+ * @returns 记录类型或 payload 不符合预期时返回 `null`，让扫描者继续寻找下一条元数据。
+ */
 export function extractCodexTranscriptMeta(record: Record<string, unknown>): CodexTranscriptMeta | null {
   if (record.type !== 'session_meta') return null;
   const payload = asRecord(record.payload);
@@ -30,6 +40,11 @@ export function extractCodexTranscriptMeta(record: Record<string, unknown>): Cod
   };
 }
 
+/**
+ * 解析必须已经包含 `task_complete` 或 `turn_aborted` 的完整 turn。
+ * @param expectedTurnId Input 从 task_started 确认的目标 turn，其他 turn 的记录会被忽略。
+ * @returns terminal 缺失、ID 不匹配或有效数据不足时为 `null`。
+ */
 export function extractCodexTerminalTurn(
   records: Record<string, unknown>[],
   meta: CodexTranscriptMeta | null,
@@ -41,6 +56,10 @@ export function extractCodexTerminalTurn(
   })?.turn ?? null;
 }
 
+/**
+ * 解析尚未结束的 turn，供不需要真实字节边界的测试和兼容调用使用。
+ * 数组序号会被临时当作偏移；生产增量提交应使用 `extractCodexPartialTurnWithBoundaries()`。
+ */
 export function extractCodexPartialTurn(
   records: Record<string, unknown>[],
   meta: CodexTranscriptMeta | null,
@@ -62,6 +81,12 @@ export function extractCodexPartialTurn(
   })?.turn ?? null;
 }
 
+/**
+ * 解析活跃 turn，并同时计算哪些 leading steps 已闭合及其真实 JSONL 字节范围。
+ *
+ * Input 只会推进到 `consumedEndOffset`，后续仍在写入的 response/tool wave 留到下一周期处理，
+ * 从而保证 checkpoint 与已经发出的事件一致。
+ */
 export function extractCodexPartialTurnWithBoundaries(
   records: CodexTranscriptSourceRecord[],
   meta: CodexTranscriptMeta | null,
@@ -83,6 +108,7 @@ export function extractCodexPartialTurnWithBoundaries(
   });
 }
 
+/** 解析期间为 step 附加源字节边界和“是否可以增量提交”的内部状态。 */
 interface StepEnvelope {
   step: CodexTranscriptStep;
   sourceRange: CodexTranscriptSourceRange;
@@ -90,6 +116,13 @@ interface StepEnvelope {
   followedByAnotherWave: boolean;
 }
 
+/**
+ * 完整与增量入口共享的状态机。
+ *
+ * 函数按 JSONL 原顺序消费 record，根据 `turn_context`/`task_started` 锚定 turn，把多种 Codex
+ * response_item 和 event_msg 形状合并为 step/tool，并在 terminal 处停止。它只转换内存数据，
+ * 不写 checkpoint；无法构成目标 turn 时返回 `null`。
+ */
 function extractCodexTurn(
   records: CodexTranscriptSourceRecord[],
   meta: CodexTranscriptMeta | null,
@@ -124,6 +157,7 @@ function extractCodexTurn(
   let lastUsage: CodexTranscriptUsage | undefined;
   let lastActivityAtMs = 0;
 
+  /** 取得当前 response wave；若尚未创建，则以当前源记录边界初始化一个 step。 */
   const beginStep = (timestamp: number, source: CodexTranscriptSourceRecord): StepEnvelope => {
     if (!currentStep) {
       const previous = stepEnvelopes.at(-1);
@@ -148,15 +182,18 @@ function extractCodexTurn(
     return currentStep;
   };
 
+  /** 把新关联的源记录纳入 step 范围，最终 checkpoint 才能推进到完全闭合的边界。 */
   const touchStep = (envelope: StepEnvelope, source: CodexTranscriptSourceRecord): void => {
     envelope.sourceRange.startOffset = Math.min(envelope.sourceRange.startOffset, source.startOffset);
     envelope.sourceRange.endOffset = Math.max(envelope.sourceRange.endOffset, source.endOffset);
   };
 
+  /** 只有“存在工具且每个工具都有完成时间”才表示工具阶段整体闭合。 */
   const stepToolsComplete = (step: CodexTranscriptStep): boolean => (
     step.tools.length > 0 && step.tools.every(tool => tool.completedAtMs !== undefined)
   );
 
+  /** 将有实际内容的当前 step 放入结果，并清空当前指针；terminal 可用 force 保留空闭合 step。 */
   const flushCurrentStep = (force = false): void => {
     if (!currentStep) return;
     const step = currentStep.step;
@@ -165,24 +202,28 @@ function extractCodexTurn(
     }
     currentStep = null;
   };
-  // TypeScript cannot infer mutations made by beginStep/flushCurrentStep through
-  // their closures, so read the mutable step through an explicitly typed getter.
+  // TypeScript 无法推断 beginStep/flushCurrentStep 通过闭包对 currentStep 的修改，因此使用
+  // 明确返回类型的 getter 读取可变状态，避免控制流分析把它错误缩窄为 null。
   const activeStep = (): StepEnvelope | null => currentStep;
+  /** 去重后拼接多段用户 prompt；rollout 可能用不同记录重复表达同一文本。 */
   const appendPrompt = (value: string | undefined): void => {
     if (!value || promptParts.includes(value)) return;
     promptParts.push(value);
     prompt = promptParts.join('\n');
   };
+  /** 记录最近有效活动时间，用于缺少显式开始/结束时间的防御性回退。 */
   const markActivity = (timestamp: number): void => {
     if (timestamp > 0) lastActivityAtMs = timestamp;
   };
 
+  // JSONL 记录顺序本身定义了 turn 的事件顺序，不能并行或排序处理。
   for (const source of records) {
     const record = source.record;
     const payload = asRecord(record.payload);
     if (!payload) continue;
     const timestamp = timestampMs(record, Date.now());
 
+    // turn_context 携带模型、cwd 和 developer instructions；只接受目标 turn 的上下文。
     if (record.type === 'turn_context') {
       const turnId = stringValue(payload.turn_id);
       if (turnId !== expectedTurnId) continue;
@@ -205,6 +246,7 @@ function extractCodexTurn(
       continue;
     }
 
+    // 在 task_started/turn_context 锚定目标 turn 之前，不把其他会话活动误归入当前 turn。
     if (currentTurnId !== expectedTurnId) continue;
 
     if (record.type === 'event_msg') {
@@ -259,6 +301,7 @@ function extractCodexTurn(
         continue;
       }
       if (payload.type === 'token_count') {
+        // token_count 属于累计/最近一次采样；只有当前 wave 已出现 response 证据时才能可靠归属。
         const usage = extractLastTokenUsage(payload.info);
         if (!usage) continue;
         const envelope = activeStep();
@@ -271,7 +314,7 @@ function extractCodexTurn(
           markActivity(timestamp);
           flushCurrentStep();
         } else if (!sameUsage(lastUsage, usage)) {
-          // Do not shift an unanchored sample onto a later response wave.
+          // 未锚定样本不能顺延给下一个 response wave，否则会把前一请求的 usage 记到后一请求。
           unmatchedTokenUsages.push(usage);
           lastUsage = usage;
         }
@@ -334,6 +377,7 @@ function extractCodexTurn(
       continue;
     }
 
+    // function/custom/tool_search/web_search 的调用形状不同，先统一为 CodexTranscriptTool。
     const call = transcriptToolCall(itemType, payload, timestamp);
     if (call) {
       const active = activeStep();
@@ -363,6 +407,7 @@ function extractCodexTurn(
       continue;
     }
 
+    // 输出通过 callId 回填到创建调用时记录的 step；找不到调用时宁可跳过，也不猜测归属。
     const toolOutput = transcriptToolOutput(itemType, payload);
     if (!toolOutput) continue;
     const envelope = toolSteps.get(toolOutput.callId);
@@ -377,6 +422,7 @@ function extractCodexTurn(
     markActivity(timestamp);
   }
 
+  // 完整解析必须有 terminal；返回 null 会让 Input 保存 pendingTerminal 并在后续周期重试。
   if (opts.requireTerminal && (!status || !terminalAtMs)) return null;
 
   const finalActiveStep = activeStep();
@@ -429,6 +475,7 @@ function extractCodexTurn(
     steps,
     unmatchedTokenUsages,
   };
+  // terminal 已落盘时可提交全部 step；活跃 turn 只能提交从头连续且明确闭合的 step。
   const committedEnvelopes = sawTerminal
     ? stepEnvelopes
     : leadingIncrementallyCommittableSteps(stepEnvelopes);
@@ -440,6 +487,10 @@ function extractCodexTurn(
   };
 }
 
+/**
+ * 从头选取可安全增量提交的连续 step。
+ * 遇到第一个未闭合 LLM wave 或工具尚未完成且后面没有新 wave 的 step 就停止，不能跳跃提交。
+ */
 function leadingIncrementallyCommittableSteps(envelopes: StepEnvelope[]): StepEnvelope[] {
   const committed: StepEnvelope[] = [];
   for (const envelope of envelopes) {
@@ -452,6 +503,7 @@ function leadingIncrementallyCommittableSteps(envelopes: StepEnvelope[]): StepEn
   return committed;
 }
 
+/** 为无真实文件偏移的兼容入口生成单调伪边界；生产 Input 不使用这些伪偏移写 checkpoint。 */
 function toSourceRecords(records: Record<string, unknown>[]): CodexTranscriptSourceRecord[] {
   return records.map((record, index) => ({
     startOffset: index,
@@ -460,12 +512,16 @@ function toSourceRecords(records: Record<string, unknown>[]): CodexTranscriptSou
   }));
 }
 
+/**
+ * 从 `rollout-...-<uuid>.jsonl` 文件名末尾提取 session UUID；不匹配时退回不带扩展名的文件名。
+ */
 export function sessionIdFromTranscriptPath(filePath: string): string {
   const base = path.basename(filePath, '.jsonl');
   const match = base.match(/([0-9a-f]{8}-[0-9a-f-]{27,})$/i);
   return match?.[1] ?? base;
 }
 
+/** 将多种 response_item 工具调用载荷统一为内部工具结构；非调用记录返回 `null`。 */
 function transcriptToolCall(
   itemType: string | undefined,
   payload: Record<string, unknown>,
@@ -498,6 +554,7 @@ function transcriptToolCall(
   };
 }
 
+/** 解析工具输出，并保留可选 status/execution/tools 元数据；缺少 callId 时返回 `null`。 */
 function transcriptToolOutput(
   itemType: string | undefined,
   payload: Record<string, unknown>,
@@ -518,6 +575,9 @@ function transcriptToolOutput(
   return { callId, output: toJsonValue(parseMaybeJson(payload.output)) };
 }
 
+/**
+ * 对常见命令工具只保留稳定且有分析价值的 command/workdir；其他工具保持 JSON 兼容结构。
+ */
 function normalizeToolInput(name: string, value: unknown): JsonValue | undefined {
   const input = toJsonValue(value);
   const record = asRecord(value);
@@ -533,26 +593,31 @@ function normalizeToolInput(name: string, value: unknown): JsonValue | undefined
   return input;
 }
 
+/** 将 Codex message content 的多种形状压平为统一 text part；无文本时返回 `null`。 */
 function transcriptInputMessage(role: string, content: unknown): { role: string; parts: Array<{ type: 'text'; content: string }> } | null {
   const text = extractMessageText(content);
   return text ? { role, parts: [{ type: 'text', content: text }] } : null;
 }
 
+/** 把未知 JSON 值安全缩窄为普通对象；数组和 null 不属于 record。 */
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
     : null;
 }
 
+/** 只返回非空字符串，避免把空值当作有效 ID、角色或文本。 */
 function stringValue(value: unknown): string | undefined {
   return typeof value === 'string' && value.length > 0 ? value : undefined;
 }
 
+/** 兼容 instruction 直接为字符串或 `{ text }` 对象的两种 rollout 格式。 */
 function readInstructionText(value: unknown): string | undefined {
   const record = asRecord(value);
   return stringValue(record?.text) ?? stringValue(value);
 }
 
+/** 从字符串或 content-part 数组提取文本，多段之间使用换行保持原先边界。 */
 function extractMessageText(content: unknown): string | undefined {
   if (typeof content === 'string' && content) return content;
   if (!Array.isArray(content)) return undefined;
@@ -564,6 +629,7 @@ function extractMessageText(content: unknown): string | undefined {
   return parts.length > 0 ? parts.join('\n') : undefined;
 }
 
+/** 字符串若是合法 JSON 就解析，否则原样返回；非字符串无需转换。 */
 function parseMaybeJson(value: unknown): unknown {
   if (typeof value !== 'string') return value;
   try {
@@ -573,6 +639,9 @@ function parseMaybeJson(value: unknown): unknown {
   }
 }
 
+/**
+ * 递归过滤 `undefined`、非有限数字等 JSON 不可表示值，得到可安全序列化的 `JsonValue`。
+ */
 function toJsonValue(value: unknown): JsonValue | undefined {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
   if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
@@ -590,6 +659,9 @@ function toJsonValue(value: unknown): JsonValue | undefined {
   return output;
 }
 
+/**
+ * 从 token_count 的 `last_token_usage` 读取本次 wave 用量；必需字段缺失时不编造样本。
+ */
 function extractLastTokenUsage(value: unknown): CodexTranscriptUsage | undefined {
   const info = asRecord(value);
   const raw = asRecord(info?.last_token_usage);
@@ -611,10 +683,12 @@ function extractLastTokenUsage(value: unknown): CodexTranscriptUsage | undefined
   };
 }
 
+/** 仅接受有限 number，拒绝字符串数字、NaN 和 Infinity。 */
 function numberValue(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
+/** 比较全部 usage 字段，用于去掉相邻重复的累计样本。 */
 function sameUsage(left: CodexTranscriptUsage | undefined, right: CodexTranscriptUsage): boolean {
   return left !== undefined
     && left.inputTokens === right.inputTokens

@@ -1,24 +1,18 @@
-// QoderWork-family worker runtime wrapper — transparent, app-agnostic shim.
-//
-// Loaded via the SHARED env var QODER_WORKER_RUNTIME_PATH. The ENTIRE
-// @qoder-ai/qoder-agent-sdk family honours this variable (QoderWork,
-// QwenWorkCN, QoderWork CN, ...), and on macOS we set it with `launchctl
-// setenv`, which is GLOBAL to the launchd user domain. Consequences:
-//   • Every GUI app inherits the variable, but only apps that actually run the
-//     @qoder-ai SDK ever load this file as their worker entry.
-//   • Therefore this wrapper CAN be the worker entry of ANY sibling app, not
-//     just QoderWork. It MUST NOT assume which app loaded it.
-//
-// Design priority (do NOT weaken): NEVER break the host app. We only ever hand
-// control to the *host app's OWN* bundled runtime, located dynamically from the
-// running process. There is intentionally NO hardcoded/app-specific fallback:
-// loading a foreign runtime (e.g. QoderWork's runtime inside QwenWorkCN) is
-// exactly what corrupts the app. If we cannot locate the host app's own runtime
-// with certainty, we install nothing and load nothing — token interception is
-// sacrificed, the app is never handed a wrong runtime.
-//
-// On the success path only, token/system-prompt records are appended to
-// ~/.loongsuite-pilot/logs/qoderwork-intercept.jsonl.
+/**
+ * Qoder Work 家族 worker runtime 的透明、与具体应用无关的包装器。
+ *
+ * 整个 `@qoder-ai/qoder-agent-sdk` 家族都读取共享环境变量 `QODER_WORKER_RUNTIME_PATH`；
+ * macOS 又通过用户级全局 `launchctl setenv` 设置它，所以 QoderWork、QwenWorkCN、
+ * Qoder Work CN 等任一同族应用都可能把本文件当 worker 入口。只有实际使用该 SDK 的应用会
+ * 加载，但本模块绝不能假设宿主应用名称。
+ *
+ * 首要约束是绝不破坏宿主：只能根据当前 process 动态定位并加载“宿主自己的”bundle runtime，
+ * 没有任何硬编码的应用回退路径。若无法确定路径，就不安装 JSON 拦截器也不加载其他 runtime，
+ * 宁可丢失 token，也不能把 QoderWork runtime 交给 QwenWorkCN 等错误宿主。成功路径才把
+ * token/system prompt 追加到 `~/.loongsuite-pilot/logs/qoderwork-intercept.jsonl`。
+ *
+ * 本文件使用 createRequire 从 ESM 加载宿主 runtime；全局 JSON 包装必须调用保存的原函数。
+ */
 
 import { createRequire } from 'module';
 import { fileURLToPath } from 'url';
@@ -43,13 +37,11 @@ function logDiag(msg) {
   } catch {}
 }
 
-// Install the JSON.parse / JSON.stringify interception hooks. Only ever called
-// right before we import the host app's own runtime, so a worker that fails to
-// self-locate is left completely untouched.
+// 仅在即将导入已确认的宿主 runtime 前安装 JSON 包装；定位失败的 worker 完全不被修改。
 function installInterceptHooks() {
   try { fs.mkdirSync(INTERCEPT_DIR, { recursive: true }); } catch {}
 
-  // Intercept SSE-parsed token usage.
+  // 截获 SSE 被解析后的 token usage。
   JSON.parse = function (text, reviver) {
     const result = origParse.call(JSON, text, reviver);
     try {
@@ -61,7 +53,7 @@ function installInterceptHooks() {
         const rec = {
           type: "token",
           ts: Date.now(),
-          id: result.id,  // chatcmpl-xxx, matches transcript message.id
+          id: result.id,  // chatcmpl-xxx，与 transcript message.id 对应。
           model: result.model || "",
           prompt_tokens: u.prompt_tokens || 0,
           cached_tokens: (u.prompt_tokens_details && u.prompt_tokens_details.cached_tokens) || 0,
@@ -69,14 +61,14 @@ function installInterceptHooks() {
           reasoning_tokens: (u.completion_tokens_details && u.completion_tokens_details.reasoning_tokens) || 0,
           total_tokens: u.total_tokens || 0,
         };
-        // Token records are ~200 bytes, well under PIPE_BUF — atomic on POSIX.
+        // token 记录约 200 字节，小于 POSIX PIPE_BUF，适合单次追加。
         fs.appendFileSync(INTERCEPT_FILE, origStringify.call(JSON, rec) + "\n");
       }
     } catch {}
     return result;
   };
 
-  // Capture system prompt before request encryption. Each process captures once.
+  // 请求加密前捕获 system prompt，每个进程最多一次。
   JSON.stringify = function (value, replacer, space) {
     try {
       if (!systemPromptCaptured && value && typeof value === "object"
@@ -93,35 +85,31 @@ function installInterceptHooks() {
   };
 }
 
-// The SDK worker runtime always lives at this fixed path relative to an app's
-// Resources dir. It bundles native deps (sharp / node-pty / keytar), so it must
-// be asar-UNPACKED and is guaranteed to exist on disk for a shipped app.
+// SDK worker 相对应用 Resources 的路径固定；它包含 sharp/node-pty/keytar 等原生依赖，
+// 必须位于 asar 解包目录，已发布应用中应是磁盘实体文件。
 const SDK_WORKER_REL = path.join(
   'app.asar.unpacked', 'node_modules', '@qoder-ai', 'qoder-agent-sdk', 'dist', '_worker',
 );
 const RUNTIME_NAMES = ['qoder-worker-runtime.obf.mjs', 'qoder-worker-runtime.mjs'];
 
-// Resource roots derived purely from the running process, so they resolve to
-// WHICHEVER app is hosting this worker — no app name is ever hardcoded.
+// 资源根只从当前进程推导，始终指向实际宿主，不硬编码任何应用名。
 function candidateResourceRoots() {
   const roots = [];
 
-  // (1) Enclosing .app bundle from the executable path. In an Electron worker
-  // thread process.execPath is the host app's own binary, e.g.
+  // 1. 从可执行文件路径找最外层 .app；Electron worker 的 execPath 是宿主自身二进制，例如：
   //   /Applications/QwenWorkCN.app/Contents/MacOS/QwenWorkCN
-  // Match the FIRST ".app" (non-greedy) so a nested "*Helper.app" cannot shadow
-  // the outer bundle. This is a hard macOS bundle-layout guarantee.
+  // 非贪婪匹配第一个 .app，避免嵌套 Helper.app 遮蔽外层 bundle；这是 macOS 布局保证。
   const exec = process.execPath || '';
   const m = /^(.*?\.app)(?:\/|$)/.exec(exec);
   if (m) roots.push(path.join(m[1], 'Contents', 'Resources'));
 
-  // (2) Electron's resourcesPath, when present, is <App>/Contents/Resources.
+  // 2. Electron 提供 resourcesPath 时，它直接指向 <App>/Contents/Resources。
   if (process.resourcesPath) roots.push(process.resourcesPath);
 
   return roots;
 }
 
-// Locate the host app's OWN worker runtime. Returns an absolute path or null.
+// 定位宿主自己的 worker runtime；确定时返回绝对路径，否则返回 null。
 function findHostAppRuntime() {
   let selfPath = '';
   try { selfPath = fs.realpathSync(fileURLToPath(import.meta.url)); } catch {}
@@ -135,7 +123,7 @@ function findHostAppRuntime() {
       try {
         if (!fs.existsSync(cand)) continue;
         const real = fs.realpathSync(cand);
-        if (real === selfPath) continue; // anti-recursion: never import ourselves
+        if (real === selfPath) continue; // 防递归：绝不能再次导入包装器自身。
         return real;
       } catch {}
     }
@@ -146,23 +134,17 @@ function findHostAppRuntime() {
 const hostRuntime = findHostAppRuntime();
 
 if (hostRuntime) {
-  // Certain we will hand control to the host app's OWN runtime. Install
-  // interception, then load it. The app behaves exactly as if unhooked, plus we
-  // capture token usage.
+  // 已确认是宿主自己的 runtime 后才安装截获并加载；除额外记录 token 外应保持原行为。
   installInterceptHooks();
   try {
     await import(hostRuntime);
   } catch (e) {
-    // The app's own runtime failed to load — the app would have hit this even
-    // without us. Do not throw (module-level throw crashes the worker_thread and
-    // blocks the SDK's own transport fallback) and do not try any other runtime.
+    // 宿主自身 runtime 加载失败时也不在模块顶层抛错，否则会崩 worker_thread 并阻断 SDK
+    // 使用宿主自身的传输回退路径；同时绝不尝试其他应用的 runtime。
     logDiag(`host runtime import failed: ${hostRuntime} :: ${e && e.message}`);
   }
 } else {
-  // Could not locate the host app's own runtime. Per design priority we refuse
-  // to load any guessed/foreign runtime (that is what broke QwenWorkCN). Install
-  // nothing, load nothing: token interception is lost, the app is never handed a
-  // wrong runtime. The SDK detects the empty worker entry and degrades on its own.
+  // 无法定位时不猜测、不加载外部 runtime，也不安装截获器；SDK 会自行识别空 worker 并降级。
   logDiag(
     'host app runtime not found — skipping intercept to avoid loading a foreign runtime '
     + `(execPath=${process.execPath || ''}, resourcesPath=${process.resourcesPath || ''})`,

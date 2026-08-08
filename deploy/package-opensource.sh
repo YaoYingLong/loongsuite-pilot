@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# package-opensource.sh — Build the project and create distributable packages
+# 开源发布包组装入口。发布流程调用本文件，也可由开发者单独执行。
 #
-# Produces both .tar.gz (Linux/macOS) and .zip (Windows) packages.
-# Internal-only and updater files are stripped automatically.
+# 它先构建 TypeScript/可选 Swift 应用，再在临时 staging 中放入 dist、assets、scripts、agents.d
+# 和 package metadata，移除内部/Updater 专用文件，最终同时生成 Linux/macOS tar.gz 与 Windows zip。
+# 发布包不含 node_modules，目标机器的安装器会运行生产依赖安装；临时目录由 trap 清理。
 #
-# Usage:
-#   bash deploy/package-opensource.sh                       # default output
-#   bash deploy/package-opensource.sh -o /tmp/out.tar.gz    # custom .tar.gz path
-#   bash deploy/package-opensource.sh --skip-build          # skip build, use existing dist/
+# 用法：
+#   bash deploy/package-opensource.sh                       # 使用默认输出路径
+#   bash deploy/package-opensource.sh -o /tmp/out.tar.gz    # 自定义 tar.gz 路径
+#   bash deploy/package-opensource.sh --skip-build          # 复用现有 dist，跳过构建
 
 # Shell 脚本严格模式，用来尽早暴露错误、避免静默失败
 # set -e（errexit）表示命令返回非 0 退出码（失败）时，立即退出脚本，不开启：某条命令失败，脚本继续往下执行，容易出现 “前面出错后面还跑” 的隐蔽 bug
@@ -49,7 +50,7 @@ ZIP_OUTPUT_PATH="${OUTPUT_PATH%.tar.gz}.zip"
 # 进入到../loongsuite-pilot目录
 cd "$PROJECT_ROOT"
 
-# ── Build ──
+# ── 构建 ──
 # 如果变量SKIP_BUILD等于0，默认是等于0
 if [ "$SKIP_BUILD" -eq 0 ]; then
     echo "==> Building..."
@@ -70,7 +71,7 @@ else
     fi
 fi
 
-# ── Stage files into a temp directory ──
+# ── 将文件放入临时 staging 目录 ──
 # 创建一个临时目录
 STAGE_DIR="$(mktemp -d)"
 # 脚本退出时删除临时目录
@@ -104,31 +105,31 @@ echo "    ✅ VERSION: v${PKG_VERSION} (${GIT_COMMIT}, ${BUILD_TIME})"
 
 echo "==> Staging files..."
 
-# Core distributable dirs
+# 核心发布目录。
 # 拷贝文件到创建的临时目录内的loongsuite-pilot目录中
 cp -r dist     "$PKG_DIR/dist"
 cp -r assets   "$PKG_DIR/assets"
 cp -r scripts  "$PKG_DIR/scripts"
 
-# Agent definition files (declarative deployment configs)
+# Agent 声明文件（声明式部署配置）。
 if [ -d agents.d ]; then
     # 拷贝文件到创建的临时目录内的loongsuite-pilot目录中
     cp -r agents.d "$PKG_DIR/agents.d"
     echo "    ✅ Agent definitions bundled: $(ls agents.d/*.json 2>/dev/null | wc -l | tr -d ' ') files"
 fi
 
-# Plugin tarballs (pre-built, bundled)
+# 预构建并随包分发的插件 tarball。
 if [ -d plugins ] && ls plugins/*.tar.gz &>/dev/null; then
     cp -r plugins  "$PKG_DIR/plugins"
     echo "    ✅ Plugins bundled: $(ls plugins/*.tar.gz | xargs -I{} basename {} | tr '\n' ' ')"
 fi
 
-# Status bar app (macOS native binary + Swift source)
+# macOS 原生状态栏应用与 Swift 源码。
 if [ -d app/macos-status-bar ]; then
     mkdir -p "$PKG_DIR/app/macos-status-bar"
     cp -r app/macos-status-bar/Sources "$PKG_DIR/app/macos-status-bar/Sources"
     cp app/macos-status-bar/Package.swift "$PKG_DIR/app/macos-status-bar/"
-    # Include pre-built binaries if available
+    # 若存在则一并放入预构建二进制。
     if [ -d app/macos-status-bar/bin ]; then
         cp -r app/macos-status-bar/bin "$PKG_DIR/app/macos-status-bar/bin"
         echo "    ✅ Status bar app bundled (with pre-built binary)"
@@ -137,40 +138,40 @@ if [ -d app/macos-status-bar ]; then
     fi
 fi
 
-# Package metadata & version
+# 包元数据与版本文件。
 cp package.json      "$PKG_DIR/"
 cp package-lock.json "$PKG_DIR/" 2>/dev/null || true
 cp .npmrc            "$PKG_DIR/" 2>/dev/null || true
 cp README.md         "$PKG_DIR/" 2>/dev/null || true
 cp VERSION           "$PKG_DIR/"
 
-# Ensure scripts are executable
+# 确保脚本具有执行权限。
 # 给所有sh脚本添加执行权限
 chmod +x "$PKG_DIR/scripts/"*.sh 2>/dev/null || true
 chmod +x "$PKG_DIR/assets/hooks/"*.sh 2>/dev/null || true
 
-# Strip internal-only files (always for opensource)
+# 开源包始终移除仅内部使用的文件。
 rm -f "$PKG_DIR/scripts/migrate-internal-config.js"
 rm -f "$PKG_DIR/scripts/updater-daemon.js"
 echo "    ✅ Stripped internal-only files"
 
 echo "    ✅ Staged into $PKG_DIR"
 
-# ── Create .tar.gz (Linux/macOS) ──
+# ── 生成 Linux/macOS tar.gz ──
 echo "==> Creating .tar.gz package..."
 tar -czf "$OUTPUT_PATH" -C "$STAGE_DIR" "$PACKAGE_NAME"
 
 PKG_SIZE=$(du -h "$OUTPUT_PATH" | cut -f1)
 echo "    ✅ $OUTPUT_PATH ($PKG_SIZE)"
 
-# ── Create .zip (Windows) ──
+# ── 生成 Windows zip ──
 echo "==> Creating .zip package..."
 (cd "$STAGE_DIR" && zip -qr "$ZIP_OUTPUT_PATH" "$PACKAGE_NAME")
 
 ZIP_SIZE=$(du -h "$ZIP_OUTPUT_PATH" | cut -f1)
 echo "    ✅ $ZIP_OUTPUT_PATH ($ZIP_SIZE)"
 
-# ── Summary ──
+# ── 输出摘要 ──
 echo ""
 echo "==> Contents:"
 tar -tzf "$OUTPUT_PATH" | sed -n '1,20p'

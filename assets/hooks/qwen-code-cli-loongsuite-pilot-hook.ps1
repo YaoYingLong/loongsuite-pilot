@@ -1,11 +1,11 @@
-# Qwen Code CLI hook entrypoint (Windows) — delegates to qwen-code-cli-hook-processor.mjs.
+# Qwen Code CLI Windows Hook 入口：委托给 qwen-code-cli-hook-processor.mjs。
 #
-# Usage (registered in ~/.qwen/settings.json by pilot HookStrategy):
+# HookStrategy 将下列命令注册到 ~/.qwen/settings.json：
 #   powershell -File $PILOT_DATA/hooks/qwen-code-cli-loongsuite-pilot-hook.ps1 <subcommand>
 #
-# Subcommand: stop / subagent-start / subagent-stop
+# 子命令：stop / subagent-start / subagent-stop。stop 解析 transcript；子 Agent 事件先累积。
 #
-# Fail-open: any error outputs "{}" and exits 0.
+# fail-open：任何错误都输出 `{}` 并退出 0，不阻塞宿主 Agent。
 
 $ErrorActionPreference = "Continue"
 $EMPTY_RESULT = '{}'
@@ -14,7 +14,7 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Processor = Join-Path $ScriptDir "qwen-code-cli-hook-processor.mjs"
 $Subcommand = if ($args.Count -gt 0) { $args[0] } else { "unknown" }
 
-# Only process registered subcommands
+# 仅分派当前注册的子命令；其他输入直接返回空 JSON。
 if ($Subcommand -notin @("stop", "subagent-start", "subagent-stop")) {
     Write-Output $EMPTY_RESULT
     exit 0
@@ -100,19 +100,19 @@ if (-not [Console]::IsInputRedirected) {
 }
 
 try {
-    # Read stdin as raw bytes to avoid PowerShell encoding issues (GB2312/ASCII mangles UTF-8)
+    # 原始字节读取可避免 PowerShell 的 GB2312/ASCII 文本编码损坏 UTF-8 JSON。
     $stdinStream = [Console]::OpenStandardInput()
     $ms = New-Object System.IO.MemoryStream
     $stdinStream.CopyTo($ms)
     $rawBytes = $ms.ToArray()
     $ms.Dispose()
 
-    # Strip UTF-8 BOM (EF BB BF) before any encoding fixup
+    # 编码修复前先去掉 UTF-8 BOM（EF BB BF）。
     if ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF) {
         $rawBytes = $rawBytes[3..($rawBytes.Length - 1)]
     }
 
-    # Fix Cursor's UTF-8→GBK double-encoding on Chinese Windows.
+    # 尝试逆转中文 Windows 上的 UTF-8 -> GBK 二次编码；失败则保留原字节。
     if ($rawBytes.Length -gt 2) {
         try {
             $utf8    = [System.Text.Encoding]::UTF8

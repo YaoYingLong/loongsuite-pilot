@@ -1,5 +1,8 @@
-# Qoder hook entrypoint (Windows) — delegates to qoder-hook-processor.mjs.
-# Usage: powershell -File qoder-loongsuite-pilot-hook.ps1 [agent-id]
+# Qoder Windows Hook 入口：把 stdin JSON 委托给 qoder-hook-processor.mjs。
+# 调用：powershell -File qoder-loongsuite-pilot-hook.ps1 [agent-id]；agent-id 默认 `qoder`。
+# 安装后 HookManager 将本命令写入 Qoder 配置。processor 增量读取 transcript 并把记录写入
+# logs/<agent-id>/history/*.jsonl。所有异常均收敛为 exit 0，避免遥测影响宿主 Agent。
+# `$ErrorActionPreference = Continue` 让非终止错误可由后续检查处理，而非中断整个 Hook。
 
 $ErrorActionPreference = "Continue"
 $AgentId = if ($args.Count -gt 0) { $args[0] } else { "qoder" }
@@ -58,23 +61,21 @@ if (-not $nodeBin) {
 }
 
 try {
-    # Read stdin as raw bytes to avoid PowerShell encoding issues (GB2312/ASCII mangles UTF-8)
+    # 按原始字节读取 stdin，避免 PowerShell 文本管道以 GB2312/ASCII 破坏 UTF-8。
     $stdinStream = [Console]::OpenStandardInput()
     $ms = New-Object System.IO.MemoryStream
     $stdinStream.CopyTo($ms)
     $rawBytes = $ms.ToArray()
     $ms.Dispose()
 
-    # Strip UTF-8 BOM (EF BB BF) before any encoding fixup
+    # 编码修复前先去掉 UTF-8 BOM（EF BB BF），否则 Node 无法直接 JSON.parse。
     if ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF) {
         $rawBytes = $rawBytes[3..($rawBytes.Length - 1)]
     }
 
-    # Fix Cursor's UTF-8→GBK double-encoding on Chinese Windows.
-    # Cursor encodes hook payloads through the system codepage (GBK/CP936), garbling
-    # all non-ASCII text.  Reversal: decode the garbled bytes as UTF-8, encode the
-    # resulting string as GBK — this recovers the ORIGINAL UTF-8 bytes.  We validate
-    # by checking that the recovered bytes are valid UTF-8; if not, keep the originals.
+    # 修复 Cursor 在中文 Windows 上造成的 UTF-8 -> GBK 二次编码。Cursor 经系统代码页
+    #（GBK/CP936）传递 payload 时会损坏非 ASCII 文本；逆向过程先按 UTF-8 解码乱码，
+    # 再按 GBK 编码以恢复原始 UTF-8 字节。恢复结果必须通过严格 UTF-8 校验。
     if ($rawBytes.Length -gt 2) {
         try {
             $utf8    = [System.Text.Encoding]::UTF8
@@ -87,7 +88,7 @@ try {
 
             $rawBytes = $recovered
         } catch {
-            # Validation failed — original bytes are already correct UTF-8, keep them
+            # 校验失败通常说明原字节本来就是正确 UTF-8，因此保持原值。
         }
     }
 

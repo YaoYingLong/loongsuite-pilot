@@ -1,29 +1,59 @@
 /**
- * Shared infrastructure for hook transcript processors.
- * Provides file I/O, offset tracking, logging, and common utilities
- * used by both qoder-hook-processor.mjs and qoderwork-hook-processor.mjs.
+ * Hook transcript processor 的共享基础设施。
+ *
+ * 本文件属于“Agent Hook -> 本地 JSONL”采集链的底层工具层，主要由
+ * `qoder-hook-processor.mjs` 和 `qoderwork-hook-processor.mjs` 导入。它负责解析
+ * processor 的命令行参数、读取 Hook stdin、按会话持久化 transcript 行游标、兼容旧版
+ * 聚合游标文件、读取新增 transcript 行，以及把归一化记录追加到 history JSONL。
+ *
+ * 输入来自宿主 Agent 写入 stdin 的 Hook JSON 和 Agent 自己维护的 transcript 文件；输出是
+ * `<dataDir>/logs/<agentId>/history/*.jsonl` 以及 `<dataDir>/state/hooks/` 下的游标状态。
+ * 这些函数运行在短生命周期 Node.js 子进程中，因此有意使用同步文件 API，保证进程退出前写入
+ * 已落盘。除缺少必填 CLI 参数会退出 1 外，采集和日志操作均采用“尽力而为（best-effort）/
+ * 失败开放（fail-open）”策略：
+ * 遥测故障不应阻塞宿主 Agent。
+ *
+ * 本文件是 ES Module：`import` 引入 Node.js 内置模块，带 `export` 的函数供 processor 复用。
  */
 
+// `node:fs` 提供同步文件读写；Hook 子进程必须在退出前完成持久化。
 import fs from 'node:fs';
+// `node:path` 负责跨平台拼接目录，避免手写 `/` 或 `\\`。
 import path from 'node:path';
+// `node:os` 用于取得用户主目录，构造默认数据目录。
 import os from 'node:os';
+// `node:crypto` 用 SHA-256 将任意 sessionId 转成安全、固定长度的文件名。
 import crypto from 'node:crypto';
+// ESM 没有 CommonJS 的 `__dirname`，需把 `import.meta.url` 转成本地路径。
 import { fileURLToPath } from 'node:url';
 import {
   buildQoderHookRecord,
   loadHookRuntimeConfig,
 } from '../agent-event-normalizer.mjs';
 
+// 调试日志总开关；写日志失败会被吞掉，不能反向影响 Agent。
 const ENABLE_LOGGING = true;
+// 当前源文件位于 `hooks/shared/`，连续两次 dirname 得到部署后的 `hooks/` 根目录。
 export const HOOKS_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+// 安装器通常注入数据目录；未注入时回退到用户主目录下的标准位置。
 export const LOONGSUITE_PILOT_DATA_DIR = process.env.LOONGSUITE_PILOT_DATA_DIR
   || path.join(os.homedir(), '.loongsuite-pilot');
+// 所有 Agent 的 debug、error 和 history 日志都以此目录为共同根路径。
 export const LOONGSUITE_PILOT_LOGS_BASE_DIR = (() => {
   return path.join(LOONGSUITE_PILOT_DATA_DIR, 'logs');
 })();
 
-// --- CLI argument parsing ---------------------------------------------------
+// --- CLI 参数解析 -----------------------------------------------------------
 
+/**
+ * 解析 processor 的 `--agent-id` 与 `--log-prefix` 参数。
+ *
+ * 调用者是 Qoder/Qoder Work processor 的 `main()`。`process.argv.slice(2)` 会跳过
+ * Node 可执行文件和脚本路径；`++i` 在读取选项值后同时跳过该值。缺少 `--agent-id` 表示
+ * 部署命令不完整，此时写 stderr 并以退出码 1 终止；其余运行期错误仍由上层 fail-open。
+ *
+ * @returns {{agentId: string, logPrefix: string}} Agent 标识和 history 文件名前缀。
+ */
 export function parseArgs() {
   const args = process.argv.slice(2);
   let agentId = '';
@@ -39,8 +69,13 @@ export function parseArgs() {
   return { agentId, logPrefix: logPrefix || agentId };
 }
 
-// --- Date helper (local timezone) --------------------------------------------
+// --- 本地时区日期工具 -------------------------------------------------------
 
+/**
+ * 把 Date 格式化为 `YYYY-MM-DD`，用于按本地自然日滚动日志文件。
+ * @param {Date} date 待格式化时间；默认当前时间。
+ * @returns {string} 固定十位日期字符串。
+ */
 export function getLocalDateString(date = new Date()) {
   const y = date.getFullYear();
   const m = String(date.getMonth() + 1).padStart(2, '0');
@@ -48,7 +83,7 @@ export function getLocalDateString(date = new Date()) {
   return `${y}-${m}-${d}`;
 }
 
-// --- Logging ----------------------------------------------------------------
+// --- 调试日志 ---------------------------------------------------------------
 
 export function getDebugLogFile(agentId) {
   const day = getLocalDateString();
@@ -67,10 +102,10 @@ export function logDebug(agentId, message) {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     const ts = new Date().toISOString().replace('T', ' ').replace(/\.\d+Z$/, '');
     fs.appendFileSync(file, `[${ts}] ${message}\n`, 'utf-8');
-  } catch { /* best-effort */ }
+  } catch { /* 尽力而为：磁盘或权限错误不能阻塞宿主 Agent。 */ }
 }
 
-// --- Line record persistence (per agent-id and session) ---------------------
+// --- 行游标持久化（按 Agent 和会话隔离） -----------------------------------
 
 function aggregateLineRecordFile(agentId) {
   return path.join(LOONGSUITE_PILOT_DATA_DIR, 'state', 'hooks', `${agentId}-line-records.json`);
@@ -85,6 +120,7 @@ function sessionLineRecordDir(agentId) {
 }
 
 function sessionLineRecordFile(agentId, sessionId) {
+  // sessionId 可能包含路径分隔符或其他特殊字符；哈希后可安全地作为文件名。
   const sessionHash = crypto.createHash('sha256').update(sessionId).digest('hex');
   return path.join(sessionLineRecordDir(agentId), `${sessionHash}.json`);
 }
@@ -104,12 +140,13 @@ function saveJsonObject(file, value) {
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
     tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+    // 先写同目录临时文件，再 rename，避免并发读取者看到半截 JSON。
     fs.writeFileSync(tmp, JSON.stringify(value, null, 2), 'utf-8');
     fs.renameSync(tmp, file);
     return true;
   } catch {
     if (tmp) {
-      try { fs.unlinkSync(tmp); } catch { /* best-effort temp cleanup */ }
+      try { fs.unlinkSync(tmp); } catch { /* 临时文件清理失败不再向外抛错。 */ }
     }
     return false;
   }
@@ -120,6 +157,7 @@ function saveSessionLineRecord(agentId, sessionId, record) {
 }
 
 function reconcileAggregateLineRecord(agentId, requestedSessionId) {
+  // 新版按 session 拆文件；这两个来源是旧版按 Agent 聚合的状态文件。
   const sources = [
     aggregateLineRecordFile(agentId),
     deployedLegacyLineRecordFile(agentId),
@@ -150,9 +188,8 @@ function reconcileAggregateLineRecord(agentId, requestedSessionId) {
 
 function isLineRecordNewer(candidate, existing) {
   if (candidate.transcript_path === existing.transcript_path) {
-    // Cursor progress for one transcript is monotonic. An older implementation
-    // may write a later timestamp with a stale line count after a concurrent
-    // read-modify-write, but that must never rewind the per-session primary.
+    // 同一 transcript 的已读行数只能单调递增。旧版本并发“读-改-写”可能留下时间较新、
+    // 行数却较旧的记录，因此此处以行数而不是 updated_at 判断，防止新版主游标倒退并重复采集。
     return Number(candidate.last_line_count) > Number(existing.last_line_count);
   }
 
@@ -162,9 +199,11 @@ function isLineRecordNewer(candidate, existing) {
     && (!existingUpdated || candidateUpdated > existingUpdated);
 }
 
+// `Atomics.wait` 需要共享数组作为等待地址；这里只借它同步休眠 10ms，不存放业务数据。
 const LOCK_WAIT_ARRAY = new Int32Array(new SharedArrayBuffer(4));
 
 function updateAggregateShadow(file, transcriptPath, record) {
+  // 多个 Hook 子进程可能同时更新兼容影子文件，使用 `wx` 独占创建锁文件串行化写入。
   const lockFile = `${file}.lock`;
   const deadline = Date.now() + 1_000;
   let acquired = false;
@@ -183,7 +222,7 @@ function updateAggregateShadow(file, transcriptPath, record) {
             fs.unlinkSync(lockFile);
             continue;
           }
-        } catch { /* retry acquisition */ }
+        } catch { /* 锁可能刚被另一进程释放，进入下一轮重试。 */ }
         if (Date.now() >= deadline) return false;
         Atomics.wait(LOCK_WAIT_ARRAY, 0, 0, 10);
       }
@@ -203,7 +242,7 @@ function updateAggregateShadow(file, transcriptPath, record) {
     return saveJsonObject(file, records);
   } finally {
     if (acquired) {
-      try { fs.unlinkSync(lockFile); } catch { /* best-effort lock cleanup */ }
+      try { fs.unlinkSync(lockFile); } catch { /* 清理失败由 30 秒陈旧锁恢复逻辑兜底。 */ }
     }
   }
 }
@@ -221,11 +260,9 @@ export function loadLineRecord(agentId, sessionId) {
   if (!sessionId) return {};
   const file = sessionLineRecordFile(agentId, sessionId);
 
-  // Older releases stored every transcript in one per-agent JSON object,
-  // either in the persistent state directory or beside the deployed hooks.
-  // Reconcile the requested session lazily. The aggregate files remain as
-  // locked rollback shadows, so a forward upgrade after an old-version rollback
-  // can recover any cursor advances made while that version was active.
+  // 旧版本把一个 Agent 的所有 transcript 游标放在单个 JSON 对象中，位置可能是持久化状态目录，
+  // 也可能是已部署 hooks 旁。这里只按请求的 session 惰性迁移，避免每次 Hook 全量扫描和重写。
+  // 聚合文件仍作为带锁的“回滚影子”继续更新，因此用户回滚旧版又升级回来时不会丢失游标进度。
   reconcileAggregateLineRecord(agentId, sessionId);
   return readJsonObject(file) || {};
 }
@@ -251,8 +288,13 @@ export function updateLineRecord(agentId, transcriptPath, sessionId, endLine) {
   return ok;
 }
 
-// --- Transcript reading -----------------------------------------------------
+// --- Transcript 增量读取 ---------------------------------------------------
 
+/**
+ * 统计 transcript 的逻辑行数；末尾没有换行符的最后一行也计入。
+ * @param {string} transcriptPath transcript 绝对路径。
+ * @returns {number} 行数；文件不存在或读取失败时返回 0。
+ */
 export function getTranscriptLineCount(transcriptPath) {
   try {
     if (!fs.existsSync(transcriptPath)) return 0;
@@ -279,6 +321,7 @@ export function getLineRangeInfo(agentId, transcriptPath, sessionId) {
 
   const currentCount = getTranscriptLineCount(transcriptPath);
 
+  // 会话或文件身份变化时不能沿用旧 offset，否则会跳过新文件开头。
   if (recordedSession && recordedSession !== sessionId) {
     logDebug(agentId, `Session changed: ${recordedSession} -> ${sessionId}, reset to 0`);
     lastCount = 0;
@@ -297,6 +340,7 @@ export function getLineRangeInfo(agentId, transcriptPath, sessionId) {
     logDebug(agentId, `No new lines (count: ${currentCount})`);
     return null;
   }
+  // 文件被截断/轮转后从第 0 行重读，保证不会永久漏掉新内容。
   if (currentCount < lastCount) {
     logDebug(agentId, `File truncated (${lastCount} -> ${currentCount}), sending all`);
     lastCount = 0;
@@ -308,9 +352,11 @@ export function getLineRangeInfo(agentId, transcriptPath, sessionId) {
 }
 
 /**
- * Compatibility API for a transient mixed-version deployment: the shared
- * module may be replaced before an older deployed processor that still imports
- * the tuple form. Current in-tree processors use getLineRangeInfo().
+ * 混合版本部署期的兼容 API。
+ *
+ * 升级时共享模块可能先于旧 processor 被替换，而旧 processor 仍要求数组返回值；因此保留
+ * `[startLine, endLine]` 形式。仓库内当前 processor 使用信息更完整的 `getLineRangeInfo()`。
+ * @returns {[number, number] | null} 有新增内容时返回起止行，否则返回 null。
  */
 export function getLineRange(agentId, transcriptPath, sessionId) {
   const info = getLineRangeInfo(agentId, transcriptPath, sessionId);
@@ -328,7 +374,7 @@ export function readTranscriptLines(transcriptPath, startLine, endLine) {
       if (trimmed) lines.push(trimmed);
     }
   } catch {
-    // best-effort
+    // 尽力读取：调用者会把空数组视为本轮无可处理记录。
   }
   return lines;
 }
@@ -349,7 +395,7 @@ export function normalizeTranscriptRecord(record, agentId, runtimeConfig, turnId
   return record;
 }
 
-// --- History file -----------------------------------------------------------
+// --- 标准 history 文件 -----------------------------------------------------
 
 export function getHistoryLogFile(agentId, logPrefix) {
   const day = getLocalDateString();
@@ -371,21 +417,29 @@ export function appendRowsToHistory(agentId, logPrefix, rows) {
   }
 }
 
-// --- Stdin helper -----------------------------------------------------------
+// --- stdin 辅助函数 --------------------------------------------------------
 
+/**
+ * 异步消费标准输入流直到 EOF，并合并为 UTF-8 字符串。
+ *
+ * `for await` 会随 Node.js 事件循环等待每个数据块，Promise 在 stdin 关闭后完成。这里剥离
+ * PowerShell 5.x 管道可能添加的 UTF-8 BOM，否则紧随其后的 JSON.parse 会失败。
+ * @returns {Promise<string>} 完整 stdin 文本。
+ */
 export async function readStdin() {
   const chunks = [];
   for await (const chunk of process.stdin) {
     chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
   }
   let str = Buffer.concat(chunks).toString('utf-8');
-  // Strip UTF-8 BOM — PowerShell 5.x adds BOM when piping strings to native commands
+  // PowerShell 5.x 向原生命令传递字符串时可能添加 UTF-8 BOM，解析 JSON 前必须去掉。
   if (str.charCodeAt(0) === 0xFEFF) str = str.slice(1);
   return str;
 }
 
 export async function parseStdinPayload(agentId) {
   const raw = await readStdin();
+  // Hook 协议需要立即得到合法 JSON；先输出空对象，即使后续采集失败也不会阻塞宿主。
   process.stdout.write('{}\n');
 
   if (!raw || !raw.trim()) return null;
@@ -426,6 +480,7 @@ export async function parseStdinPayload(agentId) {
   return { transcriptPath, sessionId, cwd };
 }
 
-// --- Re-export normalizer utilities -----------------------------------------
+// --- 重新导出归一化工具 ----------------------------------------------------
 
+// 调用者只依赖本共享模块即可取得运行时配置加载器，无需了解其实际定义文件。
 export { loadHookRuntimeConfig };

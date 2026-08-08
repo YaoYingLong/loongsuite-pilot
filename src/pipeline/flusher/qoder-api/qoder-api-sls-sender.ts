@@ -1,3 +1,10 @@
+/**
+ * Qoder API Pipeline 专用 SLS WebTracking 缓冲发送器。
+ *
+ * 所有管理 API 宽表行共享一个有序 buffer，不按文件分桶；两秒 flush，每波并发最多 8 个
+ * 4000 条 batch。发送失败后删除 payload 并保存有界诊断元数据，确定性 event_id 保护重采去重。
+ */
+
 import * as os from 'node:os';
 import type { PipelineSlsFlusherConfig } from '../../types.js';
 import {
@@ -18,6 +25,7 @@ const HIGH_WATERMARK = 32_000;
 const FLUSH_CONCURRENCY = 8;
 const SHUTDOWN_WAIT_TIMEOUT_MS = 30_000;
 
+/** 构造 sender 所需的目标、命名和运行目录。 */
 export interface QoderApiSlsSenderOptions {
   flusherConfig: PipelineSlsFlusherConfig;
   configName: string;
@@ -26,11 +34,7 @@ export interface QoderApiSlsSenderOptions {
 }
 
 /**
- * SLS sender for the Qoder API pipeline.
- *
- * Buffers flat-string log rows in a single array (no per-file buckets) and
- * flushes them to SLS via webtracking on a 2-second interval. On send failure
- * bounded diagnostic metadata is persisted to a local failed-log directory.
+ * 持有有界单数组 buffer，并通过公共 SLS transport 发送。
  */
 export class QoderApiSlsSender {
   private readonly transportConfig: SlsTransportConfig;
@@ -42,6 +46,7 @@ export class QoderApiSlsSender {
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private flushing = false;
 
+  /** 标准化 endpoint，缓存 User-Agent/hostname，不在构造时创建网络连接。 */
   constructor(opts: QoderApiSlsSenderOptions) {
     const endpoint = /^https?:\/\//.test(opts.flusherConfig.Endpoint)
       ? opts.flusherConfig.Endpoint
@@ -58,6 +63,7 @@ export class QoderApiSlsSender {
     this.hostname = os.hostname();
   }
 
+  /** 幂等启动非保活两秒定时器。 */
   start(): void {
     if (this.flushTimer) return;
     this.flushTimer = setInterval(
@@ -67,6 +73,7 @@ export class QoderApiSlsSender {
     this.flushTimer.unref();
   }
 
+  /** 批量入队；已达到 64k 硬上限时拒绝整个新批次。 */
   enqueue(rows: Record<string, string>[]): boolean {
     if (this.bufferSize() >= MAX_BUFFER_SIZE) {
       logger.warn('buffer full, rejecting enqueue', {
@@ -81,10 +88,12 @@ export class QoderApiSlsSender {
     return true;
   }
 
+  /** 32k 高水位提示，当前 Pipeline 主要使用硬上限返回值。 */
   isBackpressured(): boolean {
     return this.bufferSize() >= HIGH_WATERMARK;
   }
 
+  /** 防重入 flush；每波切成最多 8 个 batch 并行发送。 */
   async flush(): Promise<void> {
     if (this.flushing || this.buffer.length === 0) return;
     this.flushing = true;
@@ -141,9 +150,7 @@ export class QoderApiSlsSender {
           }
         }
 
-        // Failed payloads are not retained locally. The lightweight failed-log only
-        // records bounded diagnostic metadata; event_id still protects any retry path
-        // from duplicate delivery.
+        // 失败 payload 不在本地保留；失败日志仅含有界元数据，event_id 保护可能的重采去重。
         this.buffer.splice(0, sliceEnd);
         if (hasFailure) break;
 
@@ -160,13 +167,14 @@ export class QoderApiSlsSender {
     }
   }
 
+  /** 清理定时器、限时等待在途 flush、重试排空并记录最终余量摘要。 */
   async shutdown(): Promise<void> {
     if (this.flushTimer) {
       clearInterval(this.flushTimer);
       this.flushTimer = null;
     }
 
-    // Wait for any in-flight flush to complete.
+    // 最多等待 30 秒在途 flush，避免停止过程永久卡住。
     const waitStart = Date.now();
     while (this.flushing && Date.now() - waitStart < SHUTDOWN_WAIT_TIMEOUT_MS) {
       await new Promise((r) => setTimeout(r, 100));
@@ -178,13 +186,13 @@ export class QoderApiSlsSender {
       });
     }
 
-    // Drain remaining buffer with retries (only effective if in-flight flush completed).
+    // 在途任务已完成时最多重试三轮排空。
     const maxAttempts = 3;
     for (let attempt = 0; attempt < maxAttempts && this.bufferSize() > 0; attempt++) {
       await this.flush();
     }
 
-    // Persist any rows that could not be drained.
+    // 最终余量从内存删除，只持久化数量/字节/错误摘要。
     if (this.bufferSize() > 0) {
       const remaining = this.buffer.splice(0);
       logger.warn('shutdown: buffer not fully drained, persisting remaining', {
@@ -207,6 +215,7 @@ export class QoderApiSlsSender {
     }
   }
 
+  /** 返回 O(1) 当前缓冲行数。 */
   bufferSize(): number {
     return this.buffer.length;
   }

@@ -1,5 +1,7 @@
-# Qoder Work hook entrypoint (Windows) — delegates to qoderwork-hook-processor.mjs.
-# Usage: powershell -File qoderwork-loongsuite-pilot-hook.ps1
+# Qoder Work Windows Hook 入口：把 stdin JSON 委托给 qoderwork-hook-processor.mjs。
+# 调用：powershell -File qoderwork-loongsuite-pilot-hook.ps1；可选首参覆盖 agent-id。
+# processor 解析 Qoder Work transcript 并写 history JSONL；缺少 Node/processor 或解析失败时
+# 都保持 exit 0，不能阻塞宿主 Agent。
 
 $ErrorActionPreference = "Continue"
 $AgentId = if ($args.Count -gt 0) { $args[0] } else { "qoder-work" }
@@ -58,19 +60,19 @@ if (-not $nodeBin) {
 }
 
 try {
-    # Read stdin as raw bytes to avoid PowerShell encoding issues (GB2312/ASCII mangles UTF-8)
+    # 按原始字节读取，避免 PowerShell 经 GB2312/ASCII 转码而损坏 UTF-8 JSON。
     $stdinStream = [Console]::OpenStandardInput()
     $ms = New-Object System.IO.MemoryStream
     $stdinStream.CopyTo($ms)
     $rawBytes = $ms.ToArray()
     $ms.Dispose()
 
-    # Strip UTF-8 BOM (EF BB BF) before any encoding fixup
+    # 编码修复前去掉 UTF-8 BOM（EF BB BF）。
     if ($rawBytes.Length -ge 3 -and $rawBytes[0] -eq 0xEF -and $rawBytes[1] -eq 0xBB -and $rawBytes[2] -eq 0xBF) {
         $rawBytes = $rawBytes[3..($rawBytes.Length - 1)]
     }
 
-    # Fix Cursor's UTF-8→GBK double-encoding on Chinese Windows.
+    # 尝试修复中文 Windows 上的 UTF-8 -> GBK 二次编码；失败则保留原字节。
     if ($rawBytes.Length -gt 2) {
         try {
             $utf8    = [System.Text.Encoding]::UTF8

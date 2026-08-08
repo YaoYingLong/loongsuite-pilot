@@ -1,22 +1,25 @@
+/**
+ * 通用 session JSONL 文件轮询基类。
+ *
+ * 子类负责发现文件和单行转换；本类为每个绝对路径维护 byte offset/inode，处理 truncate/rotation
+ * 并逐行隔离 JSON 错误。复杂的跨行 turn/step 语义（如当前 Codex）会直接继承 BaseInput，
+ * 不使用这个“单行即一事件”的简单基类。
+ */
+
 import * as fs from 'node:fs/promises';
 import { CollectionMethod } from '../../types/index.js';
 import type { AgentActivityEntry } from '../../types/index.js';
 import { BaseInput, type InputOptions } from './base-input.js';
 
 export interface SessionInputOptions extends InputOptions {
-  /** Glob-like base directory to scan for session files. */
+  /** session 文件扫描根目录。 */
   sessionDir: string;
-  /** File name pattern (e.g. "rollout-*.jsonl"). */
+  /** 文件名 pattern，例如 `rollout-*.jsonl`。 */
   filePattern: string;
 }
 
 /**
- * Base input for session file polling (e.g. Codex CLI, OpenCode).
- * Reads JSONL session files with offset tracking per file (inode-aware rotation).
- *
- * Subclass must implement:
- *   - discoverSessionFiles(): list session files to process
- *   - processSessionLine(): handle a single JSONL line from a session file
+ * 单行独立 session 文件的增量轮询抽象类。
  */
 export abstract class BaseSessionInput extends BaseInput {
   readonly collectionMethod = CollectionMethod.SessionFilePolling;
@@ -24,12 +27,14 @@ export abstract class BaseSessionInput extends BaseInput {
   protected readonly sessionDir: string;
   protected readonly filePattern: string;
 
+  /** 保存扫描根与 pattern；不在构造阶段访问文件系统。 */
   constructor(opts: SessionInputOptions) {
     super(opts);
     this.sessionDir = opts.sessionDir;
     this.filePattern = opts.filePattern;
   }
 
+  /** 顺序处理发现到的文件，保持子类返回顺序。 */
   protected async collect(): Promise<AgentActivityEntry[]> {
     const files = await this.discoverSessionFiles();
     const allEntries: AgentActivityEntry[] = [];
@@ -41,6 +46,7 @@ export abstract class BaseSessionInput extends BaseInput {
     return allEntries;
   }
 
+  /** 按路径状态 key 增量读取文件，并为 inode/截断变化重置 offset。 */
   private async processFile(filePath: string): Promise<AgentActivityEntry[]> {
     const stateKey = `${this.id}:${filePath}`;
     let stat;
@@ -54,12 +60,13 @@ export abstract class BaseSessionInput extends BaseInput {
     const prevState = this.stateStore.get(stateKey);
     const prevInode = prevState.extra?.inode as number | undefined;
 
-    // Detect file rotation via inode change
+    // inode 变化表示路径已指向新文件，从 0 开始消费。
     if (prevInode !== undefined && prevInode !== (stat as any).ino) {
       this.stateStore.setOffset(stateKey, 0);
       this.stateStore.update(stateKey, { extra: { inode: (stat as any).ino } });
     }
 
+    // 同 inode 但 size 变小属于 copytruncate，也需要重置。
     let offset = this.stateStore.getOffset(stateKey);
     if (offset > 0 && stat.size < offset) {
       this.logger.info('file truncated or rotated, resetting offset', {
@@ -78,6 +85,7 @@ export abstract class BaseSessionInput extends BaseInput {
       const buf = Buffer.alloc(stat.size - offset);
       await handle.read(buf, 0, buf.length, offset);
       const text = buf.toString('utf-8');
+      // 先推进到本次 stat.size；畸形行不会永久阻塞后续内容。
       this.stateStore.setOffset(stateKey, stat.size);
       this.stateStore.update(stateKey, { extra: { inode: (stat as any).ino } });
 
@@ -98,10 +106,10 @@ export abstract class BaseSessionInput extends BaseInput {
     }
   }
 
-  /** Discover session files to process. */
+  /** 发现本轮需要处理的 session 文件。 */
   protected abstract discoverSessionFiles(): Promise<string[]>;
 
-  /** Process a single parsed JSON line from a session file. Return null to skip. */
+  /** 转换单条已解析 JSON；返回 null 跳过。 */
   protected abstract processSessionLine(
     record: Record<string, unknown>,
     filePath: string,

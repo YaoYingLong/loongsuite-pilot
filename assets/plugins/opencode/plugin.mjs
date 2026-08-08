@@ -1,21 +1,18 @@
 /**
- * loongsuite-pilot OpenCode event_t plugin
+ * LoongSuite Pilot 的 OpenCode event_t 插件。
  *
- * Runs inside the OpenCode process (Bun runtime).
- * Converts OpenCode EventV2 events into event_t JSONL records
- * for consumption by loongsuite-pilot's BaseHookInput pipeline.
+ * `PluginInjectStrategy` 把本文件的 file:// spec 写入 OpenCode 配置；随后代码常驻 OpenCode
+ * 的 Bun 进程，把 EventV2 生命周期转换成 `logs/opencode/opencode-YYYY-MM-DD.jsonl`，再由
+ * `OpenCodeLogInput` 通过 BaseHookInput 管道读取。插件零外部依赖，只使用 Node/Bun 内置 API。
  *
- * Zero external dependencies — only Node/Bun built-in APIs.
+ * 事件映射：chat.message 开启 turn 并采集 user；chat.params 保存模型/provider；
+ * message.part.updated 处理 step、reasoning/text 和工具状态；message.updated 汇总 LLM response
+ * 与 token；tool.execute.before/after 补充工具参数、结果和时长；实验性 system.transform 保存
+ * system instructions；session.idle/error 清理会话内存。
  *
- * OpenCode plugin hooks used (requires OpenCode >= 0.1.x):
- *   - chat.message           — turn start, user message capture
- *   - chat.params            — model / provider metadata
- *   - message.part.updated   — step-start, step-finish, tool invocation parts
- *   - message.updated        — LLM response aggregation, token metrics
- *   - tool.execute.before    — tool call arguments capture
- *   - tool.execute.after     — tool result & duration capture
- *   - experimental.chat.system.transform — system instructions capture (experimental API)
- *   - session.idle / session.error       — session lifecycle cleanup
+ * 每个 OpenCode server 实例对应一个工作目录。会话状态存在有上限的 Map 中，最多 100 个并按
+ * 插入顺序淘汰。所有处理器都经 safe() 包装，序列化/落盘失败只写诊断，不得改变宿主行为。
+ * 内容最长 64KB，并执行 `captureMessageContent` 配置；插件退出时无外部资源需要显式关闭。
  */
 
 import fs from "node:fs";
@@ -28,13 +25,10 @@ const MAX_SESSIONS = 100;
 const MAX_CONTENT_SIZE = 64 * 1024;
 
 // ---------------------------------------------------------------------------
-// Caller-supplied span attributes
+// 调用方提供的 span 属性
 // ---------------------------------------------------------------------------
-// The host process (e.g. multica daemon) sets LOONGSUITE_PILOT_SPAN_ATTRIBUTES
-// as `key=value,key=value` per agent invocation. Parsed once at init and stamped
-// onto every record as top-level fields so the trace flusher can pass matching
-// keys through to span attributes. Inlined (no import) — plugins ship standalone.
-// Mirrors parseSpanAttributesFromEnv in assets/hooks/shared/resource-context.mjs.
+// 宿主按每次调用以 `key=value,key=value` 设置环境变量；模块初始化时解析一次并铺到记录顶层。
+// 插件独立分发不能依赖 hooks/shared，故内联实现，并与 resource-context.mjs 保持规则一致。
 const SPAN_ATTR_RESERVED_PREFIXES = [
   "gen_ai.",
   "git.",
@@ -72,7 +66,7 @@ function parseSpanAttributesFromEnv(env = process.env) {
 const SPAN_ATTRIBUTES = parseSpanAttributesFromEnv(process.env);
 
 // ---------------------------------------------------------------------------
-// Path helpers
+// 路径辅助函数
 // ---------------------------------------------------------------------------
 
 function resolveDataDir() {
@@ -102,7 +96,7 @@ function todayStamp() {
 }
 
 // ---------------------------------------------------------------------------
-// ID generators
+// ID 生成器
 // ---------------------------------------------------------------------------
 
 function generateTraceId() {
@@ -124,7 +118,7 @@ function msToNanos(ms) {
 }
 
 // ---------------------------------------------------------------------------
-// Safe JSON serialization
+// 安全 JSON 序列化
 // ---------------------------------------------------------------------------
 
 function safeStringify(obj) {
@@ -167,7 +161,7 @@ function truncateContent(val) {
 }
 
 // ---------------------------------------------------------------------------
-// Config
+// 运行时配置
 // ---------------------------------------------------------------------------
 
 function loadPilotConfig() {
@@ -190,15 +184,13 @@ function resolveUserId(cfg) {
 }
 
 // ---------------------------------------------------------------------------
-// JSONL writer
+// JSONL 写入
 // ---------------------------------------------------------------------------
 
 let _logDirReady = false;
 
-// Working directory of the OpenCode instance, captured once at server init.
-// One OpenCode server instance maps to one project directory, so this is stable
-// for the process lifetime. Emitted as agent.opencode.cwd so the pilot pipeline
-// can enrich git.repo / workspace.current_root downstream.
+// server 初始化时记录 OpenCode 工作目录；一个 server 对应一个项目，进程生命周期内稳定。
+// 写为 agent.opencode.cwd，供后续管道丰富 git.repo/workspace.current_root。
 let agentCwd;
 
 function writeRecord(record) {
@@ -229,7 +221,7 @@ function writeError(source, err) {
 }
 
 // ---------------------------------------------------------------------------
-// Session state (LRU-bounded Map)
+// 会话状态（容量有上限的 Map）
 // ---------------------------------------------------------------------------
 
 const sessions = new Map();
@@ -253,6 +245,7 @@ function getSession(sessionID) {
       stepFinishData: null,
     };
     sessions.set(sessionID, s);
+    // Map 保持插入顺序，超限时删除最早会话，避免常驻插件无限增长内存。
     if (sessions.size > MAX_SESSIONS) {
       const oldest = sessions.keys().next().value;
       clearSession(oldest);
@@ -275,7 +268,7 @@ function clearSession(sessionID) {
 }
 
 // ---------------------------------------------------------------------------
-// Record builder helpers
+// 标准记录公共字段
 // ---------------------------------------------------------------------------
 
 function buildCommonFields(sessionID, session, userId) {
@@ -318,7 +311,7 @@ function inferProviderName(providerID) {
 }
 
 // ---------------------------------------------------------------------------
-// Message format helpers (ARMS nested parts structure)
+// 消息格式工具（ARMS 嵌套 parts 结构）
 // ---------------------------------------------------------------------------
 
 function buildUserInputMessages(systemPrompt, userPromptText) {
@@ -414,7 +407,7 @@ function buildOutputMessages(pendingParts, finishReason) {
 }
 
 // ---------------------------------------------------------------------------
-// Event handlers
+// OpenCode 事件处理器
 // ---------------------------------------------------------------------------
 
 // 方案1(env):首个 turn 读 process.env.TRACEPARENT,写 session 级关联记录到
@@ -437,7 +430,7 @@ function recordUpstreamEnvOnce(sessionID) {
     const rec = { type: "session", sessionId: sessionID, traceparent: tp, ts: new Date().toISOString() };
     fs.appendFileSync(path.join(dir, `${base}.jsonl`), JSON.stringify(rec) + "\n", "utf-8");
   } catch {
-    // fail-open: 绝不影响 opencode
+    // fail-open：关联记录失败绝不影响 OpenCode。
   }
 }
 
@@ -730,12 +723,8 @@ function handleMessageUpdated(props, userId) {
     finishReasons[0]
   );
 
-  // opencode's tokens.input has cache already subtracted out (a cost-bucketing
-  // convention: input/cache.read/cache.write are non-overlapping). Add cache
-  // back so gen_ai.usage.input_tokens is the TOTAL prompt tokens, matching the
-  // claude-code / qwen collectors where cache_read is a subset of input. This
-  // keeps cache_read <= input_tokens. cost_usd is left untouched (opencode
-  // already computed it correctly from the non-overlapping buckets).
+  // OpenCode tokens.input 已扣除 cache（input/read/write 是互斥成本桶）。标准字段要求 input 为
+  // 总 prompt token，故加回 cache，使 cache_read <= input；cost_usd 已按桶正确计算，不改。
   const cacheRead = tokens.cache?.read || 0;
   const cacheWrite = tokens.cache?.write || 0;
   const outputTokens = tokens.output || 0;
@@ -853,12 +842,8 @@ function handleToolExecuteAfter(inp, out, userId) {
 
   const resultPayload = out?.output ?? out?.result ?? "";
 
-  // MCP tools: opencode does not pass the result through this after-hook
-  // (out.output / out.result are empty), yet it DOES populate part.state.output,
-  // which the message.part.updated path reads. If there is no content and no
-  // error here, bail out WITHOUT marking result:<callID> consumed, so the part
-  // path can own the result. Otherwise we would emit an empty tool.result and
-  // block the path that actually carries the MCP output.
+  // MCP 的 after-hook 不带结果，但 part.state.output 有真实值。这里无内容且无错误时直接返回，
+  // 且不标记 result 已消费，让 message.part.updated 路径稍后输出，避免空结果抢占真实结果。
   const hasResultContent = typeof resultPayload === "string"
     ? resultPayload.length > 0
     : resultPayload != null;
@@ -902,7 +887,7 @@ function handleToolExecuteAfter(inp, out, userId) {
 }
 
 // ---------------------------------------------------------------------------
-// Safe wrapper
+// 遵循 fail-open 的处理器包装器。
 // ---------------------------------------------------------------------------
 
 function safe(fn) {
@@ -916,7 +901,7 @@ function safe(fn) {
 }
 
 // ---------------------------------------------------------------------------
-// Plugin entry point
+// OpenCode 插件入口
 // ---------------------------------------------------------------------------
 
 export default {
@@ -925,9 +910,7 @@ export default {
   server: async (input, _options) => {
     ensureDir(logDir());
 
-    // OpenCode passes the instance context here; `directory` is the working
-    // directory. Fall back to process.cwd() (the plugin runs inside the
-    // OpenCode process, whose cwd is the same directory).
+    // OpenCode 在 server 回调传实例上下文；directory 是工作目录，缺失时回退宿主 process.cwd()。
     agentCwd =
       (typeof input?.directory === "string" && input.directory) ||
       process.cwd() ||

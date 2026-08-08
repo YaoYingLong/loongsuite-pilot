@@ -1,21 +1,27 @@
+/**
+ * Qoder trace 记录的多来源 token 用量补齐器。
+ *
+ * 按拦截文件、segment 统计和 SQLite 样本等来源匹配 turn/request，去重并只填充缺失 usage；
+ * 匹配不确定时保留原事件，不编造 token。
+ */
 import * as crypto from 'node:crypto';
 import type { AgentActivityEntry } from '../../types/index.js';
 import type { SegmentTokenData } from './segment-token-reader.js';
 import type { SqliteTokenData } from './sqlite-token-reader.js';
 
-// Outer bound for the nearest-timestamp fallback (Pass B). Nearest match wins;
-// this is only the acceptance ceiling. Widened from 1000ms because the JSONL
-// llm.response time (hook progress clock) drifts from SQLite gmt_create by up to
-// ~1.4s; the accurate agent.qoder.match_ts (when present) matches within a few ms.
+// 阶段 B 最近时间匹配的最大允许差值；实际仍选择最近候选。JSONL response 的 Hook progress 时钟
+// 与 SQLite gmt_create 可漂移约 1.4 秒，所以从 1000ms 放宽；有 match_ts 时通常只差几毫秒。
 const TIMESTAMP_THRESHOLD_MS = 5000;
 
-// Time-sanity guard for the order-based pass: reject a positional pair whose
-// response↔row time gap is implausibly large (guards against mis-alignment when a
-// row is missing in the middle). STRICT applies when the response carries the
-// accurate match_ts; LOOSE applies when only the drifted time_unix_nano is available.
+// 顺序匹配的时间合理性保护：中间缺 SQLite 行会使后续位置整体错一位，若 response 与 row 时间差
+// 明显过大就拒绝该配对。存在准确 match_ts 时用严格阈值，仅有漂移时钟时用宽松阈值。
 const ORDER_MATCH_STRICT_MS = 1000;
 const ORDER_MATCH_LOOSE_MS = 3000;
 
+/**
+ * 用 CLI segment 数据原地补充一个 turn 的 token、模型、finish reason 与 step/tool 时间。
+ * 同一 responseId 重复出现时只把 token 写到第一条，其余写 0，避免聚合重复计数。
+ */
 export function enrichCliTurn(
   entries: AgentActivityEntry[],
   segments: SegmentTokenData[],
@@ -59,10 +65,10 @@ export function enrichCliTurn(
       matches[i]['gen_ai.usage.cache_creation.input_tokens'] = 0;
     }
 
-    // Inject segment-derived timestamps and model for the entire step (unified clock source)
+    // 整个 step 都使用 segment 时间和模型，避免同一 span 混用 Hook 时钟与 session 时钟。
     const stepId = matches[0]['gen_ai.step.id'];
 
-    // Inject real model name from segment (overrides 'auto' from hook-processor)
+    // segment 中的真实模型覆盖 Hook processor 无法确认时写入的 auto。
     if (seg.model && seg.model !== 'unknown') {
       matches[0]['gen_ai.request.model'] = seg.model;
       matches[0]['gen_ai.response.model'] = seg.model;
@@ -72,7 +78,7 @@ export function enrichCliTurn(
       if (req) req['gen_ai.request.model'] = seg.model;
     }
 
-    // llm.request: use segment requestStartTs
+    // llm.request 使用 segment 的请求开始时间。
     if (seg.requestStartTs > 0) {
       const req = entries.find(e =>
         e['event.name'] === 'llm.request' && e['gen_ai.step.id'] === stepId,
@@ -82,13 +88,12 @@ export function enrichCliTurn(
       }
     }
 
-    // llm.response: use segment responseEndTs
+    // llm.response 使用 segment 的响应完成时间。
     if (seg.responseEndTs > 0) {
       matches[0].time_unix_nano = String(BigInt(seg.responseEndTs) * 1_000_000n);
     }
 
-    // tool.call: use segment responseEndTs (tool starts when LLM finishes)
-    // tool.result: use segment toolFinishedTs (tool ends when execution completes)
+    // 工具在 LLM 响应结束后开始，tool.call 用 responseEndTs；tool.result 用真实 toolFinishedTs。
     if (stepId && seg.toolFinishedTs > 0) {
       const toolCalls = entries.filter(e =>
         e['event.name'] === 'tool.call' && e['gen_ai.step.id'] === stepId,
@@ -112,13 +117,19 @@ export function enrichCliTurn(
   }
 }
 
+/**
+ * 用 SQLite 样本原地 enrich 同 session 的 IDE 事件。
+ *
+ * 阶段 A 优先按 turn/request 顺序匹配，阶段 B 再用最近时间处理剩余项；方法同步 request/model/token
+ * 和时间，最后把未获得 token 的 response 明确写为 0，便于下游 AGENT 聚合。
+ */
 export function enrichIdeTurn(
   entries: AgentActivityEntry[],
   sqliteRows: SqliteTokenData[],
 ): void {
   if (sqliteRows.length === 0) return;
 
-  // Get all llm.response entries sorted by time
+  // 只对 llm.response 匹配 token，并按时间排序供阶段 B 最近距离搜索。
   const responseEntries = entries
     .filter(e => e['event.name'] === 'llm.response')
     .sort((a, b) => extractMs(a) - extractMs(b));
@@ -129,13 +140,10 @@ export function enrichIdeTurn(
 
   matchIdeTurnsBySqliteOrder(entries, sortedGroups, used, tokenWritten);
 
-  // Conservative fallback for incomplete SQLite metadata or structurally unmatched responses:
-  // match by close timestamp only, preserving the previous behavior.
+  // SQLite 元数据不完整或结构匹配失败时，用保守的近时间匹配保持兼容行为。
   for (const [requestId, group] of sortedGroups) {
     for (const row of group) {
-      // Skip rows already consumed by the order-based pass so Pass B only handles
-      // genuinely-leftover rows; otherwise an already-matched row could re-stamp a
-      // leftover response with the wrong id/model.
+      // 跳过阶段 A 已消费的 row；否则同一 row 可能再次给剩余 response 写入错误 ID/模型。
       if (tokenWritten.has(sqliteDedupeKey(row))) continue;
 
       let bestEntry: AgentActivityEntry | null = null;
@@ -174,8 +182,8 @@ export function enrichIdeTurn(
           }
         }
 
-        // Each SQLite row = one LLM call. Write token on first match per row.
-        // Use composite key (requestId:gmtCreate) to avoid collision if two calls share a millisecond.
+        // 一条 SQLite row 代表一次 LLM 调用，token 只能写一次。优先 messageId，否则组合
+        // requestId:gmtCreate，避免同一毫秒出现多个调用时发生简单时间键冲突。
         const dedupeKey = sqliteDedupeKey(row);
         if (!tokenWritten.has(dedupeKey)) {
           bestEntry['gen_ai.usage.input_tokens'] = row.inputTokens;
@@ -188,8 +196,7 @@ export function enrichIdeTurn(
     }
   }
 
-  // Inject real timestamps from SQLite gmt_create (similar to enrichCliTurn using segment timestamps).
-  // Collect matched entries with their gmt_create, sorted chronologically.
+  // 类似 CLI 使用 segment 时钟，IDE 使用 SQLite gmt_create 作为真实响应时间，并按时间排序配对。
   const matchedPairs: { entry: AgentActivityEntry; gmtCreate: number }[] = [];
   for (const entry of responseEntries) {
     if (!used.has(entry)) continue;
@@ -198,8 +205,7 @@ export function enrichIdeTurn(
   }
   matchedPairs.sort((a, b) => a.gmtCreate - b.gmtCreate);
 
-  // Find the user-boundary entry for step 1's request time.
-  // The normalizer emits user prompts as 'other' (not 'llm.request'), so match both.
+  // 查找 step 1 的用户边界。normalizer 通常把用户 prompt 输出为 other，也兼容旧 llm.request 形状。
   const userBoundary = entries.find(e =>
     !e['gen_ai.step.id'] &&
     (e['event.name'] === 'llm.request' || (e['event.name'] === 'other' && e['gen_ai.input.messages_delta'])),
@@ -208,21 +214,17 @@ export function enrichIdeTurn(
   for (let i = 0; i < matchedPairs.length; i++) {
     const { entry: respEntry, gmtCreate } = matchedPairs[i];
 
-    // llm.response: use gmt_create as real response time
+    // llm.response 采用 SQLite gmt_create 作为真实完成时间。
     respEntry.time_unix_nano = String(BigInt(gmtCreate) * 1_000_000n);
 
-    // Find the llm.request for this response's step (same step.id).
-    // Restrict to the same step to avoid cross-turn contamination in
-    // multi-turn sessions where allEntries contains entries from different
-    // turns. A backwards scan without a step.id check would find the
-    // previous turn's llm.request and overwrite its timestamp.
+    // 优先找同 step.id 的 llm.request，避免同 session 多 turn 合并后误改上一 turn 的请求时间。
     const respStepId = respEntry['gen_ai.step.id'];
     let req: AgentActivityEntry | undefined;
     if (respStepId) {
       req = entries.find(e => e['event.name'] === 'llm.request' && e['gen_ai.step.id'] === respStepId);
     }
     if (!req) {
-      // Fallback: backwards scan limited to the same turn
+      // step.id 缺失时才向前回扫，但仍限制在相同 turn 内。
       const respTurnId = respEntry['gen_ai.turn.id'];
       const respIdx = entries.indexOf(respEntry);
       for (let j = respIdx - 1; j >= 0; j--) {
@@ -236,21 +238,18 @@ export function enrichIdeTurn(
 
     if (req) {
       if (i > 0) {
-        // Previous step's gmt_create + 1ms (accounts for tool.result buffer in prior step)
+        // 后续 step 从上一响应后 1ms 开始，为上一 step 的 tool.result 留出时间位置。
         req.time_unix_nano = String(BigInt(matchedPairs[i - 1].gmtCreate + 1) * 1_000_000n);
       } else if (userBoundary) {
-        // Use userBoundary.time + 1ms so the LLM request starts strictly after
-        // the user prompt event. When both share the same timestamp the converter
-        // generates a duplicate empty STEP (0ms, no LLM children) because it
-        // sees two events at the same instant inside step s1.
+        // 首个请求放在用户边界后 1ms。二者同刻时转换器会在 step s1 生成一个 0ms、无 LLM 子节点
+        // 的重复空 STEP。
         const ubNs = BigInt(String(userBoundary.time_unix_nano));
         req.time_unix_nano = String(ubNs + 1_000_000n); // +1ms
       }
     }
 
-    // IDE data has no tool-finished timestamp; place tool.call at response time
-    // and tool.result 1ms later. The next step's llm.request is offset by +1ms
-    // to match, keeping steps non-overlapping.
+    // IDE 没有工具完成时间，只能把 tool.call 放在 response 时刻、result 放到 1ms 后；下一 step
+    // request 也从该位置继续，保持各 STEP 不重叠。
     const toolCallTs = String(BigInt(gmtCreate) * 1_000_000n);
     const toolResultTs = String(BigInt(gmtCreate + 1) * 1_000_000n);
     const respIdx = entries.indexOf(respEntry);
@@ -263,13 +262,12 @@ export function enrichIdeTurn(
     }
   }
 
-  // Clean up temporary marker
+  // 临时匹配时间只用于本函数内部，输出前删除，避免污染事件 schema。
   for (const entry of responseEntries) {
     delete (entry as Record<string, unknown>).__matched_gmt_create;
   }
 
-  // Set token fields to 0 on all llm.response entries that didn't receive tokens.
-  // This ensures AGENT aggregation counts them as 0 rather than undefined (which would be skipped).
+  // 未匹配 response 明确写 0，使 AGENT 聚合把它计为 0；undefined 会被聚合逻辑完全跳过。
   for (const entry of responseEntries) {
     if (entry['gen_ai.usage.input_tokens'] !== undefined) continue;
     entry['gen_ai.usage.input_tokens'] = 0;
@@ -280,6 +278,7 @@ export function enrichIdeTurn(
 
 }
 
+/** 按 requestId 分组并分别按 gmtCreate 排序，再按每组首行时间排列各 request 组。 */
 function groupSqliteRowsByRequest(sqliteRows: SqliteTokenData[]): Array<[string, SqliteTokenData[]]> {
   const requestGroups = new Map<string, SqliteTokenData[]>();
   for (const row of sqliteRows) {
@@ -297,6 +296,10 @@ function groupSqliteRowsByRequest(sqliteRows: SqliteTokenData[]): Array<[string,
     .sort((a, b) => a[1][0].gmtCreate - b[1][0].gmtCreate);
 }
 
+/**
+ * 阶段 A：在 session 元数据完整时，按 Hook turn 顺序与 SQLite request 组顺序做结构匹配。
+ * 结果通过 used/tokenWritten 集合传给阶段 B，函数原地更新匹配到的事件。
+ */
 function matchIdeTurnsBySqliteOrder(
   entries: AgentActivityEntry[],
   requestGroups: Array<[string, SqliteTokenData[]]>,
@@ -328,17 +331,10 @@ function matchIdeTurnsBySqliteOrder(
     const [requestId, sqliteRows] = candidateGroups[i];
     const responses = turnEntries.filter(e => e['event.name'] === 'llm.response');
 
-    // Best-effort ordered matching. Counts often differ (sub-agent turns miss the
-    // final answer in the transcript; the latest row may not be persisted yet).
-    // Match the aligned prefix by order instead of abandoning the whole turn to the
-    // timestamp fallback. A time-sanity guard rejects positionally-aligned pairs
-    // whose times are implausibly far apart (mid-turn gap → order shifts by one →
-    // the shifted pair lands on a neighbouring call seconds away) so they fall
-    // through to the nearest-timestamp fallback (Pass B) instead of mis-attributing.
+    // 数量常因 sub-agent transcript 缺最终答案或最新 SQLite row 未落盘而不同；仍按顺序匹配可对齐
+    // 的前缀。若中间缺行导致位置整体偏移，时间保护会拒绝明显过远的配对并交给阶段 B。
     const n = Math.min(responses.length, sqliteRows.length);
-    // When counts match exactly, trust order fully (clock-independent) — this is the
-    // original, well-tested contract. The time-sanity guard applies only in the
-    // best-effort (unequal count) path, where a mid-turn gap would shift the pairing.
+    // 数量完全一致时信任结构顺序，不依赖两个时钟；只有数量不等的 best-effort 分支才检查时间差。
     const countsMatch = responses.length === sqliteRows.length;
     for (let j = 0; j < n; j++) {
       const response = responses[j];
@@ -357,6 +353,7 @@ function matchIdeTurnsBySqliteOrder(
   }
 }
 
+/** 按非空 turn.id 分组，并移除不含 llm.response 的组。 */
 function groupEntriesByTurn(entries: AgentActivityEntry[]): Array<[string, AgentActivityEntry[]]> {
   const groups = new Map<string, AgentActivityEntry[]>();
   for (const entry of entries) {
@@ -369,6 +366,7 @@ function groupEntriesByTurn(entries: AgentActivityEntry[]): Array<[string, Agent
   return [...groups.entries()].filter(([, group]) => group.some(e => e['event.name'] === 'llm.response'));
 }
 
+/** 把一条确认匹配的 SQLite row 的 ID、模型和 token 写入 response 及同 step request。 */
 function applySqliteRowToIdeResponse(
   allEntries: AgentActivityEntry[],
   turnEntries: AgentActivityEntry[],
@@ -405,21 +403,24 @@ function applySqliteRowToIdeResponse(
   tokenWritten.add(dedupeKey);
 }
 
+/** 查找与 response 具有相同 step.id 的 llm.request。 */
 function findStepRequest(entries: AgentActivityEntry[], response: AgentActivityEntry): AgentActivityEntry | undefined {
   const stepId = response['gen_ai.step.id'];
   return entries.find(e => e['event.name'] === 'llm.request' && e['gen_ai.step.id'] === stepId);
 }
 
+/** 低置信匹配目前只作为显式占位，不向事件写额外字段，避免污染输出 schema。 */
 function markLowConfidence(entries: AgentActivityEntry[], _warning: string): void {
-  // Low-confidence match: no additional fields written to avoid polluting output.
   void entries;
 }
 
+/** 优先使用 messageId，否则组合 requestId 与时间生成 SQLite 行去重键。 */
 function sqliteDedupeKey(row: SqliteTokenData): string {
   return row.messageId || `${row.requestId}:${row.gmtCreate}`;
 }
 
 
+/** 为同一 turn 的全部事件原地写入同一个随机 16 字节 trace_id；空数组不生成随机值。 */
 export function injectTraceId(entries: AgentActivityEntry[]): void {
   if (entries.length === 0) return;
   const traceId = crypto.randomBytes(16).toString('hex');
@@ -428,6 +429,7 @@ export function injectTraceId(entries: AgentActivityEntry[]): void {
   }
 }
 
+/** 从纳秒字符串/数字或兼容 timestamp 字段取得毫秒时间，缺失时返回 0。 */
 function extractMs(entry: AgentActivityEntry): number {
   const raw = entry.time_unix_nano;
   if (typeof raw === 'string') {
@@ -440,9 +442,10 @@ function extractMs(entry: AgentActivityEntry): number {
   return 0;
 }
 
-// Accurate per-response match timestamp injected by the hook from the transcript's
-// assistant record (≈ SQLite gmt_create, within a few ms). Returns undefined when
-// absent (old JSONL / hook not yet updated).
+/**
+ * 读取 Hook 从 transcript assistant record 注入的精确匹配时间，通常与 SQLite gmt_create 只差数毫秒。
+ * 旧 JSONL 或旧 Hook 不含此字段时返回 undefined。
+ */
 function accurateMatchMs(entry: AgentActivityEntry): number | undefined {
   const raw = (entry as Record<string, unknown>)['agent.qoder.match_ts'];
   if (typeof raw === 'number' && Number.isFinite(raw)) return raw;
@@ -453,8 +456,7 @@ function accurateMatchMs(entry: AgentActivityEntry): number | undefined {
   return undefined;
 }
 
-// Timestamp used for matching against SQLite gmt_create: the accurate match_ts when
-// available, otherwise the drifted time_unix_nano.
+/** SQLite 匹配优先用精确 match_ts，缺失时回退到可能有漂移的事件时间。 */
 function matchMs(entry: AgentActivityEntry): number {
   return accurateMatchMs(entry) ?? extractMs(entry);
 }

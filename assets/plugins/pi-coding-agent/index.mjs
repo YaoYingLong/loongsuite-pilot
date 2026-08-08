@@ -1,11 +1,17 @@
 /**
- * LoongSuite Pilot extension for Pi Coding Agent.
+ * LoongSuite Pilot 的 Pi Coding Agent Extension。
  *
- * Runs inside the Pi process and converts Pi extension lifecycle events into
- * canonical GenAI JSONL records consumed by PiCodingAgentLogInput.
+ * `PluginInjectStrategy` 把本文件路径注入 Pi 配置；默认导出函数收到 Pi Extension API 后，
+ * 在 Pi 进程内注册 session/agent/turn/context/message/tool 生命周期监听器，将事件转换为
+ * `logs/pi-coding-agent/pi-coding-agent-YYYY-MM-DD.jsonl`。`PiCodingAgentLogInput` 随后读取
+ * 这些标准 GenAI 记录。
  *
- * The extension is deliberately dependency-free and fail-open: telemetry
- * failures must never interrupt an agent turn or tool execution.
+ * state 与监听器和宿主进程同生命周期：session_start/before_agent_start 重置 trace/turn，
+ * turn_start 建 step，context 输出 user + llm.request，message_end 输出 response，工具开始/结束
+ * 配对并计算时长，session_shutdown 清理暂存 Map。内容遵循 captureMessageContent。
+ *
+ * 插件刻意零依赖、fail-open。序列化限制深度/数组/键/字符串长度并处理循环引用；目录/文件在
+ * POSIX 分别收紧到 0700/0600。任何遥测异常由 safeHandler 捕获，不能中断 Agent turn 或工具。
  */
 
 import crypto from 'node:crypto';
@@ -22,7 +28,7 @@ const MAX_OBJECT_KEYS = 100;
 const MAX_DEPTH = 8;
 
 const pluginDir = path.dirname(fileURLToPath(import.meta.url));
-// Installed layout: $PILOT_DATA/plugins/pi-coding-agent/index.mjs.
+// 安装后布局为 `$PILOT_DATA/plugins/pi-coding-agent/index.mjs`，向上两级即数据目录。
 const installedDataDir = path.resolve(pluginDir, '..', '..');
 
 function resolveDataDir() {
@@ -53,8 +59,7 @@ function timestampNanos(timestamp = Date.now()) {
 
 function timestampStrictlyAfter(timestamp, startedAt) {
   const millis = timestampMillis(timestamp);
-  // The downstream OTel converter consumes numeric timestamps in milliseconds,
-  // so a 1ns adjustment would be truncated back to a zero-duration span.
+  // 下游 OTel converter 以毫秒消费数字时间；只加 1ns 会被截断回零时长，因此至少加 1ms。
   return Number.isFinite(startedAt) ? Math.max(millis, Math.trunc(startedAt) + 1) : millis;
 }
 
@@ -122,9 +127,7 @@ function appendLogFile(fileName, content) {
     try {
       ensureLogDir();
       fd = fs.openSync(filePath, 'a', 0o600);
-      // `mode` only applies when creating a file. Tighten the actual opened
-      // inode before every append so log rotation/replacement cannot leave a
-      // permissive file receiving sensitive telemetry.
+      // open 的 mode 只在创建时生效；每次 append 前对真实 fd 再 chmod，防止日志轮转后权限变宽。
       if (process.platform !== 'win32') fs.fchmodSync(fd, 0o600);
       fs.writeFileSync(fd, content, { encoding: 'utf8' });
       return;
@@ -147,7 +150,7 @@ function writeError(source, error) {
       `${new Date().toISOString()} [${source}] ${error?.stack || error}\n`,
     );
   } catch {
-    // Telemetry errors are intentionally ignored.
+    // 遥测错误有意忽略，不能反向影响 Pi。
   }
 }
 
@@ -377,6 +380,11 @@ function trailingUserInputMessages(messages) {
   return out;
 }
 
+/**
+ * 注册 LoongSuite Pilot 的全部 Pi 生命周期监听器。
+ * @param {object} pi Pi Coding Agent 提供的 Extension API，需支持 `on()` 和工具查询方法。
+ * @returns {void} 监听器随 Pi session 生命周期运行，由宿主负责调度。
+ */
 export default function loongSuitePilotPiCodingAgent(pi) {
   const state = {
     userId: 'unknown',
@@ -481,12 +489,10 @@ export default function loongSuitePilotPiCodingAgent(pi) {
     const message = event.message;
     if (!message || message.role !== 'assistant') return;
 
-    // A response without a preceding context event would otherwise be
-    // converted into a zero-duration response-only LLM span downstream.
+    // 若 response 前没有 context，先补 user/request，避免下游得到零时长的孤立 response span。
     emitUserInput({ messages: [] }, ctx);
     emitLlmRequest({ messages: [] }, ctx);
-    // Pi assigns AssistantMessage.timestamp when provider streaming starts;
-    // handler receipt time is the closest available response-completion time.
+    // Pi 的 AssistantMessage.timestamp 是流开始时间；处理器收到事件的时刻最接近完成时间。
     const responseAt = timestampStrictlyAfter(Date.now(), state.requestStartedAt);
 
     const usage = message.usage || {};

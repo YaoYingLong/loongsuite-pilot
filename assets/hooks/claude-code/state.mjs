@@ -2,19 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * state.mjs — Claude Code session state.
+ * Claude Code 会话状态持久化模块。
  *
- * 移植自 claude-code-plugin .../src/state.js,改:
- *   - ESM 导出
- *   - state 路径改为 ~/.loongsuite-pilot/state/claude-code/sessions/<sessionId>.json
- *   - 新增 listStateFiles / getStateMtime,供 hook-watchdog cleanup 使用
+ * 移植自 claude-code-plugin 的 `src/state.js`，主要变化如下：
+ *   - 改用 ES Module 导出；
+ *   - state 路径改为 `~/.loongsuite-pilot/state/claude-code/sessions/<sessionId>.json`；
+ *   - 新增 listStateFiles / getStateMtime，供 hook-watchdog 清理陈旧状态。
  *
- * State 文件格式(向后兼容老插件结构):
+ * State 文件格式（向后兼容旧插件结构）：
  *   { session_id, start_time, prompt, model, transcript_path, transcript_offset?,
  *     metrics: { input_tokens, output_tokens, tools_used, turns },
  *     tools_used: [], events: [], stop_time?: number, ... }
  *
- * 写入采用 temp + rename 原子,防止半写文件被并发 hook 读到。
+ * 写入采用临时文件 + rename 的原子替换，防止并发 Hook 读到尚未写完的 JSON。
  */
 
 import fs from 'node:fs';
@@ -47,7 +47,7 @@ export function loadState(sessionId) {
     try {
       return JSON.parse(fs.readFileSync(sf, 'utf-8'));
     } catch (err) {
-      // corrupted — discard and start fresh
+      // 文件损坏时丢弃并以默认状态重建；Hook 不能因旧状态 JSON 失败。
       // eslint-disable-next-line no-console
       console.error(
         `[claude-code-hook] state file for session ${sessionId} corrupted; starting fresh (${err.message})`,
@@ -100,7 +100,7 @@ export function readAndDeleteChildState(childSessionId) {
   }
 }
 
-// ─── Cleanup helpers (供 hook-watchdog 调用) ───
+// ─── 清理辅助函数（供 hook-watchdog 调用） ───
 
 export function listStateFiles() {
   try {

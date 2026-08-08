@@ -1,7 +1,18 @@
+/**
+ * `loongsuite-pilot token-usage` 终端报表命令。
+ *
+ * 主入口仅在命中 `token-usage`/`tokens` 时动态导入本模块，避免常驻 Collector 支付
+ * CLI 启动成本。模块只读取 status-bar 生成的 metrics-summary.json 与 runtime.json，
+ * 选择其中今日/7 天/30 天统计，再以 ANSI 颜色、表格和进度条输出到 stdout；不启动
+ * Orchestrator、网络请求或后台 timer。
+ */
+
+
 import * as path from 'node:path';
 import { readFile } from 'node:fs/promises';
 import { readJsonFile, resolveHome } from '../utils/fs-utils.js';
 
+/** CLI 支持的三个聚合区间，与 MetricsSummary.ranges key 一致。 */
 export type MetricsRange = 'today' | 'sevenDays' | 'thirtyDays';
 
 export interface ShareEntry {
@@ -112,6 +123,12 @@ const TABLE_METRIC_WIDTH = 6;
 const TABLE_META_WIDTH = 4;
 const TABLE_BAR_WIDTH = 24;
 
+/**
+ * 解析范围、dataDir、颜色和帮助参数。`--once` 是兼容无操作项，因为命令本就单次输出。
+ *
+ * @param env 用于 NO_COLOR，默认当前进程环境；测试可注入。
+ * @param isTTY 非 TTY 默认关闭 ANSI 颜色。
+ */
 export function parseTokenUsageArgs(
   args: string[],
   env: NodeJS.ProcessEnv = process.env,
@@ -177,6 +194,10 @@ export function parseTokenUsageArgs(
   return { options };
 }
 
+/**
+ * token-usage CLI 主流程：解析 -> 读取视图 -> 渲染 -> 写 stdout/stderr。
+ * @returns 建议进程退出码；不直接 process.exit，主入口负责设置 exitCode。
+ */
 export async function runTokenUsageCommand(args: string[] = process.argv.slice(3)): Promise<number> {
   const parsed = parseTokenUsageArgs(args);
   if (parsed.error) {
@@ -194,6 +215,7 @@ export async function runTokenUsageCommand(args: string[] = process.argv.slice(3
   return data.summary ? 0 : 1;
 }
 
+/** 返回纯文本英文 CLI 帮助，不带 ANSI 控制码。 */
 export function renderHelp(): string {
   return [
     'Usage: loongsuite-pilot token-usage [options]',
@@ -210,6 +232,9 @@ export function renderHelp(): string {
   ].join('\n');
 }
 
+/**
+ * dataDir 优先级：显式参数 > LOONGSUITE_PILOT_DATA_DIR > 指定/默认 config.json > 默认目录。
+ */
 export async function resolveTokenUsageDataDir(explicitDataDir?: string): Promise<string> {
   if (explicitDataDir) return resolveHome(explicitDataDir);
   if (process.env.LOONGSUITE_PILOT_DATA_DIR) {
@@ -223,6 +248,10 @@ export async function resolveTokenUsageDataDir(explicitDataDir?: string): Promis
   return resolveHome(config?.dataDir ?? DEFAULT_DATA_DIR);
 }
 
+/**
+ * 并行读取 metrics-summary.json 与 runtime.json，保留各自错误文本并用 PID signal 0
+ * 判断 runtime 是否真实存活。
+ */
 export async function loadViewData(options: TokenUsageOptions): Promise<TokenUsageViewData> {
   const dataDir = await resolveTokenUsageDataDir(options.dataDir);
   const summaryPath = path.join(dataDir, 'logs', 'metrics-summary.json');
@@ -248,6 +277,10 @@ export async function loadViewData(options: TokenUsageOptions): Promise<TokenUsa
   };
 }
 
+/**
+ * 把 ViewData 渲染为单个终端字符串；summary 缺失时输出诊断提示，其余段落按 KPI、
+ * token、Provider、Model、Agent、Repo、趋势顺序排列。
+ */
 export function renderTokenUsage(
   data: TokenUsageViewData,
   options: TokenUsageOptions,
@@ -308,6 +341,7 @@ export function renderTokenUsage(
   return trimLines(lines, width);
 }
 
+/** 兼容 today/1d、7d/seven、30d/thirty 等范围别名。 */
 function parseRangeValue(value: string | undefined): MetricsRange | null {
   switch ((value ?? '').trim().toLowerCase()) {
     case 'today':
@@ -331,6 +365,7 @@ function parseRangeValue(value: string | undefined): MetricsRange | null {
   }
 }
 
+/** 读取并 JSON.parse；ENOENT 与其他不可读错误分别返回文本，不抛出。 */
 async function readJsonWithError<T>(filePath: string): Promise<{ data: T | null; error?: string }> {
   try {
     const raw = await readFile(filePath, 'utf8');
@@ -342,6 +377,7 @@ async function readJsonWithError<T>(filePath: string): Promise<{ data: T | null;
   }
 }
 
+/** runtime 必须自报 active、PID 为正且 signal 0 成功才视为在线。 */
 function isRuntimeAlive(runtime: RuntimeRecord): boolean {
   if (runtime.status !== 'active') return false;
   if (!runtime.pid || runtime.pid <= 0) return false;
@@ -353,6 +389,7 @@ function isRuntimeAlive(runtime: RuntimeRecord): boolean {
   }
 }
 
+/** 将八个核心 KPI 排成两组四列。 */
 function renderKpis(rangeData: RangeData, color: ReturnType<typeof makeColor>): string[] {
   const cells = [
     { label: 'Tokens', value: compactNumber(rangeData.totalTokens ?? 0), paint: color.cyan },
@@ -376,6 +413,7 @@ function renderKpis(rangeData: RangeData, color: ReturnType<typeof makeColor>): 
   return rows;
 }
 
+/** 渲染 input/output 占总 token、cache 占 input 的分解表。 */
 function renderTokenBreakdown(rangeData: RangeData, width: number, color: ReturnType<typeof makeColor>): string {
   const total = rangeData.totalTokens ?? 0;
   const input = rangeData.inputTokens ?? 0;
@@ -386,6 +424,7 @@ function renderTokenBreakdown(rangeData: RangeData, width: number, color: Return
   const outputShare = total > 0 ? output / total : 0;
   const cacheShare = input > 0 ? cache / input : 0;
   const barWidth = tableBarWidth(width);
+  // 统一生成分解表的数据行，避免每种 token 比例重复拼装列宽和进度条。
   const row = (label: string, share: number, value: string) =>
     tableRow(label, value, percent(share), '', renderBar(share, barWidth, color));
 
@@ -400,6 +439,9 @@ function renderTokenBreakdown(rangeData: RangeData, width: number, color: Return
   ].filter(Boolean).join('\n');
 }
 
+/**
+ * 通用 Provider/Model 占比段落，最多显示六项；fields 回调适配不同数据结构。
+ */
 function renderShareSection<T extends ShareEntry>(
   title: string,
   items: T[],
@@ -430,6 +472,7 @@ function renderShareSection<T extends ShareEntry>(
   return lines;
 }
 
+/** 渲染最多八个 Agent 的 token、event、session 和活动条。 */
 function renderAgentSection(
   items: AgentShareEntry[],
   width: number,
@@ -457,6 +500,7 @@ function renderAgentSection(
   return lines;
 }
 
+/** 渲染最多六个仓库的 event/session 计数。 */
 function renderRepoSection(
   items: RepoShareEntry[],
   width: number,
@@ -476,6 +520,7 @@ function renderRepoSection(
   return lines;
 }
 
+/** 根据范围取最近 7/30 点，以最大 token 为 100% 渲染日趋势。 */
 function renderTrendSection(
   range: MetricsRange,
   dailyTokens: DailyPoint[],
@@ -504,6 +549,7 @@ function renderTrendSection(
   return lines;
 }
 
+/** 根据 runtime 文件存在、status 和 PID 活性渲染服务状态。 */
 function formatServiceState(data: TokenUsageViewData, color: ReturnType<typeof makeColor>): string {
   if (data.runtimeAlive) {
     return color.green(`active pid ${data.runtime?.pid ?? '-'}`);
@@ -514,6 +560,7 @@ function formatServiceState(data: TokenUsageViewData, color: ReturnType<typeof m
   return color.yellow('service not running');
 }
 
+/** 以 K/M/B 缩写数值，保留一位小数。 */
 function compactNumber(value: number): string {
   const abs = Math.abs(value);
   if (abs >= 1_000_000_000) return `${formatOneDecimal(value / 1_000_000_000)}B`;
@@ -522,24 +569,29 @@ function compactNumber(value: number): string {
   return String(Math.round(value));
 }
 
+/** 固定一位小数。 */
 function formatOneDecimal(value: number): string {
   return value.toFixed(1);
 }
 
+/** 将 0..1 占比格式为整数百分比，先做边界收敛。 */
 function percent(value: number): string {
   return `${Math.round(clampShare(value) * 100)}%`;
 }
 
+/** 以 #/- 绘制固定宽度 ASCII 进度条；非零值至少显示一格。 */
 function renderBar(value: number, width: number, color: ReturnType<typeof makeColor>): string {
   const share = clampShare(value);
   const filled = share > 0 ? Math.max(1, Math.round(width * share)) : 0;
   return color.cyan(`[${'#'.repeat(filled)}${'-'.repeat(Math.max(0, width - filled))}]`);
 }
 
+/** 根据终端宽度计算 10..24 的表格 bar 宽度。 */
 function tableBarWidth(width: number): number {
   return Math.min(TABLE_BAR_WIDTH, Math.max(10, width - 58));
 }
 
+/** 按固定列宽拼一行表格，tail/detail 可追加 bar 与说明。 */
 function tableRow(
   name: string,
   value = '',
@@ -558,11 +610,13 @@ function tableRow(
   return `${row}${tailPart}${detail}`;
 }
 
+/** 非有限值归零，其余限制在 0..1。 */
 function clampShare(value: number): number {
   if (!Number.isFinite(value)) return 0;
   return Math.max(0, Math.min(1, value));
 }
 
+/** 解析时间并按当前 locale 输出月日时分秒；无效返回 null。 */
 function formatDateTime(value: string | undefined): string | null {
   if (!value) return null;
   const date = new Date(value);
@@ -576,10 +630,12 @@ function formatDateTime(value: string | undefined): string | null {
   });
 }
 
+/** 读取 stdout 列数并设置最小 72、默认 100。 */
 function terminalWidth(): number {
   return Math.max(72, process.stdout.columns || 100);
 }
 
+/** 展开嵌入换行、限制过长可见行并移除行尾空白。 */
 function trimLines(lines: string[], width: number): string {
   return lines
     .flatMap((line) => line.split('\n'))
@@ -588,11 +644,15 @@ function trimLines(lines: string[], width: number): string {
     .join('\n');
 }
 
+/**
+ * 粗略截断可能含 ANSI 的字符串。注意它按原始 code unit slice，因此仅用于异常长行兜底。
+ */
 function truncateAnsiUnsafe(value: string, maxLength: number): string {
   if (stripAnsi(value).length <= maxLength) return value;
   return `${value.slice(0, Math.max(0, maxLength - 1))}...`;
 }
 
+/** 超长名称保留首尾，中间用三个点替代。 */
 function truncateMiddle(value: string, maxLength: number): string {
   if (value.length <= maxLength) return value;
   if (maxLength <= 3) return value.slice(0, maxLength);
@@ -601,25 +661,31 @@ function truncateMiddle(value: string, maxLength: number): string {
   return `${value.slice(0, left)}...${value.slice(value.length - right)}`;
 }
 
+/** 按去 ANSI 后的可见长度右补空格。 */
 function padRight(value: string, width: number): string {
   const length = visibleLength(value);
   return length >= width ? value : value + ' '.repeat(width - length);
 }
 
+/** 按去 ANSI 后的可见长度左补空格。 */
 function padLeft(value: string, width: number): string {
   const length = visibleLength(value);
   return length >= width ? value : ' '.repeat(width - length) + value;
 }
 
+/** 移除本模块生成的 SGR 颜色控制码。 */
 function stripAnsi(value: string): string {
   return value.replace(/\x1b\[[0-9;]*m/g, '');
 }
 
+/** 返回不含 ANSI 的字符串长度。 */
 function visibleLength(value: string): number {
   return stripAnsi(value).length;
 }
 
+/** 返回可开关的颜色函数集合；关闭时所有函数原样返回文本。 */
 function makeColor(enabled: boolean) {
+  // 根据 ANSI code 包装文本；关闭颜色时直接返回原字符串，便于重定向到文件。
   const paint = (code: string, text: string) => enabled ? `\x1b[${code}m${text}\x1b[0m` : text;
   return {
     normal: (text: string) => text,

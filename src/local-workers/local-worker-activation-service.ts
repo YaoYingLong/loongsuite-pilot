@@ -1,3 +1,14 @@
+/**
+ * Local Worker 实例“期望状态 -> 实际进程”的收敛服务。
+ *
+ * Orchestrator 启动后，本类监听 local-workers 目录并每 5 秒兜底扫描 instance.json。
+ * 对 enabled 实例，它从 AgentDefinition.localWorkerRuntime 派生实例专用 plugin-probe
+ * 定义，按配置指纹决定部署/重启 Worker；禁用或删除实例时停止对应进程。fs.watch
+ * 回调只请求异步 refresh，Promise 锁避免并发重入；单实例失败写 supervisor 状态并
+ * 隔离，不阻断其他 Worker。
+ */
+
+
 import * as crypto from 'node:crypto';
 import { watch, type FSWatcher } from 'node:fs';
 import * as path from 'node:path';
@@ -44,6 +55,7 @@ export class LocalWorkerActivationService {
   private watcher: FSWatcher | null = null;
   private refreshing = false;
 
+  /** 保存目录和声明，并创建复用的 PluginProbeStrategy；不建立 watcher。 */
   constructor(options: LocalWorkerActivationServiceOptions) {
     this.dataDir = options.dataDir;
     this.pilotDir = options.pilotDir;
@@ -51,6 +63,9 @@ export class LocalWorkerActivationService {
     this.strategy = new PluginProbeStrategy(options.dataDir, options.pilotDir);
   }
 
+  /**
+   * 确保实例根目录，先收敛现有实例，再建立非持久化 fs.watch 和 5 秒兜底 interval。
+   */
   async start(): Promise<void> {
     const root = localWorkerRoot(this.dataDir);
     await ensureDir(root);
@@ -75,6 +90,9 @@ export class LocalWorkerActivationService {
     this.timer.unref();
   }
 
+  /**
+   * 清 watcher/timer，并停止所有实例进程但不改变 instance.enabled，便于下次启动恢复。
+   */
   async stop(): Promise<void> {
     if (this.timer) {
       clearInterval(this.timer);
@@ -94,6 +112,7 @@ export class LocalWorkerActivationService {
     this.activeFingerprints.clear();
   }
 
+  /** 用进程内锁把 watch/poll 合并为单轮串行 reconcile。 */
   async refresh(trigger: string): Promise<void> {
     // watch 和 poll 可能同时触发；用轻量锁避免对同一实例并发部署或停止。
     if (this.refreshing) return;
@@ -108,6 +127,9 @@ export class LocalWorkerActivationService {
     }
   }
 
+  /**
+   * 单实例收敛：disabled 停止；缺模板写失败；指纹未变且存活跳过；否则停旧并重新部署。
+   */
   private async reconcile(instance: LocalWorkerInstance, trigger: string): Promise<void> {
     if (!instance.enabled) {
       // disconnect 写入 enabled=false 后会进入此分支，实际停止动作在这里完成。
@@ -148,6 +170,7 @@ export class LocalWorkerActivationService {
     this.activeFingerprints.set(instance.id, fingerprint);
   }
 
+  /** 派生实例定义后调用 Strategy 停 Worker；停止异常只告警。 */
   private async stopInstance(instance: LocalWorkerInstance): Promise<void> {
     const template = this.findTemplate(instance.runtime);
     if (!template?.pluginProbe) return;
@@ -205,6 +228,7 @@ export class LocalWorkerActivationService {
     };
   }
 
+  /** 返回用户保存的 Runtime 参数；Supervisor 负责具体展开。 */
   private buildRuntimeOptions(instance: LocalWorkerInstance): RuntimeOptions {
     return instance.runtimeOptions;
   }
@@ -227,6 +251,7 @@ export class LocalWorkerActivationService {
     })).digest('hex');
   }
 
+  /** 用实例展开参数查询 Supervisor 记录的 PID 活性。 */
   private async isInstanceWorkerAlive(template: AgentDefinition, instance: LocalWorkerInstance): Promise<boolean> {
     const def = this.buildDefinition(template, instance);
     return this.strategy.isWorkerRunning(def, {

@@ -1,18 +1,28 @@
+/**
+ * Qoder 组织管理 OpenAPI 的带类型 HTTP 客户端。
+ *
+ * 该 Client 只负责 URL/query、Bearer 鉴权、JSON 解析、超时和有限重试；分页、时间窗口、并发
+ * 及宽表转换由 QoderApiInput 完成。apiKey 始终为私有成员，不提供 getter，也不写入日志。
+ */
+
 import { createLogger } from '../../../utils/logger.js';
 
 const logger = createLogger('QoderApiClient');
 
+/** 30 秒超时、三次请求及可重试 HTTP 状态。 */
 const DEFAULT_TIMEOUT_MS = 30_000;
 const RETRY_MAX_ATTEMPTS = 3;
 const RETRY_BASE_DELAY_MS = 1_000;
 const RETRYABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
 
+/** 包含 status 与 URL 的 API 错误；响应正文只保留前 256 字符。 */
 export class QoderApiHttpError extends Error {
   constructor(readonly status: number, readonly url: string, body: string) {
     super(`Qoder API ${status} ${url}: ${body.slice(0, 256)}`);
   }
 }
 
+/** 以下接口按 Qoder API 响应建模，并保留未知字段兼容服务端扩展。 */
 export interface QoderMember {
   id: string;
   name?: string;
@@ -157,10 +167,10 @@ export interface QoderApiClientOptions {
 }
 
 /**
- * Qoder OpenAPI client for the pipeline input.
- * - Bearer auth via private apiKey (never exposed via getter or logged)
- * - Built-in exponential backoff for 5xx/429/network errors (3 attempts: 1s/2s/4s)
- * - 4xx errors thrown immediately so the caller can decide to halt
+ * Qoder OpenAPI 客户端。
+ *
+ * Bearer apiKey 保持私有；5xx/429/网络错误执行指数退避；不可重试 4xx 立即抛出，让 Input
+ * 把 401/403 标为 fatal auth 并停止周期请求。
  */
 export class QoderApiClient {
   readonly apiBase: string;
@@ -168,6 +178,10 @@ export class QoderApiClient {
   private readonly apiKey: string;
   private readonly timeoutMs: number;
 
+  /**
+   * 验证必填配置，去掉 apiBase 尾斜杠并固定超时。
+   * @throws apiKey/apiBase/orgId 任一为空时同步抛错。
+   */
   constructor(opts: QoderApiClientOptions) {
     if (!opts.apiKey) throw new Error('QoderApiClient: apiKey is required');
     if (!opts.apiBase) throw new Error('QoderApiClient: apiBase is required');
@@ -178,6 +192,7 @@ export class QoderApiClient {
     this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   }
 
+  /** 分页列出组织成员。 */
   async listMembers(
     orgId: string,
     opts: { nextToken?: string; maxResults?: number; includeDeleted?: boolean } = {},
@@ -193,6 +208,7 @@ export class QoderApiClient {
     );
   }
 
+  /** 分页列出单成员在时间窗口内的 usage events。 */
   async listMemberUsageEvents(
     orgId: string,
     memberId: string,
@@ -215,6 +231,7 @@ export class QoderApiClient {
     );
   }
 
+  /** 读取单成员当前配额快照。 */
   async getMemberQuota(
     orgId: string,
     memberId: string,
@@ -225,6 +242,7 @@ export class QoderApiClient {
     );
   }
 
+  /** 按 offset page 查询 AI 代码 change 记录。 */
   async listAiCodeChanges(
     orgId: string,
     opts: {
@@ -252,6 +270,7 @@ export class QoderApiClient {
     );
   }
 
+  /** 按 offset page 查询 AI 代码 commit 记录。 */
   async listAiCodeCommits(
     orgId: string,
     opts: {
@@ -279,7 +298,7 @@ export class QoderApiClient {
     );
   }
 
-  /** GET /v1/organizations/{org}/usage-events — organization-wide usage events */
+  /** 查询组织级 usage events。 */
   async listOrgUsageEvents(
     orgId: string,
     opts: {
@@ -307,7 +326,7 @@ export class QoderApiClient {
     );
   }
 
-  /** GET /v1/organizations/{org}/members/{id}/usage-summary?groupBy=source|operation */
+  /** 按 source 或 operation 查询成员 usage 汇总。 */
   async getMemberUsageSummary(
     orgId: string,
     memberId: string,
@@ -324,7 +343,7 @@ export class QoderApiClient {
     );
   }
 
-  /** GET /v1/organizations/{org}/resource-packages */
+  /** 分页查询组织资源包。 */
   async listResourcePackages(
     orgId: string,
     opts: {
@@ -352,7 +371,7 @@ export class QoderApiClient {
     );
   }
 
-  /** GET /v1/organizations/{org}/seat-month-batches (third-party purchases only) */
+  /** 查询 seat-month 批次（仅第三方购买）。 */
   async listSeatMonthBatches(
     orgId: string,
     opts: {
@@ -376,7 +395,7 @@ export class QoderApiClient {
     );
   }
 
-  /** GET /v1/organizations/{org}/ai-code/stats/overview */
+  /** 查询 AI 代码统计总览。 */
   async getAiCodeStatsOverview(
     orgId: string,
     opts: { startDate: string; endDate: string; repoName?: string; primaryBranchOnly?: boolean },
@@ -393,7 +412,7 @@ export class QoderApiClient {
     );
   }
 
-  /** GET /v1/organizations/{org}/ai-code/stats/daily-trend */
+  /** 查询 AI 代码每日趋势。 */
   async getAiCodeDailyTrend(
     orgId: string,
     opts: { startDate: string; endDate: string; repoName?: string; primaryBranchOnly?: boolean },
@@ -414,7 +433,7 @@ export class QoderApiClient {
     );
   }
 
-  /** GET /v1/organizations/{org}/ai-code/stats/member-ranking */
+  /** 查询 AI 代码成员排名。 */
   async getAiCodeMemberRanking(
     orgId: string,
     opts: { startDate: string; endDate: string; limit?: number },
@@ -430,7 +449,7 @@ export class QoderApiClient {
     );
   }
 
-  /** GET /v1/organizations/{org}/ai-code/repos */
+  /** 分页查询 AI 代码仓库。 */
   async listAiCodeRepos(
     orgId: string,
     opts: {
@@ -459,7 +478,7 @@ export class QoderApiClient {
     );
   }
 
-  /** GET /v1/organizations/{org}/ai-code/file-extensions */
+  /** 查询 AI 代码文件扩展名统计。 */
   async listAiCodeFileExtensions(
     orgId: string,
     opts: { startDate?: string; endDate?: string } = {},
@@ -474,6 +493,7 @@ export class QoderApiClient {
     );
   }
 
+  /** 对非空 query 参数执行 URI 编码并拼成 `?k=v&...`。 */
   private toQuery(params: Record<string, string | number | boolean | undefined>): string {
     const parts: string[] = [];
     for (const [k, v] of Object.entries(params)) {
@@ -483,6 +503,11 @@ export class QoderApiClient {
     return parts.length === 0 ? '' : `?${parts.join('&')}`;
   }
 
+  /**
+   * 执行一个 JSON 请求，按状态/网络错误分类重试。
+   *
+   * @throws 不可重试 4xx 立即抛 QoderApiHttpError；三次仍失败抛最后异常。
+   */
   private async request<T>(method: string, pathAndQuery: string): Promise<T> {
     const url = `${this.apiBase}${pathAndQuery}`;
 
@@ -493,7 +518,7 @@ export class QoderApiClient {
         const resp = await fetch(url, {
           method,
           headers: {
-            // Authorization header value never logged.
+            // Authorization 值只在请求对象中构造，任何日志都不输出 apiKey。
             Authorization: `Bearer ${this.apiKey}`,
             Accept: 'application/json',
           },
@@ -527,6 +552,7 @@ export class QoderApiClient {
         if (attempt === RETRY_MAX_ATTEMPTS - 1) break;
       }
 
+      // 退避序列为 1s、2s；第三次失败后不会再等待。（常量描述的下一阶 4s 不会执行。）
       const delay = RETRY_BASE_DELAY_MS * 2 ** attempt;
       logger.warn('qoder api retrying', {
         method,
@@ -542,12 +568,14 @@ export class QoderApiClient {
   }
 }
 
+/** 对最终错误文本再做一次防御性 Bearer token 替换。 */
 function redactError(err: unknown): string {
   const msg = err instanceof Error ? err.message : String(err);
-  // Defensive: ensure no Authorization header value sneaks through.
+  // 即使底层 fetch 把 header 拼入异常，也不让 token 进入日志。
   return msg.replace(/Bearer\s+[A-Za-z0-9._-]+/g, 'Bearer <redacted>');
 }
 
+/** Promise 化退避等待。 */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }

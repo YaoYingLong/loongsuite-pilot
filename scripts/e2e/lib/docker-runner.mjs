@@ -1,11 +1,18 @@
+// Docker 容器内的 Bash 子进程执行器。场景入口把生成的脚本文本传给 `runLocalScript()`，
+// 本模块使用 `spawn` 连接 stdout/stderr 到控制台和按时间命名的日志文件，并用 AbortController
+// 在超时后终止子进程。日志流在进程内缓存复用，调用方应在全部场景结束后关闭。
+// Promise 在退出码 0 时 resolve，非零退出、spawn 错误或超时则 reject。
+
 import { spawn } from 'node:child_process';
 import * as fs from 'node:fs/promises';
 import { createWriteStream } from 'node:fs';
 import * as path from 'node:path';
 
+// 环境变量允许 CI 将 artifacts 挂载到宿主机；默认目录适用于测试镜像。
 const LOG_DIR = process.env.E2E_LOG_DIR || '/opt/artifacts';
 let _logStream = null;
 
+/** 延迟创建并缓存 artifacts 追加流，保证同一 E2E 进程的子场景写入同一日志文件。 */
 async function getLogStream() {
   if (_logStream) return _logStream;
   await fs.mkdir(LOG_DIR, { recursive: true });
@@ -17,9 +24,9 @@ async function getLogStream() {
 }
 
 /**
- * Run a bash script locally inside the Docker container (replaces SSH runner).
+ * 在 Docker 容器内本地运行 Bash 脚本，用于替代 SSH runner。
  * @param {object} opts
- * @param {string} opts.script full bash source
+ * @param {string} opts.script 完整 Bash 源码。
  * @param {string} [opts.artifactDir]
  * @param {string} [opts.artifactLabel]
  * @param {number} [opts.timeoutMs]
@@ -67,8 +74,8 @@ export async function runLocalScript(opts) {
 }
 
 /**
- * Simulate reboot by killing pilot processes and restarting systemd service.
- * Docker containers cannot truly reboot, so we simulate the effect.
+ * 通过终止 Pilot 进程并重启 systemd 服务来模拟重启。
+ * Docker 容器无法真正重启，因此这里只复现重启后的进程与服务效果。
  */
 export async function simulateReboot() {
   console.log('[e2e-docker] Simulating reboot: killing pilot processes and restarting service...');
@@ -76,15 +83,16 @@ export async function simulateReboot() {
 set +e
 pkill -f 'loongsuite-pilot|collector-daemon|updater-daemon' 2>/dev/null || true
 sleep 2
-# Try systemd user restart
+# 尝试重启 systemd user 服务
 systemctl --user restart loongsuite-pilot.service 2>/dev/null || true
-# Wait for service to come back
+# 等待服务恢复
 sleep 5
 echo "[e2e-docker] Simulated reboot complete (processes killed + service restarted)"
 `;
   return runLocalScript({ script: killScript, artifactLabel: 'simulate-reboot' });
 }
 
+/** 同步地对 redactSensitive 输入中的凭据字段脱敏，避免测试日志泄露 secret。 */
 function redactSensitive(text) {
   let redacted = String(text ?? '');
   for (const [key, value] of Object.entries(process.env)) {
@@ -95,6 +103,7 @@ function redactSensitive(text) {
   return redacted;
 }
 
+/** 把失败命令、输出和退出状态写入带时间戳的 artifact，便于容器退出后排障。 */
 async function writeArtifact(dir, label, payload) {
   await fs.mkdir(dir, { recursive: true });
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');

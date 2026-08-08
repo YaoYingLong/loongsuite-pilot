@@ -1,3 +1,14 @@
+/**
+ * `loongsuite-pilot worker` 子命令解析与输出层。
+ *
+ * `src/index.ts` 在加载 Collector 配置前调用 `handleWorkerCli()`；命中 connect/list/
+ * status/disconnect/delete 后，本模块校验 flags、位置参数及 `--` 后 Runtime 透传参数，
+ * 再调用 instance-store 修改声明文件或读取视图。函数通过设置 `process.exitCode` 表达
+ * 命令失败而不直接 `process.exit()`，使异步写盘和测试有机会收尾；输出仅写 stdout/
+ * stderr，不会启动常驻采集服务。
+ */
+
+
 import { readJsonFile, resolveHome } from '../utils/fs-utils.js';
 import {
   connectLocalWorker,
@@ -29,6 +40,7 @@ interface ParsedArgs {
  * 表示本函数已经完成输出和退出码设置。这里不直接 process.exit()，以便调用方和测试
  * 仍有机会完成必要的异步收尾。
  */
+/** 命令错误由内部捕获并设置 process.exitCode=1。 */
 export async function handleWorkerCli(argv: string[]): Promise<boolean> {
   if (argv[0] !== 'worker') return false;
 
@@ -83,6 +95,7 @@ async function resolveWorkerDataDir(): Promise<string> {
   return resolveHome(file?.dataDir ?? '~/.loongsuite-pilot');
 }
 
+/** connect 可新建或按位置 ID 重连；输出支持 `--json`。 */
 async function connectCommand(dataDir: string, args: ParsedArgs): Promise<void> {
   // `--` 后的参数只在 connect 中合法，稍后会保存为 runtimeOptions。
   validateFlags(args, ['runtime', 'bootstrap-token', 'work-dir', 'json'], { allowRuntimeOptions: true });
@@ -132,6 +145,7 @@ async function connectCommand(dataDir: string, args: ParsedArgs): Promise<void> 
   console.log(`workDir: ${instance.workDir}`);
 }
 
+/** 列出全部实例聚合视图，默认表格、`--json` 输出数组。 */
 async function listCommand(dataDir: string, args: ParsedArgs): Promise<void> {
   validateFlags(args, ['json']);
   // View 会把实例配置与 supervisor/worker/runtime/matrix 状态快照合并为展示模型。
@@ -160,6 +174,7 @@ async function listCommand(dataDir: string, args: ParsedArgs): Promise<void> {
   printTable(rows);
 }
 
+/** 输出单实例详细视图；不存在时抛用户输入错误。 */
 async function statusCommand(dataDir: string, args: ParsedArgs): Promise<void> {
   validateFlags(args, ['json']);
   const id = args.positional[0];
@@ -190,6 +205,7 @@ async function statusCommand(dataDir: string, args: ParsedArgs): Promise<void> {
   console.log(`Log:         ${view.logPath}`);
 }
 
+/** 把 enabled 写为 false；实际停止由 ActivationService 异步完成。 */
 async function disconnectCommand(dataDir: string, args: ParsedArgs): Promise<void> {
   validateFlags(args, ['json']);
   const id = args.positional[0];
@@ -203,6 +219,7 @@ async function disconnectCommand(dataDir: string, args: ParsedArgs): Promise<voi
   console.log(`disconnect requested ${instance.id}`);
 }
 
+/** 删除已禁用且无存活进程的实例目录。 */
 async function deleteCommand(dataDir: string, args: ParsedArgs): Promise<void> {
   validateFlags(args, ['json']);
   const id = args.positional[0];
@@ -259,6 +276,7 @@ function parseArgs(argv: string[]): ParsedArgs {
 }
 
 /** 校验 CLI 选项白名单，并限制只有 connect 能接收 Runtime 透传参数。 */
+/** 校验未知 flag；allowRuntimeOptions 时接受 `runtime.*` 前缀。 */
 function validateFlags(
   args: ParsedArgs,
   allowed: string[],
@@ -278,6 +296,7 @@ function validateFlags(
  * 将 `--` 后的 Runtime 参数规范化为持久化对象。
  * 只接受选项形式，不接受位置参数；有值选项保存为字符串，无值选项保存为 true。
  */
+/** 把 key/value、key=value 和布尔开关解析为 RuntimeOptions。 */
 function parseRuntimeOptions(argv: string[]): RuntimeOptions {
   const options: RuntimeOptions = {};
   for (let i = 0; i < argv.length; i += 1) {
@@ -308,6 +327,7 @@ function parseRuntimeOptions(argv: string[]): RuntimeOptions {
 }
 
 /** 读取必填字符串选项；缺失、布尔开关或纯空白值都视为未提供。 */
+/** 读取必填非空字符串 flag，否则抛用户输入错误。 */
 function requiredString(args: ParsedArgs, name: string): string {
   const value = optionalString(args, name);
   if (!value) throw new Error(`--${name} is required`);
@@ -315,12 +335,14 @@ function requiredString(args: ParsedArgs, name: string): string {
 }
 
 /** 读取非空字符串选项，布尔开关不会被隐式转换成字符串。 */
+/** 读取可选字符串 flag；布尔形态视为未提供值。 */
 function optionalString(args: ParsedArgs, name: string): string | undefined {
   const value = args.flags[name];
   return typeof value === 'string' && value.trim() !== '' ? value : undefined;
 }
 
 /** 按每列最长内容生成简单的等宽文本表格。 */
+/** 按列最大宽度输出左对齐纯文本表格。 */
 function printTable(rows: string[][]): void {
   const widths = rows[0].map((_, index) => Math.max(...rows.map(row => row[index].length)));
   for (const row of rows) {
@@ -328,6 +350,7 @@ function printTable(rows: string[][]): void {
   }
 }
 
+/** 输出 worker 子命令帮助文本。 */
 function printUsage(): void {
   console.log(`Usage:
   loongsuite-pilot worker connect --runtime claude-code --bootstrap-token <token> [--work-dir <dir>] [-- <runtime-options...>]

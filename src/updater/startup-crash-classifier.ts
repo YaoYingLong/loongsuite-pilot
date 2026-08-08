@@ -1,3 +1,13 @@
+/**
+ * Collector 启动崩溃 breadcrumb 的稳定分类器。
+ *
+ * UpdaterMetrics 读取主入口或 bootstrap 写下的原始错误后调用本模块，把易变消息映射
+ * 为 native_module_missing、module_not_found、config_error、permission_or_disk 或
+ * unknown，供告警聚合。规则按顺序首个命中，detail 会去换行和截断；纯函数不读写
+ * 文件，也不会抛出原始异常。
+ */
+
+
 import type { StartupCrashBreadcrumb } from '../utils/crash-breadcrumb.js';
 
 export type StartupCrashReason =
@@ -15,9 +25,8 @@ export interface StartupCrashClassification {
 const DETAIL_MAX_CHARS = 300;
 
 /**
- * Maps a raw crash breadcrumb to a stable `reason` label (for aggregation/alarming)
- * plus a human-readable detail head. Rules are evaluated in order; the first match
- * wins, and `unknown` always carries the raw message so nothing is lost.
+ * 把原始崩溃记录映射为可聚合告警的稳定 reason 与可读 detail。规则按顺序首个命中；
+ * unknown 仍保留清洗后的原消息，避免排障信息丢失。
  */
 export function classifyStartupCrash(breadcrumb: StartupCrashBreadcrumb): StartupCrashClassification {
   const message = (breadcrumb.error_message || '').toLowerCase();
@@ -28,6 +37,7 @@ export function classifyStartupCrash(breadcrumb: StartupCrashBreadcrumb): Startu
   };
 }
 
+/** 按 native module -> module -> 权限/磁盘 -> 严格 JSON 配置签名顺序分类。 */
 function detectReason(message: string, full: string, phase: string): StartupCrashReason {
   if (
     full.includes('sqlite3')
@@ -43,14 +53,12 @@ function detectReason(message: string, full: string, phase: string): StartupCras
   if (full.includes('cannot find module')) {
     return 'module_not_found';
   }
-  // Check permission/disk before config so a startup-phase EACCES whose message merely
-  // mentions "config" is not mislabeled as a configuration error.
+  // 权限/磁盘先于配置，避免含 config 文本的 EACCES 被误分类。
   if (full.includes('eacces') || full.includes('erofs') || full.includes('enospc')) {
     return 'permission_or_disk';
   }
-  // config_error is intentionally narrow: only a JSON-parse signature in the error
-  // *message* (not the stack, which routinely contains config-loader.ts paths) during
-  // the startup phase. Bare "config"/"json" substrings are too broad.
+  // config_error 仅看 startup 阶段 message 的 JSON.parse 特征；stack 常含配置文件路径，
+  // 不能用裸 config/json 子串判断。
   if (
     phase === 'startup'
     && (
@@ -66,12 +74,12 @@ function detectReason(message: string, full: string, phase: string): StartupCras
   return 'unknown';
 }
 
+/** 只取错误 message 第一行。 */
 function firstLine(text: string): string {
   return (text || '').split(/\r?\n/)[0] ?? '';
 }
 
-// Keep the detail safe to embed in `detail="..."` inside the alarm message: no quotes
-// or control chars that could break downstream parsing/readability.
+// 清除引号和控制字符，使文本可安全嵌入告警 `detail="..."`，并限制 300 字符。
 function sanitizeDetail(text: string): string {
   return text.replace(/["\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, DETAIL_MAX_CHARS);
 }

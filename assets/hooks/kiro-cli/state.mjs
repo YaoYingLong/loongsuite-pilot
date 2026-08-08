@@ -10,6 +10,11 @@
  *
  * 缓冲键：cwd（= conversations_v2.key）。每个 cwd 一个 JSONL 缓冲文件，
  * 存 PostToolUse 的 {tool_name, tool_input, tool_response, captureTs}。
+ *
+ * 本模块还维护 SQLite/session offset、已输出 step、turn 计数和 pending-stop ready/inflight
+ * 队列。stop Hook 负责入队；长驻 KiroCliSessionInput 通过原子 rename 抢占 pending，崩溃后
+ * 再把 inflight 恢复到 ready。同步文件操作保证短生命周期 Hook 退出前状态已经提交；所有非
+ * 关键缓冲写入采用 fail-open，drain 则先 rename 再读，避免边读边被新事件追加。
  */
 
 import fs from 'node:fs';
@@ -36,7 +41,7 @@ function ensureDir(dir) {
   try {
     fs.mkdirSync(dir, { recursive: true });
   } catch {
-    // ignore
+    // 目录创建失败由后续具体读写自然处理。
   }
   return dir;
 }
@@ -57,7 +62,7 @@ export function appendToolEvent(cwd, entry) {
   try {
     fs.appendFileSync(file, JSON.stringify(entry) + '\n', 'utf-8');
   } catch {
-    // fail-open
+    // fail-open：缓冲失败不能阻塞宿主。
   }
 }
 
@@ -85,10 +90,10 @@ function recoverStaleDrainFiles(dir, baseFile) {
       for (const line of raw.split('\n')) {
         const t = line.trim();
         if (!t) continue;
-        try { out.push(JSON.parse(t)); } catch { /* skip malformed */ }
+        try { out.push(JSON.parse(t)); } catch { /* 跳过损坏行。 */ }
       }
-    } catch { /* read failed, skip */ }
-    try { fs.unlinkSync(full); } catch { /* ignore */ }
+    } catch { /* 读取失败时跳过该遗留文件。 */ }
+    try { fs.unlinkSync(full); } catch { /* 清理失败不影响恢复。 */ }
   }
   return out;
 }
@@ -112,13 +117,13 @@ export function drainToolEvents(cwd) {
   try {
     raw = fs.readFileSync(tmp, 'utf-8');
   } catch {
-    try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    try { fs.unlinkSync(tmp); } catch { /* 清理失败不影响返回已恢复事件。 */ }
     return out;
   }
   try {
     fs.unlinkSync(tmp);
   } catch {
-    // ignore
+    // 清理失败留待下次恢复扫描。
   }
   for (const line of raw.split('\n')) {
     const t = line.trim();
@@ -126,7 +131,7 @@ export function drainToolEvents(cwd) {
     try {
       out.push(JSON.parse(t));
     } catch {
-      // skip malformed
+      // 跳过损坏缓冲行，继续恢复其余事件。
     }
   }
   return out;
@@ -140,7 +145,7 @@ export function appendPreToolEvent(cwd, entry) {
   try {
     fs.appendFileSync(file, JSON.stringify(entry) + '\n', 'utf-8');
   } catch {
-    // fail-open
+    // fail-open：预工具缓冲失败不阻塞宿主。
   }
 }
 
@@ -163,18 +168,18 @@ export function drainPreToolEvents(cwd) {
   try {
     raw = fs.readFileSync(tmp, 'utf-8');
   } catch {
-    try { fs.unlinkSync(tmp); } catch { /* ignore */ }
+    try { fs.unlinkSync(tmp); } catch { /* 清理失败不影响返回已恢复事件。 */ }
     return out;
   }
   try {
     fs.unlinkSync(tmp);
   } catch {
-    // ignore
+    // 清理失败留待下次 drain 恢复。
   }
   for (const line of raw.split('\n')) {
     const t = line.trim();
     if (!t) continue;
-    try { out.push(JSON.parse(t)); } catch { /* skip malformed */ }
+    try { out.push(JSON.parse(t)); } catch { /* 跳过损坏行。 */ }
   }
   return out;
 }
@@ -196,7 +201,7 @@ export function loadOffset(cwd) {
       return typeof data?.updatedMs === 'number' ? data.updatedMs : 0;
     }
   } catch {
-    // ignore
+    // offset 读取失败时使用默认值 0。
   }
   return 0;
 }
@@ -215,7 +220,7 @@ export function saveOffset(cwd, updatedMs) {
     try {
       fs.writeFileSync(file, JSON.stringify({ updatedMs }), 'utf-8');
     } catch {
-      // ignore
+      // offset 写入失败不阻断 Hook，下一轮仍可重试。
     }
   }
 }
@@ -234,7 +239,7 @@ export function loadSessionOffset(cwd) {
       return typeof data?.updatedMs === 'number' ? data.updatedMs : 0;
     }
   } catch {
-    // ignore
+    // session offset 读取失败时使用默认值 0。
   }
   return 0;
 }
@@ -250,12 +255,12 @@ export function saveSessionOffset(cwd, updatedMs) {
     try {
       fs.writeFileSync(file, JSON.stringify({ updatedMs }), 'utf-8');
     } catch {
-      // ignore
+      // session offset 写入失败不阻断 Hook。
     }
   }
 }
 
-// ─── per-cwd step-level idempotent dedup (multi-conversation) ───
+// ─── 按 cwd、step 去重的幂等状态（支持多个 conversation） ───
 //
 // 交互式模式下 stop hook 可能多次触发。若 SQLite 行的 updated_at 在两次
 // stop 之间发生变化（kiro-cli 延迟写入），offset 机制失效，整个会话的所有
@@ -282,7 +287,7 @@ export function loadEmittedSteps(cwd) {
       const data = JSON.parse(fs.readFileSync(file, 'utf-8'));
       const map = new Map();
 
-      // v2 format: {conversations: {convId: [stepIds]}}
+      // v2 格式：{conversations: {convId: [stepIds]}}。
       if (data.conversations && typeof data.conversations === 'object') {
         for (const [convId, ids] of Object.entries(data.conversations)) {
           map.set(convId, new Set(Array.isArray(ids) ? ids : []));
@@ -290,14 +295,14 @@ export function loadEmittedSteps(cwd) {
         return map;
       }
 
-      // v1 backward compat: {conversationId, stepIds}
+      // 兼容 v1 格式：{conversationId, stepIds}。
       if (typeof data.conversationId === 'string' && Array.isArray(data.stepIds)) {
         map.set(data.conversationId, new Set(data.stepIds));
         return map;
       }
     }
   } catch {
-    // ignore
+    // 去重状态损坏时返回空 Map，由上层重新建立。
   }
   return new Map();
 }
@@ -329,7 +334,7 @@ export function saveEmittedSteps(cwd, conversationId, newStepIds) {
     try {
       fs.writeFileSync(file, JSON.stringify(payload), 'utf-8');
     } catch {
-      // ignore
+      // 已输出 step 状态写入失败不阻断宿主。
     }
   }
 }
@@ -348,7 +353,7 @@ export function loadTurnCount(cwd) {
       return typeof data?.count === 'number' ? data.count : 0;
     }
   } catch {
-    // ignore
+    // turn 计数读取失败时从 0 开始。
   }
   return 0;
 }
@@ -364,7 +369,7 @@ export function saveTurnCount(cwd, count) {
     try {
       fs.writeFileSync(file, JSON.stringify({ count }), 'utf-8');
     } catch {
-      // ignore
+      // turn 计数写入失败不阻断宿主。
     }
   }
 }
@@ -378,7 +383,7 @@ export function saveTurnCount(cwd, count) {
 //   - 满足成熟条件（now - stop_unix_ms >= MATURE_MS）→ rename 到 inflight/，
 //     调用 delayedCollect 子命令把成熟样本转成 hook JSONL；成功后删除文件。
 //   - 未成熟 → 跳过，下一轮再试。
-//   - 超过 MAX_AGE_MS 仍未成熟 → 强制 fallback（由 delayedCollect 内部决定）。
+//   - 超过 MAX_AGE_MS 仍未成熟 → 强制回退（由 delayedCollect 内部决定）。
 //
 // 文件命名: `${pad(enqueueMs, 13)}-${pid}-${counter}.json`
 // 内容字段:
@@ -450,7 +455,7 @@ export function listPendingStops() {
       items.push({ path: filePath, record });
     } catch {
       // 读取失败 → 删掉，避免反复污染
-      try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+      try { fs.unlinkSync(filePath); } catch { /* 忽略损坏文件的清理失败。 */ }
     }
   }
   items.sort((a, b) => (a.record?.enqueueMs || 0) - (b.record?.enqueueMs || 0));
@@ -480,7 +485,7 @@ export function finishPendingStop(inflightPath) {
   try {
     fs.unlinkSync(inflightPath);
   } catch {
-    // ignore
+    // 删除失败会由后续启动恢复/清理再次处理。
   }
 }
 
@@ -494,7 +499,7 @@ export function releasePendingStop(inflightPath) {
     fs.renameSync(inflightPath, readyPath);
   } catch {
     // 若 rename 失败，至少别留死锁：把 inflight 删除
-    try { fs.unlinkSync(inflightPath); } catch { /* ignore */ }
+    try { fs.unlinkSync(inflightPath); } catch { /* 忽略兜底清理失败。 */ }
   }
 }
 
@@ -520,7 +525,7 @@ export function recoverInflightPendingStops() {
       n++;
     } catch {
       // 同名 ready 已存在 → 重复入队，删除 inflight 的副本
-      try { fs.unlinkSync(inflightPath); } catch { /* ignore */ }
+      try { fs.unlinkSync(inflightPath); } catch { /* 忽略重复副本的清理失败。 */ }
     }
   }
   return n;

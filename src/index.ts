@@ -17,6 +17,8 @@ const logger = createLogger('Main');
  *
  * worker、token-usage 等短生命周期命令会先行分流；未命中子命令时才加载配置并启动
  * Orchestrator，避免普通 CLI 操作误启动常驻的数据采集服务。
+ *
+ * @throws 配置、日志初始化或 Orchestrator 必需阶段失败时向顶层 catch 传播。
  */
 async function main(): Promise<void> {
   /**
@@ -40,12 +42,15 @@ async function main(): Promise<void> {
     return;
   }
 
-  // 配置加载遵循“环境变量 > 配置文件 > 默认值”的优先级。
+  // 配置加载遵循“环境变量 > 配置文件 > 默认值”的优先级。 加载并整理 Collector 的完整运行配置
   const config = await loadConfig();
 
   // 文件日志依赖最终解析出的 dataDir，因此必须在配置加载完成后初始化。
+  // 将~/.loongsuite-pilot转换成绝对路径
   const dataDir = resolveHome(config.dataDir);
+  // ~/.loongsuite-pilot/logs
   const logDir = path.join(dataDir, 'logs');
+  // ~/.loongsuite-pilot/logs/loongsuite-pilot-service.log，其实就是初始化日志文件
   await initFileLogging(path.join(logDir, 'loongsuite-pilot-service.log'));
 
   if (!config.enabled) {
@@ -64,7 +69,10 @@ async function main(): Promise<void> {
     await orchestrator.stop();
     process.exit(0);
   };
+  // 监听操作系统发送的进程终止信号，收到信号后执行优雅关闭函数 shutdown()
+  // 人工在控制台中断程序发出的信号即终端按下 Ctrl + C
   process.on('SIGINT', () => void shutdown());
+  // kill <pid>、Docker/K8s 容器停止、systemd 关闭服务
   process.on('SIGTERM', () => void shutdown());
 
   await orchestrator.start();

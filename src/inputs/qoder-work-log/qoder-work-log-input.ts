@@ -1,74 +1,95 @@
+/**
+ * Qoder Work / Qoder Work CN 的 SDK 纯文本日志增量输入与共享解析器。
+ *
+ * 本文件中的 `QoderWorkLogInput` 扫描平台数据目录下各 session 的 `main.log` 或旧版
+ * `main/sdk-*.log`，从异步写入的 SDK 行恢复 session、turn、模型策略、token 和工具调用元数据。
+ * 因 delta 的物理落盘顺序不可靠，本 Input 有意不拼接 prompt/response/tool arguments；Trace
+ * 关闭时，Orchestrator 会同时启用 Hook 与 SQLite Input 来补足这些内容。
+ *
+ * `parseSdkLogLine` / `SdkEvent` 还被两个 Trace 实现复用。BaseInput 管理轮询和停止；本类按文件
+ * 保存 byte offset、inode 与内存状态机，轮转时重置。输出标准事件经 InputManager 进入统一策略
+ * 和 MultiFlusher。所有文件和 JSON 解析错误均按单文件/单行隔离，不持有跨周期文件句柄。
+ */
+// 内置模块分别用于 event.id/trace_id、异步文件读取、home/平台目录和路径拼接。
 import * as crypto from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import type { Dirent } from 'node:fs';
+// 产品类型决定实例 ID 与标准事件中的 gen_ai.agent.type。
 import { ClientType } from '../../types/index.js';
 import type { AgentActivityEntry, JsonValue } from '../../types/index.js';
+// builder 统一时间、ID、gen_ai 字段和 Agent 私有 attributes。
 import { buildAgentActivityEntry } from '../../normalization/entry-builder.js';
 import { directoryExists, resolveHome } from '../../utils/fs-utils.js';
+// 继承 Session Input 只为复用生命周期/collectionMethod；纯文本读取路径由本类覆盖。
 import {
   BaseSessionInput,
   type SessionInputOptions,
 } from '../base/base-session-input.js';
 
+/** 国际版/CN 在 macOS 和 Linux 下的默认应用数据根目录。 */
 const DEFAULT_QODERWORK_ROOT_MAC = '~/Library/Application Support/QoderWork';
 const DEFAULT_QODERWORK_ROOT_LINUX = '~/.config/QoderWork';
 const DEFAULT_QODERWORK_CN_ROOT_MAC = '~/Library/Application Support/QoderWork CN';
 const DEFAULT_QODERWORK_CN_ROOT_LINUX = '~/.config/QoderWork CN';
+/** 事件来源标记和缺失模型时的显式占位值。 */
 const SOURCE = 'qoder-work-sdk-log';
 const UNKNOWN_MODEL = 'unknown';
+/** 每文件单轮最大读取量，以及无活动 session 的内存保留时间。 */
 const MAX_READ_BYTES = 16 * 1024 * 1024;
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
+/** 匹配 SDK 发给客户端的已接收消息行，捕获时间、日志级别、消息类型和 JSON。 */
 const RECEIVED_MSG_RE =
   /^\[([^\]]+)\] \[(\w+)\] \[SDK\] \[QueryHandler\] Received message: (\w+) (.+)$/;
 /**
- * `Sending control request: set_model_policy` is the client → SDK control
- * request that pins the LLM model for the next conversation turn(s). The
- * payload's `request.request.chat.model` carries the actual model key (e.g.
- * `qwork-ultimate` for main chat, `qwork-auto` for summarizer/compact). We
- * snapshot this value at every `message_start` so each turn's emitted entries
- * report the model that was active when the turn began.
+ * `Sending control request: set_model_policy` 是客户端发给 SDK 的模型策略请求。
+ * payload 的 chat/compact/scene_model 槽位携带真实模型键，例如主对话的 `qwork-ultimate`；
+ * 收到 `message_start` 时会按 session 订阅层级选择槽位并快照，避免后续策略变化改写旧 turn。
  */
 const SET_MODEL_POLICY_RE =
   /^\[([^\]]+)\] \[(\w+)\] \[SDK\] \[QueryHandler\] Sending control request: set_model_policy (.+)$/;
 
+/** SDK Log Input 参数；dataRoot/agentType 使同一实现可服务国际版和 CN。 */
 export interface QoderWorkLogInputOptions extends Omit<SessionInputOptions, 'sessionDir' | 'filePattern'> {
-  /** Override QoderWork data root (default resolves to platform-specific dir). */
+  /** 覆盖 Qoder Work 数据根目录；默认按产品变体和平台解析。 */
   dataRoot?: string;
-  /** Agent type for this instance (default QoderWork). */
+  /** 当前实例的 Agent 类型；默认国际版 QoderWork。 */
   agentType?: ClientType;
 }
 
+/** SDK system init 建立的会话级状态；常驻到 TTL 淘汰或进程退出。 */
 interface SessionState {
   /**
-   * The `model` field on `system init` is the QoderWork subscription tier
-   * ("Standard"/"Premium"), NOT the LLM model key. The real model key is
-   * captured separately from `Sending control request: set_model_policy`
-   * lines and snapshotted onto each ActiveTurn at `message_start`. The tier
-   * itself is preserved here and surfaced via `attributes.subscription_tier`.
+   * `system init.model` 在国际版表示订阅层级（Standard/Premium），不是实际 LLM 模型键。
+   * 真正模型来自 set_model_policy，并在 message_start 时写入 ActiveTurn；订阅层级仍保存在
+   * attributes.subscription_tier。CN 可能把实际策略名放在此字段，代码会在无显式策略时兜底。
    */
   subscriptionTier: string;
+  /** 会话工作目录和宿主声明的 Agent/工具清单。 */
   cwd: string;
   agents: string[];
   tools: string[];
+  /** 最近事件时间用于 TTL 淘汰；traceId/turnCounter 用于同 session 内层级关联。 */
   lastSeenMs: number;
   traceId: string;
   turnCounter: number;
 }
 
+/** 一个 tool_use block 的最小配对信息；本路径不重建参数。 */
 interface ToolCallSlot {
   id: string;
   name: string;
 }
 
+/** 从 message_start 到下一 turn/result 之间累积的 LLM turn 状态。 */
 interface ActiveTurn {
   messageId: string;
-  /** Snapshot of the most recent `set_model_policy.chat.model` at turn start. */
+  /** turn 开始时按订阅层级选出的模型策略快照。 */
   model: string;
   toolCalls: ToolCallSlot[];
-  /** blockIndex -> toolCalls array index */
+  /** content block index -> toolCalls 数组下标；当前只为状态结构兼容保留。 */
   toolIndexMap: Map<number, number>;
   stopReason: string;
   inputTokens: number;
@@ -77,6 +98,10 @@ interface ActiveTurn {
   endTimestamp: number;
 }
 
+/**
+ * `parseSdkLogLine` 的判别联合返回值。
+ * kind 让 TypeScript 在 switch 中收窄字段；时间统一为 epoch 毫秒。
+ */
 export type SdkEvent =
   | {
       kind: 'system_init';
@@ -89,10 +114,8 @@ export type SdkEvent =
     }
   | {
       /**
-       * Client-side control request that pins models for upcoming turns.
-       * `chat.model` is the value used by main user turns; `compact.model`
-       * and `scene_model.model` are used by summarizer/scene tasks. We only
-       * track `chat.model` since that is what each `message_start` consumes.
+       * 客户端为后续 turn 固定的模型策略。chat 用于主对话，compact/scene_model 用于摘要或
+       * 场景任务；三个槽位都保留，message_start 再按 session 层级选择。
        */
       kind: 'set_model_policy';
       ts: number;
@@ -134,43 +157,35 @@ export type SdkEvent =
   | { kind: 'post_tool_use'; ts: number; sessionId: string; toolUseId: string; toolName: string; toolResponse: string; transcriptPath: string };
 
 /**
- * Qoder Work — SDK log tail input.
+ * Qoder Work SDK 日志 tail Input。
  *
- * Tails QoderWork's `sdk-*.log` files and emits LLM call METADATA only at turn
- * close. We deliberately do NOT reconstruct thinking/text content from
- * `*_delta` events: QoderWork SDK writes log lines asynchronously, so the
- * physical write order in the file does not match the actual LLM token
- * generation order — concatenating deltas by file order produces scrambled
- * text. Conversation content is sourced from the SQLite input instead.
+ * SDK 异步写日志，文件中的 thinking/text/input_json delta 顺序不等于模型真实生成顺序；按文件
+ * 顺序拼接会得到乱码或错序内容。因此本类在 turn 关闭时仅输出 LLM/工具元数据，正文由并行启用
+ * 的 Hook/SQLite 回退 Input 提供。
  *
- * Model attribution: `Sending control request: set_model_policy` lines pin
- * the LLM model policy for upcoming turns (separate `chat`, `compact` and
- * `scene_model` slots). We track all three slots and, at every `message_start`,
- * snapshot the slot that matches the session's `subscription_tier` onto the
- * `ActiveTurn` (Premium→chat, Standard→scene_model, fallback to chat). The
- * result is then stamped onto every emitted entry's `gen_ai.{request,response}.model`.
+ * 模型归属来自 set_model_policy 的 chat/compact/scene_model 槽位：Premium 主对话优先 chat，
+ * Standard 场景任务优先 scene_model，再逐级回退。每次 message_start 将当时值快照进 ActiveTurn，
+ * 最终写到 gen_ai.request.model / gen_ai.response.model。
  *
- * Per turn we emit:
- *   - one `llm.response` entry carrying tokens / finish_reasons / message_id /
- *     subscription_tier / cwd / agents / tools.
- *   - one `tool.call` entry per `tool_use` block carrying tool name and id
- *     (arguments are intentionally omitted — same async-ordering issue).
- * On `result` events we additionally emit a session-level `other` summary.
+ * 每个 turn 输出 llm.request、带 token/finish reason/message_id 的 llm.response，以及每个
+ * tool_use 的 tool.call；工具参数同样因异步顺序问题有意省略。result 还输出 session 级 other。
+ * 类继承 BaseSessionInput，但覆盖 collect 读取纯文本；生命周期中无后台子进程或网络 I/O。
  */
 export class QoderWorkLogInput extends BaseSessionInput {
+  /** 根据变体生成 `qoder-work-log` 或 `qoder-work-cn-log`。 */
   readonly id: string;
   readonly agentType: ClientType;
 
+  /** session 元数据与当前未完成 turn，key 均为 SDK session_id。 */
   private readonly sessions: Map<string, SessionState> = new Map();
   private readonly activeTurns: Map<string, ActiveTurn> = new Map();
+  /** handleEvent 之外暂存的事件；当前代码没有写入点，保留原因待确认。 */
   private pendingEntries: AgentActivityEntry[] = [];
+  /** 当前处理文件路径；当前仅在 collect 中赋值，其他逻辑未读取，保留原因待确认。 */
   private currentFilePath: string = '';
   /**
-   * Per-file model policy state. Each SDK log file may belong to a different
-   * SDK process with its own `set_model_policy` line, so we isolate policy
-   * by file path. The policy is restored at the start of each `processLogFile`
-   * call and saved back after processing, ensuring cross-poll-cycle continuity
-   * without cross-file leakage.
+   * 每文件模型策略。不同 SDK 日志可能来自各自进程和 set_model_policy，因此按路径隔离；
+   * processLogFile 开始恢复、结束保存，既跨轮询连续，又不把一个文件的策略泄漏到另一个文件。
    */
   private readonly fileModelPolicies: Map<string, { chat: string; compact: string; scene: string }> = new Map();
   private currentModelPolicy: { chat: string; compact: string; scene: string } = {
@@ -178,7 +193,12 @@ export class QoderWorkLogInput extends BaseSessionInput {
     compact: '',
     scene: '',
   };
+  /**
+   * 解析变体数据目录并配置 SDK 日志扫描根目录。
+   * @param opts StateStore、轮询周期及可选 dataRoot/agentType。
+   */
   constructor(opts: QoderWorkLogInputOptions) {
+    // Orchestrator 为 CN 实例显式传 agentType/dataRoot；其他调用默认国际版。
     const agentType = opts.agentType ?? ClientType.QoderWork;
     const dataRoot = opts.dataRoot ?? resolveQoderWorkRoot(agentType === ClientType.QoderWorkCN ? 'cn' : 'standard');
     super({
@@ -191,19 +211,30 @@ export class QoderWorkLogInput extends BaseSessionInput {
     this.id = `${agentType}-log`;
   }
 
+  /**
+   * 返回国际版默认 SDK 日志目录，供 discovery watcher 使用。
+   * @returns 单元素绝对路径数组；CN 注册由 Orchestrator 提供专用路径。
+   */
   static getWatchPaths(): string[] {
     return [path.join(resolveQoderWorkRoot(), 'logs')];
   }
 
+  /**
+   * 判断国际版默认 logs 目录是否存在。
+   * @returns 目录存在为 true；CN 实例在 Orchestrator 中使用自定义检查。
+   */
   static async checkAvailability(): Promise<boolean> {
     return directoryExists(path.join(resolveQoderWorkRoot(), 'logs'));
   }
 
+  /**
+   * 首次启动为每个 SDK 日志建立 offset/inode 基线。
+   *
+   * offset 定位到最近 result 行之后，因此已完成历史不会回放；尚无 result 的文件从 0 读取，
+   * 使正在进行的 turn 结束时仍能完整输出。已有 offset 时不覆盖。轮转竞态只跳过该文件。
+   */
   protected override async onStart(): Promise<void> {
-    // Baseline: skip already-completed turns on first start, but keep any
-    // in-flight turn so its events are emitted once it terminates. We do this
-    // by setting the per-file offset to the byte just AFTER the most recent
-    // `result` line. Files without a `result` line baseline to 0 (full read).
+    // 首次基线跳过已完成 turn，但保留尚未出现 result 的在途 turn。
     const files = await this.discoverSessionFiles();
     for (const filePath of files) {
       try {
@@ -218,11 +249,15 @@ export class QoderWorkLogInput extends BaseSessionInput {
           extra: { inode: (stat as unknown as { ino: number }).ino },
         });
       } catch {
-        // file might disappear during rotation
+        // 扫描与 stat 之间可能发生日志轮转；下轮 discovery 会重新发现。
       }
     }
   }
 
+  /**
+   * 发现新旧两种 SDK 日志布局。
+   * @returns 排序后的完整文件路径；根目录不可读时返回空数组。
+   */
   protected async discoverSessionFiles(): Promise<string[]> {
     const files: string[] = [];
     let sessionDirs: Dirent[];
@@ -232,11 +267,12 @@ export class QoderWorkLogInput extends BaseSessionInput {
       return files;
     }
 
+    // 第一层每个目录代表一个 SDK session；非目录项不参与。
     for (const dir of sessionDirs) {
       if (!dir.isDirectory()) continue;
       const sessionPath = path.join(this.sessionDir, dir.name);
 
-      // New layout: <session>/main.log (SDK events mixed into a single file)
+      // 新布局：`<session>/main.log`，所有 SDK 事件混在单一文件。
       const mainLogPath = path.join(sessionPath, 'main.log');
       try {
         const st = await fs.stat(mainLogPath);
@@ -244,9 +280,9 @@ export class QoderWorkLogInput extends BaseSessionInput {
           files.push(mainLogPath);
           continue;
         }
-      } catch { /* fall through to legacy layout */ }
+      } catch { /* 未找到新布局时继续尝试旧布局。 */ }
 
-      // Legacy layout: <session>/main/sdk-*.log
+      // 旧布局：`<session>/main/sdk-*.log`，一个 session 下可能有多个轮转文件。
       const mainDir = path.join(sessionPath, 'main');
       let entries: Dirent[];
       try {
@@ -264,24 +300,32 @@ export class QoderWorkLogInput extends BaseSessionInput {
     return files.sort();
   }
 
+  /**
+   * BaseSessionInput 要求实现的 JSON 行回调；本类的源文件是纯文本，所以始终返回 null。
+   * 真正路径是下面覆盖的 collect -> processLogFile -> parseSdkLogLine。
+   * @param record 偶然可解析成 JSON 的行，当前忽略。
+   * @param filePath 来源路径，当前忽略。
+   * @returns 恒为 null。
+   */
   protected async processSessionLine(
     record: Record<string, unknown>,
     filePath: string,
   ): Promise<AgentActivityEntry | null> {
-    // BaseSessionInput parses each line via JSON.parse first. For SDK logs
-    // (non-JSON), JSON.parse will throw and BaseSessionInput logs a warning.
-    // To handle plain text lines, we override collect() below to bypass the
-    // JSON parsing path. This method remains as a no-op fallback for any
-    // accidental JSON-shaped lines that slip through.
+    // SDK 行不是 JSON，必须绕开 BaseSessionInput 的逐行 JSON.parse；此方法只满足抽象契约。
     void record;
     void filePath;
     return null;
   }
 
+  /**
+   * 执行一轮全部 SDK 文件增量读取、事件状态机处理和 TTL 清理。
+   * @returns 本轮已闭合 turn/result 生成的标准事件；文件按路径串行处理以保持策略状态确定性。
+   */
   protected override async collect(): Promise<AgentActivityEntry[]> {
     const files = await this.discoverSessionFiles();
     const allEntries: AgentActivityEntry[] = [];
 
+    // 顺序处理使单文件内部事件顺序稳定；跨文件策略由 fileModelPolicies 隔离。
     for (const filePath of files) {
       this.currentFilePath = filePath;
       const fileEntries = await this.processLogFile(filePath);
@@ -289,6 +333,7 @@ export class QoderWorkLogInput extends BaseSessionInput {
     }
     this.currentFilePath = '';
 
+    // 兼容预留队列存在数据时一次性转移并清空，避免重复发射。
     if (this.pendingEntries.length > 0) {
       allEntries.push(...this.pendingEntries);
       this.pendingEntries = [];
@@ -298,6 +343,7 @@ export class QoderWorkLogInput extends BaseSessionInput {
     return allEntries;
   }
 
+  /** 删除 24 小时无事件的 session/turn 内存状态，防止常驻进程 Map 无界增长。 */
   private evictStaleSessions(): void {
     const now = Date.now();
     for (const [id, session] of this.sessions) {
@@ -308,7 +354,17 @@ export class QoderWorkLogInput extends BaseSessionInput {
     }
   }
 
+  /**
+   * 增量读取一个日志文件，并把可识别行送入状态机。
+   *
+   * inode 改变视为路径轮转并重置 offset/模型策略；单轮最多读取 16 MiB，达到上限时回退到
+   * 最后完整换行，残行留到下轮。文件句柄在 finally 中关闭。
+   *
+   * @param filePath SDK main.log 或 sdk-*.log 完整路径。
+   * @returns 本文件本轮闭合出的事件数组。
+   */
   private async processLogFile(filePath: string): Promise<AgentActivityEntry[]> {
+    // 每次处理前恢复该文件自己的模型策略，避免多个 SDK 进程互相污染。
     this.currentModelPolicy = this.fileModelPolicies.get(filePath)
       ?? { chat: '', compact: '', scene: '' };
     const stateKey = `${this.id}:${filePath}`;
@@ -323,6 +379,7 @@ export class QoderWorkLogInput extends BaseSessionInput {
     const prevInode = prevState.extra?.inode as number | undefined;
     const currentInode = (stat as unknown as { ino: number }).ino;
 
+    // inode 变化说明同路径已换成新文件，旧 byte offset 不再有效。
     if (prevInode !== undefined && prevInode !== currentInode) {
       this.stateStore.setOffset(stateKey, 0);
       this.stateStore.update(stateKey, { extra: { inode: currentInode } });
@@ -343,15 +400,13 @@ export class QoderWorkLogInput extends BaseSessionInput {
       await handle.read(buf, 0, readSize, offset);
       text = buf.toString('utf-8');
 
-      // When capped by MAX_READ_BYTES the last "line" is likely truncated.
-      // Roll back to the last complete newline so the partial line is re-read
-      // next cycle.
+      // 触及 16 MiB 上限时末尾通常是半行；只推进到最后换行，残行下轮重读。
       let consumedBytes = readSize;
       if (readSize < stat.size - offset) {
         const lastNL = text.lastIndexOf('\n');
         if (lastNL >= 0) {
           text = text.substring(0, lastNL);
-          consumedBytes = Buffer.byteLength(text, 'utf-8') + 1; // +1 for the \n
+          consumedBytes = Buffer.byteLength(text, 'utf-8') + 1; // 加 1 计入换行字节。
         }
       }
 
@@ -362,6 +417,7 @@ export class QoderWorkLogInput extends BaseSessionInput {
     }
 
     const out: AgentActivityEntry[] = [];
+    // 无法识别或 JSON 损坏的 SDK 行由 parser 返回 null，只跳过该行。
     for (const line of text.split('\n')) {
       if (!line.trim()) continue;
       const event = parseSdkLogLine(line);
@@ -369,10 +425,17 @@ export class QoderWorkLogInput extends BaseSessionInput {
       this.handleEvent(event, filePath, out);
     }
 
+    // 保存副本而不是对象引用，保证下个文件修改 currentModelPolicy 时不会反向改写。
     this.fileModelPolicies.set(filePath, { ...this.currentModelPolicy });
     return out;
   }
 
+  /**
+   * SDK 判别事件状态机：创建 session、更新模型策略、累积 active turn，并在边界生成事件。
+   * @param event parseSdkLogLine 返回的已验证判别联合。
+   * @param filePath 参与稳定 event.id 的来源文件。
+   * @param out 当前文件的输出数组，函数会原地追加。
+   */
   private handleEvent(
     event: SdkEvent,
     filePath: string,
@@ -380,6 +443,7 @@ export class QoderWorkLogInput extends BaseSessionInput {
   ): void {
     switch (event.kind) {
       case 'system_init':
+        // init 重新建立 session 元数据和新的 trace；同 ID 旧状态会被覆盖。
         this.sessions.set(event.sessionId, {
           subscriptionTier: event.subscriptionTier,
           cwd: event.cwd,
@@ -389,10 +453,8 @@ export class QoderWorkLogInput extends BaseSessionInput {
           traceId: crypto.randomBytes(16).toString('hex'),
           turnCounter: 0,
         });
-        // QoderWork CN only sends `set_model_policy` once per SDK process
-        // start, which may be skipped by baseline. Use system init's `model`
-        // field as a fallback policy seed when no explicit policy has been
-        // observed yet (e.g. init.model = "Auto" in CN, "Premium" in intl).
+        // CN 可能只在 SDK 进程启动时发送一次 set_model_policy，而启动基线可能跳过它；尚无任何
+        // 显式策略时，用 init.model 中非 Premium/Standard 的值作为 chat 策略种子。
         if (event.subscriptionTier &&
             !this.currentModelPolicy.chat &&
             !this.currentModelPolicy.scene &&
@@ -405,16 +467,14 @@ export class QoderWorkLogInput extends BaseSessionInput {
         return;
 
       case 'set_model_policy':
-        // Pure state update; no entries emitted. Captures all model slots so
-        // subsequent `message_start` events can snapshot the correct one
-        // based on the session's subscription tier.
+        // 纯状态更新，不输出事件；后续 message_start 才按 session 层级选择并快照槽位。
         if (event.chatModel) this.currentModelPolicy.chat = event.chatModel;
         if (event.compactModel) this.currentModelPolicy.compact = event.compactModel;
         if (event.sceneModel) this.currentModelPolicy.scene = event.sceneModel;
         return;
 
       case 'message_start': {
-        // close prior turn before starting new one
+        // 同 session 新 message 开始前先关闭旧 active turn，防止状态被覆盖丢失。
         this.finalizeTurn(event.sessionId, filePath, out);
         const sess = this.sessions.get(event.sessionId);
         if (sess) {
@@ -438,6 +498,7 @@ export class QoderWorkLogInput extends BaseSessionInput {
       case 'block_start': {
         const turn = this.activeTurns.get(event.sessionId);
         if (!turn) return;
+        // thinking/text 只更新时间；完整 tool_use 身份才进入工具列表。
         if (event.blockType === 'tool_use' && event.toolId && event.toolName) {
           const idx = turn.toolCalls.length;
           turn.toolIndexMap.set(event.index, idx);
@@ -448,9 +509,7 @@ export class QoderWorkLogInput extends BaseSessionInput {
       }
 
       case 'delta': {
-        // We intentionally drop content (thinking/text/input_json) — see class
-        // doc comment. We only refresh endTimestamp so the turn's emitted
-        // entries reflect the latest activity time.
+        // 有意丢弃 thinking/text/input_json 内容，只刷新活动结束时间；原因见类注释。
         const turn = this.activeTurns.get(event.sessionId);
         if (!turn) return;
         turn.endTimestamp = event.ts;
@@ -458,6 +517,7 @@ export class QoderWorkLogInput extends BaseSessionInput {
       }
 
       case 'message_delta': {
+        // message_delta 提供本 turn 的停止原因与 token，是 response 元数据权威来源。
         const turn = this.activeTurns.get(event.sessionId);
         if (!turn) return;
         turn.stopReason = event.stopReason;
@@ -470,11 +530,12 @@ export class QoderWorkLogInput extends BaseSessionInput {
       case 'message_stop': {
         const turn = this.activeTurns.get(event.sessionId);
         if (turn) turn.endTimestamp = event.ts;
-        // Do NOT finalize here: message_delta may arrive after message_stop.
+        // 不能在此 finalize：SDK 日志中 message_delta 可能晚于 message_stop 落盘。
         return;
       }
 
       case 'result': {
+        // result 是可靠 session 窗口边界：先输出最后 active turn，再输出汇总 other。
         this.finalizeTurn(event.sessionId, filePath, out);
         const session = this.sessions.get(event.sessionId);
         const resultModel = this.pickModelForSession(event.sessionId);
@@ -505,21 +566,17 @@ export class QoderWorkLogInput extends BaseSessionInput {
             },
           }),
         );
-        // Keep session state for any follow-up turns; QoderWork can emit
-        // additional message_start blocks within the same SDK process after
-        // result. Only delete on hard reset (file rotation).
+        // result 后同一 SDK 进程仍可能追加 message_start，因此保留 session；仅 TTL/硬重置清理。
         return;
       }
     }
   }
 
   /**
-   * Select the LLM model key for a session based on its subscription tier.
-   * QoderWork emits a single `set_model_policy` payload with parallel slots
-   * (chat / compact / scene_model); main user turns (Premium tier) consume
-   * `chat`, while summarizer / scene turns (Standard tier) consume
-   * `scene_model`. Falls back to chat → compact → UNKNOWN when slots are
-   * empty (e.g. before the first policy line is observed).
+   * 按 session subscriptionTier 从当前策略选择实际 LLM 模型。
+   * Standard 优先 scene -> compact -> chat；Premium、未知层级和缺 session 时优先主 chat 槽位。
+   * @param sessionId SDK session_id。
+   * @returns 非空模型键；所有槽位缺失时返回 `unknown`。
    */
   private pickModelForSession(sessionId: string): string {
     const tier = this.sessions.get(sessionId)?.subscriptionTier ?? '';
@@ -527,10 +584,20 @@ export class QoderWorkLogInput extends BaseSessionInput {
     if (tier === 'Standard') {
       return policy.scene || policy.compact || policy.chat || UNKNOWN_MODEL;
     }
-    // Premium and any other tier (or unknown) default to the main chat slot.
+    // Premium、其他层级和未知值都默认使用主对话 chat 槽位。
     return policy.chat || policy.scene || policy.compact || UNKNOWN_MODEL;
   }
 
+  /**
+   * 关闭一个 active turn，把累积状态展开为 request、response 和 tool.call 事件。
+   *
+   * 本方法同步修改 `activeTurns` 并向 out 原地追加；没有 active turn 时幂等返回。工具参数和正文
+   * 有意缺失，token/模型/时序来自 SDK 元数据。request 与 response 共用 turn/step/trace 关联字段。
+   *
+   * @param sessionId 要关闭的 SDK session。
+   * @param filePath 参与确定性 event.id 的日志路径。
+   * @param out 当前收集周期输出数组。
+   */
   private finalizeTurn(
     sessionId: string,
     filePath: string,
@@ -540,6 +607,7 @@ export class QoderWorkLogInput extends BaseSessionInput {
     if (!turn) return;
     this.activeTurns.delete(sessionId);
 
+    // session init 可能因基线或截断缺失；此时仍输出事件，但关联字段允许 undefined。
     const session = this.sessions.get(sessionId);
     const model = turn.model || UNKNOWN_MODEL;
     const sharedAttrs = sessionAttributes(session);
@@ -548,7 +616,8 @@ export class QoderWorkLogInput extends BaseSessionInput {
     const turnId = session ? `${sessionId}:t${session.turnCounter}` : undefined;
     const stepId = turnId ? `${turnId}:s1` : undefined;
 
-    // Emit llm.request at turn start so OTLP flusher can compute span duration
+    // turn 起点显式输出 llm.request，OTLP converter 才能计算 LLM span 时长。
+    // turn 终点输出 response，携带 token、结束原因和可用于配对的 message ID。
     out.push(
       buildAgentActivityEntry({
         timestamp: turn.startTimestamp,
@@ -594,6 +663,7 @@ export class QoderWorkLogInput extends BaseSessionInput {
       }),
     );
 
+    // 每个 tool_use block 输出独立 tool.call；本路径没有可靠 result/arguments。
     for (let i = 0; i < turn.toolCalls.length; i++) {
       const tc = turn.toolCalls[i];
       out.push(
@@ -633,8 +703,9 @@ export class QoderWorkLogInput extends BaseSessionInput {
 }
 
 /**
- * Per-session attributes shared by every entry (tier/cwd/agents/tools).
- * Returns an empty object when session state is missing.
+ * 提取所有事件共享的 session attributes（订阅层级、cwd、Agent 和工具清单）。
+ * @param session 可选 session 状态；init 行缺失时可能为 undefined。
+ * @returns 仅包含非空字段的普通 JSON 对象；无状态时返回空对象。
  */
 function sessionAttributes(session: SessionState | undefined): Record<string, JsonValue> {
   if (!session) return {};
@@ -646,6 +717,15 @@ function sessionAttributes(session: SessionState | undefined): Record<string, Js
   return out;
 }
 
+/**
+ * 按平台和产品变体解析 Qoder Work 应用数据根目录。
+ *
+ * Windows 优先 APPDATA，Linux 优先 XDG_CONFIG_HOME，macOS 使用 Application Support；所有
+ * fallback 都通过 home 目录构造，不访问文件系统。
+ *
+ * @param variant `standard` 为国际版，`cn` 为 CN；默认国际版。
+ * @returns 当前平台的绝对目录路径。
+ */
 export function resolveQoderWorkRoot(variant: 'standard' | 'cn' = 'standard'): string {
   if (process.platform === 'darwin') {
     return resolveHome(variant === 'cn' ? DEFAULT_QODERWORK_CN_ROOT_MAC : DEFAULT_QODERWORK_ROOT_MAC);
@@ -659,6 +739,16 @@ export function resolveQoderWorkRoot(variant: 'standard' | 'cn' = 'standard'): s
   return resolveHome(variant === 'cn' ? DEFAULT_QODERWORK_CN_ROOT_LINUX : DEFAULT_QODERWORK_ROOT_LINUX);
 }
 
+/**
+ * 把一行 SDK 纯文本解析为共享 SdkEvent 判别联合。
+ *
+ * 先匹配出站 set_model_policy，再匹配入站 Received message。时间无法解析时回退 Date.now；
+ * payload JSON 损坏、未知消息类型或结构不完整时返回 null。`post_tool_use` 主要供 CN Trace 聚合器
+ * 获取工具结果；QoderWorkLogInput 自身当前不在 handleEvent 中消费该 kind。
+ *
+ * @param line SDK 日志中的完整单行文本。
+ * @returns 可识别事件或 null；不抛出 JSON 解析异常。
+ */
 export function parseSdkLogLine(line: string): SdkEvent | null {
   const policyMatch = SET_MODEL_POLICY_RE.exec(line);
   if (policyMatch) {
@@ -671,7 +761,7 @@ export function parseSdkLogLine(line: string): SdkEvent | null {
     } catch {
       return null;
     }
-    // Payload shape:
+    // payload 结构：
     //   { requestId, request: { type, request_id,
     //       request: { subtype: 'set_model_policy', chat:{model}, compact:{model}, scene_model:{model} } } }
     const outer = (envelope.request && typeof envelope.request === 'object'
@@ -700,6 +790,7 @@ export function parseSdkLogLine(line: string): SdkEvent | null {
     return null;
   }
 
+  // system init 建立会话元数据；部分版本用 subtype，部分版本用 type。
   if (msgType === 'system' && (data.subtype === 'init' || data.type === 'init')) {
     return {
       kind: 'system_init',
@@ -712,6 +803,7 @@ export function parseSdkLogLine(line: string): SdkEvent | null {
     };
   }
 
+  // stream_event 继续交给专用 parser 按 event.type 收窄。
   if (msgType === 'stream_event' && data.event && typeof data.event === 'object') {
     return parseStreamEvent(tsNum, stringOr(data.session_id, ''), data.event as Record<string, unknown>);
   }
@@ -730,6 +822,7 @@ export function parseSdkLogLine(line: string): SdkEvent | null {
     };
   }
 
+  // control_request 里只有 PostToolUse 对遥测有用，其他控制消息跳过。
   if (msgType === 'control_request') {
     const req = data.request as Record<string, unknown> | undefined;
     const input = (req && typeof req === 'object'
@@ -752,6 +845,13 @@ export function parseSdkLogLine(line: string): SdkEvent | null {
   return null;
 }
 
+/**
+ * 解析 stream_event 内层对象，映射 message/block/delta/stop 生命周期。
+ * @param ts 外层日志时间（epoch 毫秒）。
+ * @param sessionId 外层携带的 session ID。
+ * @param event stream_event.event 对象。
+ * @returns 对应 SdkEvent；未知 block/delta/type 返回 null。
+ */
 function parseStreamEvent(
   ts: number,
   sessionId: string,
@@ -771,6 +871,7 @@ function parseStreamEvent(
       };
     }
     case 'content_block_start': {
+      // block 类型决定后续 delta 如何解释；tool_use 还携带 name/id。
       const block = (event.content_block && typeof event.content_block === 'object'
         ? event.content_block
         : null) as Record<string, unknown> | null;
@@ -799,6 +900,7 @@ function parseStreamEvent(
       return null;
     }
     case 'content_block_delta': {
+      // 三种 delta 内容字段名不同，统一成 content，并保留工具 block index。
       const delta = (event.delta && typeof event.delta === 'object'
         ? event.delta
         : null) as Record<string, unknown> | null;
@@ -835,6 +937,7 @@ function parseStreamEvent(
       return null;
     }
     case 'message_delta': {
+      // stop_reason 位于 delta，token 位于并列 usage 对象。
       const delta = (event.delta && typeof event.delta === 'object'
         ? event.delta
         : {}) as Record<string, unknown>;
@@ -857,6 +960,7 @@ function parseStreamEvent(
   }
 }
 
+/** 对关键字段做 NUL 分隔后计算 SHA-256，生成跨重读稳定的 event.id。 */
 function hashId(parts: Array<string | number | undefined>): string {
   return crypto
     .createHash('sha256')
@@ -864,39 +968,49 @@ function hashId(parts: Array<string | number | undefined>): string {
     .digest('hex');
 }
 
+/** 返回非空字符串，否则使用 fallback。 */
 function stringOr(value: unknown, fallback: string): string {
   return typeof value === 'string' && value.length > 0 ? value : fallback;
 }
 
+/** 返回有限 number，否则使用 fallback。 */
 function numberOr(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
+/** 仅保留大于 0 的有限 token 数；0/坏值转 undefined 以省略字段。 */
 function finiteNum(value: number | undefined): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? value : undefined;
 }
 
+/** 从未知值中过滤出字符串数组；非数组返回空数组。 */
 function arrayOfString(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
   return value.filter((v): v is string => typeof v === 'string');
 }
 
+/** 从模型策略槽位对象读取非空 model 字段。 */
 function extractModel(value: unknown): string {
   if (!value || typeof value !== 'object') return '';
   const obj = value as Record<string, unknown>;
   return stringOr(obj.model, '');
 }
 
+/** 两侧 token 都存在时求和；任一缺失则不伪造 total。 */
 function sumIfPresent(left: number | undefined, right: number | undefined): number | undefined {
   if (left === undefined || right === undefined) return undefined;
   return left + right;
 }
 
 /**
- * Scan a sdk log file backwards and return the byte offset just AFTER the
- * newline that terminates the most recent `Received message: result` line.
- * If no result line exists, return 0 (full read). The scan reads the tail of
- * the file in 64 KiB chunks to avoid loading huge logs into memory.
+ * 从文件尾反向扫描最近一条 `Received message: result`，返回其结束换行后的 byte offset。
+ *
+ * 每次只读 64 KiB，并把跨块行片段留给下一轮拼接，避免首次启动把超大日志全部载入内存。
+ * 没有 result 时返回 0，以便保留可能正在进行的 turn；文件句柄始终在 finally 关闭。
+ *
+ * @param filePath SDK 日志路径。
+ * @param size 调用方 stat 得到的本轮文件大小边界。
+ * @returns 最近完成窗口之后的 offset，或 0。
  */
 async function findLastResultBoundary(filePath: string, size: number): Promise<number> {
   if (size <= 0) return 0;
@@ -912,21 +1026,20 @@ async function findLastResultBoundary(filePath: string, size: number): Promise<n
       await handle.read(buf, 0, readSize, cursor);
       tail = buf.toString('utf-8') + tail;
       const lines = tail.split('\n');
-      // Keep first chunk fragment for next iteration to handle line splits.
+      // 保留块首残片，与更早一个块拼接，处理行跨块情况。
       const fragment = cursor > 0 ? lines.shift() ?? '' : '';
-      // Walk lines from end to start within the assembled tail (excluding
-      // the leading fragment we still need to combine with previous chunk).
+      // 除待拼接首残片外，assembled tail 中其余行已经完整，可以从尾向前查找。
       let runningOffset = cursor + Buffer.byteLength(fragment, 'utf-8');
-      // We need offsets per line; rebuild them by re-walking from start.
+      // 为得到命中行的 byte offset，从完整行数组头部重新累计 UTF-8 字节数。
       const offsets: number[] = [];
       let off = runningOffset;
       for (const line of lines) {
         offsets.push(off);
-        off += Buffer.byteLength(line, 'utf-8') + 1; // +1 for the \n
+        off += Buffer.byteLength(line, 'utf-8') + 1; // 加 1 计入换行字节。
       }
       for (let i = lines.length - 1; i >= 0; i--) {
         if (lines[i].includes('Received message: result ')) {
-          // Boundary is just after this line's terminating newline.
+          // 基线位于命中行终止换行之后，下一次从后续字节开始读取。
           return offsets[i] + Buffer.byteLength(lines[i], 'utf-8') + 1;
         }
       }

@@ -1,13 +1,16 @@
 #!/usr/bin/env node
 /**
- * Cursor hook processor for loongsuite-pilot.
+ * LoongSuite Pilot 的 Cursor Hook 有状态处理器。
  *
- * Stateful processor: each hook event is appended to an event journal.
- * On parent "stop", all journal events are assembled into canonical history
- * records with proper step division, subagent nesting, and trace ids.
+ * Shell/PowerShell wrapper 每收到一个 Cursor Hook 事件就启动一次本 Node 子进程。普通事件先
+ * 转成内部结构并追加到共享 event journal；父会话 `stop` 到来时读取 journal，把同一 turn
+ * 组装成带 step、子 Agent 嵌套和 trace ID 的标准记录，再写 history JSONL。Windows 优先
+ * 用原生 UTF-8 transcript 提供文本以绕过 GB18030 损坏，其他平台或解析失败时走 Hook 事件
+ * assembler。Cursor CLI 的 stop 可能早于 afterAgentResponse，因此支持延迟补偿组装。
  *
- * History JSONL is the sole formal data source for CursorHookInput.
- * Raw capture is behind LOONGSUITE_CURSOR_RAW_TRACE=1 env flag.
+ * `logs/cursor/history/*.jsonl` 是 `CursorHookInput` 唯一正式数据源；原始 payload 仅在
+ * `LOONGSUITE_CURSOR_RAW_TRACE=1` 时写入诊断目录。stdout 始终输出 `{}`，所有采集错误
+ * fail-open。主入口最后的 `import.meta.url` 判断使测试可以导入导出函数而不自动消费 stdin。
  */
 
 import crypto from 'node:crypto';
@@ -56,7 +59,7 @@ async function appendErrorJsonl(dataDir, now, fields) {
       await fs.appendFile(filePath, `${JSON.stringify(record)}\n`, 'utf-8');
       return;
     } catch {
-      // best-effort
+      // 首选目录和临时目录都不可写时放弃；错误日志本身不能阻塞宿主。
     }
   }
 }
@@ -114,20 +117,18 @@ function applyPolicy(record, runtimeConfig) {
 }
 
 function injectSkillRecords(records, skills, runtimeConfig = {}) {
-  // Skill-to-step alignment is best-effort: attach detected reads to the first
-  // assembled LLM response. Cursor's assemblers synthesize a response even for
-  // thought-only and implicit tool steps, so never attach output to a request.
+  // Skill 与 step 的对齐只能尽力而为：把检测到的 Read 附到第一条 LLM response。
+  // assembler 即使面对纯 thought/隐式工具 step 也会合成 response，因此不要附到 request。
   const targetLlmIdx = records.findIndex(r => r['event.name'] === 'llm.response');
   if (targetLlmIdx < 0) return;
 
-  // Generate each call ID once so the LLM output, tool.call, and tool.result
-  // records all describe the same synthetic tool invocation.
+  // 每个 Read 只生成一次 call ID，使 LLM output、tool.call、tool.result 指向同一合成调用。
   const skillEntries = skills.map(skill => ({
     skill,
     toolCallId: crypto.randomUUID(),
   }));
 
-  // Append canonical Read tool_call entries to the first LLM response.
+  // 先在第一条 LLM response 的 assistant parts 中声明标准 Read tool_call。
   const llmRecord = records[targetLlmIdx];
   const outputMsgs = Array.isArray(llmRecord['gen_ai.output.messages'])
     ? llmRecord['gen_ai.output.messages']
@@ -151,7 +152,7 @@ function injectSkillRecords(records, skills, runtimeConfig = {}) {
   llmRecord['gen_ai.output.messages'] = outputMsgs;
   records[targetLlmIdx] = applyPolicy(llmRecord, runtimeConfig);
 
-  // Create tool.call + tool.result record pairs for each skill read
+  // 再为每次 skill 读取创建配对的 tool.call 与 tool.result 独立记录。
   const insertRecords = [];
   const baseTime = BigInt(llmRecord.time_unix_nano);
   const baseObservedTime = BigInt(
@@ -170,7 +171,7 @@ function injectSkillRecords(records, skills, runtimeConfig = {}) {
       'user.id': llmRecord['user.id'],
     };
 
-    // tool.call
+    // 合成 Skill Read 的 tool.call。
     insertRecords.push(applyPolicy({
       ...baseFields,
       time_unix_nano: String(baseTime + callOffset),
@@ -184,7 +185,7 @@ function injectSkillRecords(records, skills, runtimeConfig = {}) {
       'agent.cursor.skill_detection_source': 'transcript_post_assembly',
     }, runtimeConfig));
 
-    // tool.result
+    // 合成同一 call ID 的 tool.result。
     insertRecords.push(applyPolicy({
       ...baseFields,
       time_unix_nano: String(baseTime + resultOffset),
@@ -198,7 +199,7 @@ function injectSkillRecords(records, skills, runtimeConfig = {}) {
     }, runtimeConfig));
   }
 
-  // Insert after the first LLM response.
+  // 紧跟在声明这些调用的第一条 LLM response 后插入，保持下游消费顺序。
   records.splice(targetLlmIdx + 1, 0, ...insertRecords);
 }
 
@@ -215,21 +216,20 @@ async function main() {
   try {
     payload = JSON.parse(raw);
   } catch (firstErr) {
-    // Cursor on Windows may insert spurious 0x3F (?) after closing quotes in JSON
-    // events containing Chinese text (GB18030 codepage maps some chars to ?).
-    // The ? appears after a closing " and before a structural char (, } ]):
+    // Windows Cursor 可能在含中文事件的 JSON 引号后插入多余 0x3F（?），原因是 GB18030
+    // 代码页把部分字符映射为问号。问号出现在闭合引号与结构字符（, } ]）之间：
     //   "value"?,  → "value",
     //   "value"?}  → "value"}
     if (process.platform === 'win32') {
       const repaired = raw
-        .replace(/"?\?,/g, '",')   // "?, or ?, before comma
-        .replace(/"?\?}/g, '"}')   // "?} or ?} before }
-        .replace(/"?\?]/g, '"]');  // "?] or ?] before ]
+        .replace(/"?\?,/g, '",')   // 删除逗号前的 `"?` 或 `?`。
+        .replace(/"?\?}/g, '"}')   // 删除右花括号前的 `"?` 或 `?`。
+        .replace(/"?\?]/g, '"]');  // 删除右方括号前的 `"?` 或 `?`。
       if (repaired !== raw) {
         try {
           payload = JSON.parse(repaired);
         } catch {
-          // repair didn't help
+          // 修复后仍无法解析，下面记录诊断并返回空响应。
         }
       }
     }
@@ -258,7 +258,7 @@ async function main() {
     return;
   }
 
-  // Convert to internal event and append to journal
+  // 先转为稳定内部事件，再在文件锁保护下追加 journal。
   const internalEvent = toInternalEvent(payload);
   try {
     appendEvent(internalEvent);
@@ -278,21 +278,19 @@ async function main() {
       const rawFile = path.join(dataDir, 'logs', 'cursor', 'raw', 'cursor-raw-trace.jsonl');
       await appendJsonl(rawFile, { _captured_at: now.toISOString(), ...payload });
     } catch {
-      // best-effort
+      // 原始追踪仅用于诊断，写失败不影响正式 history 流程。
     }
   }
 
-  // On stop: assemble turn and write history
+  // 父会话 stop 到达时组装完整 turn 并写正式 history。
   if (internalEvent.hook_event === 'stop') {
     try {
       const allEvents = readAllEvents();
 
-      // NOTE: preToolUse events may arrive after stop is processed due to Cursor's
-      // parallel hook invocation. When this happens, tool.call/result records are
-      // absent from the output — this is a known Cursor hook timing limitation.
+      // 已知限制：Cursor 会并行启动 Hook，preToolUse 可能晚于 stop；此时本轮输出会缺少相应
+      // tool.call/result。当前代码没有等待窗口，不能把此情况误解为已解决。
 
-      // Guard against duplicate stop events: if journal has no beforeSubmitPrompt
-      // for this conversation, the turn was already processed — skip to avoid duplication.
+      // 重复 stop 防护：journal 中若已没有本会话 beforeSubmitPrompt，说明 turn 已被压缩处理。
       const hasPendingTurn = allEvents.some(e =>
         e.hook_event === 'beforeSubmitPrompt' &&
         e.conversation_id === internalEvent.conversation_id
@@ -307,18 +305,16 @@ async function main() {
         return;
       }
 
-      // ─── Deferred-stop for Cursor CLI ───
-      // Cursor CLI fires stop BEFORE afterAgentResponse. If there's a prompt but
-      // no response yet for this conversation, defer assembly until the late
-      // response arrives. IDE sessions always assemble immediately (abort/error
-      // scenarios must not lose data).
+      // ─── Cursor CLI 延迟 stop ───
+      // Cursor CLI 会先发 stop、后发 afterAgentResponse；有 prompt 但尚无 response 时延迟组装。
+      // IDE 会立即组装，因为中止/错误场景不能等待一个可能永远不来的 response。
       const convId = internalEvent.conversation_id;
       const variant = inferVariant(allEvents);
       const hasResponse = allEvents.some(e =>
         e.hook_event === 'afterAgentResponse' && e.conversation_id === convId
       );
       if (variant === 'cursor-cli' && !hasResponse) {
-        // defer — afterAgentResponse handler will trigger assembly
+        // 仅保留 journal；后到的 afterAgentResponse 分支会重新触发组装。
         writeEmptyResponse();
         return;
       }
@@ -328,8 +324,7 @@ async function main() {
       let consumedConversationIds;
       let assembledFromTranscript = false;
 
-      // On Windows: use transcript as source of truth for text content.
-      // This bypasses GB18030 codepage corruption of hook payload text.
+      // Windows 以 transcript 作为文本事实源，绕过 Hook payload 的 GB18030 代码页损坏。
       if (process.platform === 'win32' && internalEvent.transcript_path) {
         const transcriptRecords = buildCursorRecordsFromTranscript(
           internalEvent.transcript_path,
@@ -343,7 +338,7 @@ async function main() {
         }
       }
 
-      // Fallback: use hook-event-driven assembleTurn (Mac/Linux or transcript unavailable)
+      // macOS/Linux 或 transcript 不可用时，回退到 Hook 事件驱动的 assembleTurn。
       if (!records) {
         const result = assembleTurn(allEvents, {
           runtimeConfig,
@@ -355,7 +350,7 @@ async function main() {
         consumedConversationIds = result.consumedConversationIds;
       }
 
-      // ─── Post-assembly: Skill Usage Detection from Transcript ───
+      // ─── 组装后从 transcript 检测 Skill 使用 ───
       try {
         const transcriptPathForSkill = internalEvent.transcript_path;
         const promptForSkill = allEvents.find(e =>
@@ -364,13 +359,12 @@ async function main() {
         if (transcriptPathForSkill && promptForSkill?.prompt && records.length > 0) {
           const { detectSkillFromTranscript } = await import('./cursor/skill-detector.mjs');
           const detectedSkills = detectSkillFromTranscript(transcriptPathForSkill, promptForSkill.prompt);
-          // The Windows transcript assembler already materializes transcript
-          // tool_use entries. Only compensate paths assembled from hook events.
+          // Windows transcript assembler 已实体化 tool_use；只为 Hook 事件组装路径补偿 Skill 记录。
           if (detectedSkills && detectedSkills.length > 0 && !assembledFromTranscript) {
             injectSkillRecords(records, detectedSkills, runtimeConfig);
           }
         }
-      } catch { /* best-effort skill detection — never block output */ }
+      } catch { /* Skill 检测尽力而为，绝不阻塞正式输出。 */ }
 
       if (records.length > 0) {
         const day = localDateString(now);
@@ -388,8 +382,7 @@ async function main() {
     }
   }
 
-  // ─── Deferred-stop compensation: assemble when late response arrives ───
-  // When stop was deferred (no response yet), afterAgentResponse triggers assembly.
+  // ─── 延迟 stop 补偿：response 晚到后再组装 ───
   if (internalEvent.hook_event === 'afterAgentResponse') {
     try {
       const allEvents = readAllEvents();
@@ -400,9 +393,8 @@ async function main() {
       if (hasStop) {
         const runtimeConfig = loadHookRuntimeConfig(dataDir);
         const variant = inferVariant(allEvents);
-        // Note: transcriptPath is deliberately omitted here — assembleTurn falls
-        // back to stopEvent?.transcript_path internally. Passing internalEvent's
-        // transcriptPath (from afterAgentResponse) would be incorrect.
+        // 这里有意不传 transcriptPath：assembleTurn 应从 journal 中的 stopEvent 读取；
+        // afterAgentResponse 自身携带的路径不保证正确。
         const result = assembleTurn(allEvents, {
           runtimeConfig,
           variant,

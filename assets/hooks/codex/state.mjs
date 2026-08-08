@@ -2,21 +2,24 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * state.mjs — Codex session state.
+ * Codex 会话状态持久化模块。
  *
- * 移植自 codex-plugin .../src/state.ts,改:
- *   - ESM 导出 + 去除 TS type
- *   - state 路径改为 ~/.loongsuite-pilot/state/codex/sessions/<sessionId>.json
- *   - 新增 listStateFiles / getStateMtime,供 hook-watchdog cleanup 使用
+ * 移植自 codex-plugin 的 `src/state.ts`，主要变化如下：
+ *   - 改用 ES Module 导出，并去除 TypeScript 类型；
+ *   - state 路径改为 `~/.loongsuite-pilot/state/codex/sessions/<sessionId>.json`；
+ *   - 新增 listStateFiles / getStateMtime，供 hook-watchdog 清理陈旧状态。
  *
- * State 字段(关键):
+ * State 关键字段：
  *   - session_id, model, start_time, events: SessionEvent[]
  *   - transcript_path?: string
- *   - transcript_offset?: number       — 增量读 codex transcript 的字节偏移(跨 turn 持久化)
- *   - transcript_last_token_usage?     — 上次已采纳的 last_token_usage(跨 turn 心跳去重)
+ *   - transcript_offset?: number       - 增量读取 Codex transcript 的字节偏移（跨 turn 持久化）
+ *   - transcript_last_token_usage?     - 上次已采纳的 last_token_usage（跨 turn 心跳去重）
  *
- * Codex Stop hook 按 turn 触发,但 codex transcript 是 session 级累加的;state 文件**不能**清,
- * 仅清空 events + 固化 transcript_offset / transcript_last_token_usage,见 cli.ts:244 注释。
+ * Codex Stop Hook 按 turn 触发，但 Codex transcript 按 session 累加，因此 state 文件不能清除；
+ * 只能清空 events 并固化 transcript_offset / transcript_last_token_usage，参见 cli.ts:244 注释。
+ *
+ * 当前仓库生产入口已改为 `CodexTranscriptInput` 自主管理 checkpoint，未发现对本文件的生产引用；
+ * 这里可能服务于外部已部署旧插件，具体保留原因待确认。不要把本 state 生命周期当作当前主链。
  */
 
 import fs from 'node:fs';
@@ -49,7 +52,7 @@ export function loadState(sessionId) {
     try {
       return JSON.parse(fs.readFileSync(sf, 'utf-8'));
     } catch {
-      // corrupted — start fresh
+      // 状态损坏时从默认值重建，避免旧 JSON 阻断 Hook。
     }
   }
   return {
@@ -132,7 +135,7 @@ export function splitIntoTurns(state) {
   return turns;
 }
 
-// ─── Cleanup helpers ───
+// ─── 清理辅助函数 ───
 
 export function listStateFiles() {
   try {

@@ -1,3 +1,7 @@
+// E2E 使用的本地 HTTP/安装包 mock 工具。它创建临时目录、测试包和按路径路由的 HTTP server，
+// 用于在无真实发布服务时验证安装、升级、崩溃与回滚。调用方必须在场景结束时关闭 server；
+// 监听/文件/打包命令失败会 reject Promise 或抛异常，让场景以非零退出码结束。
+
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -5,7 +9,7 @@ import { execSync } from 'node:child_process';
 import os from 'node:os';
 
 /**
- * Generic HTTP mock server with path→handler routing.
+ * 创建按 URL path 分派 handler 的通用 HTTP mock server。
  */
 export function createMockServer(handlers, port = 0) {
   return new Promise((resolve, reject) => {
@@ -34,7 +38,7 @@ export function createMockServer(handlers, port = 0) {
 }
 
 /**
- * Mock webtracking collector — collects POST bodies into an array.
+ * 模拟 webtracking Collector，把 POST 请求体收集到数组中。
  */
 export async function createWebtrackingCollector(port = 0) {
   const received = [];
@@ -72,7 +76,7 @@ export async function createWebtrackingCollector(port = 0) {
 }
 
 /**
- * Serves manifest.json and a tar.gz package file for updater testing.
+ * 为 Updater 测试提供 manifest.json 和 tar.gz 安装包。
  */
 export async function createManifestServer(port = 0, { manifest, packagePath }) {
   const handlers = new Map();
@@ -100,7 +104,7 @@ export async function createManifestServer(port = 0, { manifest, packagePath }) 
 }
 
 /**
- * Generates a minimal tar.gz with a crashing dist/index.js for rollback testing.
+ * 生成包含故障 dist/index.js 的最小 tar.gz，用于回滚测试。
  */
 export function createBrokenPackage(outputPath) {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'broken-pkg-'));
@@ -126,7 +130,7 @@ export function createBrokenPackage(outputPath) {
   fs.writeFileSync(
     path.join(pkgDir, 'scripts', 'collector-daemon.js'),
     `'use strict';
-// Crash immediately so installer health-check detects failure and triggers rollback
+// 立即退出，让安装器健康检查识别失败并触发回滚
 process.exit(1);
 `,
   );
@@ -136,7 +140,7 @@ process.exit(1);
     'process.exit(0);\n',
   );
 
-  // Include the real loongsuite-pilot.sh so installer's install_loongsuite_pilot_command succeeds
+  // 包含真实 loongsuite-pilot.sh，确保安装器的 install_loongsuite_pilot_command 成功。
   const candidates = [
     path.resolve(path.dirname(new URL(import.meta.url).pathname), '../../loongsuite-pilot.sh'),
     '/opt/project/scripts/loongsuite-pilot.sh',

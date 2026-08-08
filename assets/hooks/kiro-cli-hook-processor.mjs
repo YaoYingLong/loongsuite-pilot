@@ -20,6 +20,11 @@
  *   - TOOL span: hook processor 接收时刻兜底（precision 1s，标注 time_source）
  *
  * token: 恒 null（AWS 后端只回吐 credit）；credit 仅作自定义 attribute。
+ *
+ * 当前 stop 不同步读取数据：它把 cwd/offset 等写入 pending 队列并发 SIGUSR1 唤醒主服务，
+ * `KiroCliSessionInput` 等待 sidecar 成熟后另起本脚本的 `delayedCollect` 子命令。后者优先读
+ * SQLite，缺失时回退 `~/.kiro/sessions/cli/*.jsonl`，再与 pre/postToolUse 缓冲关联并写
+ * `logs/kiro-cli/*.jsonl`。所有 Hook 入口 stdout 最终输出 `{}`，采集失败不阻塞 Kiro CLI。
  */
 
 import crypto from 'node:crypto';
@@ -31,7 +36,7 @@ import { readStdinJson } from './shared/stdin-reader.mjs';
 import {
   INITIAL_HASH,
   computeHash,
-  shouldLogFullMessages,  // kept for reference; not called (kiro uses logFull=true directly)
+  shouldLogFullMessages,  // 仅保留作兼容参考；Kiro 当前直接使用 logFull=true，未调用该函数。
   generateTraceId,
   generateSpanId,
   writeJsonlRecords,
@@ -66,10 +71,9 @@ function pilotDataDir() {
 }
 
 /**
- * Send SIGUSR1 to the daemon process so KiroCliSessionInput triggers a
- * collect cycle after its mature delay, rather than waiting for the next
- * 60s fallback poll. Failures are silently ignored — the poll fallback
- * will pick up the pending record within a minute.
+ * 向主服务发送 SIGUSR1，使 KiroCliSessionInput 在成熟延迟后安排采集，而不必等 60 秒轮询。
+ * @param {string} dataDir Pilot 数据目录，其中包含 daemon PID 文件。
+ * @returns {void} PID 缺失、陈旧或目标进程不存在时静默返回，轮询会在一分钟内兜底。
  */
 function wakeDaemon(dataDir) {
   try {
@@ -77,7 +81,7 @@ function wakeDaemon(dataDir) {
     const pid = parseInt(fs.readFileSync(pidFile, 'utf-8').trim(), 10);
     if (pid > 0) process.kill(pid, 'SIGUSR1');
   } catch {
-    // PID file missing, stale, or process gone — fallback poll will handle it.
+    // PID 文件缺失/陈旧或进程已退出时，交给周期轮询兜底。
   }
 }
 
@@ -122,7 +126,7 @@ function isoToMs(iso) {
   return Number.isFinite(ms) ? ms : 0;
 }
 
-// ─── cmd handlers ───
+// ─── 子命令处理器 ───
 
 /**
  * postToolUse: 把 tool_response 缓冲到 per-cwd 文件，stop 时再 join。
@@ -165,7 +169,7 @@ function cmdPreToolUse() {
  * transcript 主干已覆盖 prompt。
  */
 function cmdNoop() {
-  // intentionally empty
+  // 有意为空：prompt 已在 transcript 主干中，额外输出会重复。
 }
 
 /**
@@ -205,22 +209,21 @@ function cmdStop() {
     userId,
   });
 
-  // Wake the daemon so KiroCliSessionInput processes the pending record after
-  // its mature delay instead of waiting for the next 60s fallback poll.
+  // 唤醒 daemon，让 Input 在成熟延迟后处理，而不是等待下一次 60 秒兜底轮询。
   wakeDaemon(pilotDataDir());
 }
 
 /**
- * cmdDelayedCollect: 主服务侧 KiroCliSessionInput 在 pending 成熟后调起。
+ * cmdDelayedCollect：主服务侧 KiroCliSessionInput 在 pending 成熟后调起。
  * argv: node kiro-cli-hook-processor.mjs delayedCollect <pending-file> [--allow-fallback]
  *
- * 读取 pending 记录中的快照 (cwd / sinceMs / sessionSinceMs / assistantResponse / userId)，
+ * 读取 pending 记录中的快照（cwd / sinceMs / sessionSinceMs / assistantResponse / userId），
  * 然后执行与原 cmdStop 等价的采集流程：
- *   1. drain per-cwd PostToolUse / PreToolUse 缓冲
+ *   1. 取出并清空按 cwd 隔离的 PostToolUse / PreToolUse 缓冲
  *   2. 读 SQLite transcript（带轮询）
- *   3. SQLite miss → session JSONL fallback（同样带轮询，但因为已经延迟过，
- *      正常情况下 sidecar 已就绪；--allow-fallback 时即便 timing 不完整也接受）
- *   4. 去重 / 构造 records / 写 JSONL / 推进 offset
+ *   3. SQLite 未命中时回退到 session JSONL（同样带轮询，但因为已经延迟过，
+ *      正常情况下 sidecar 已就绪；--allow-fallback 时即便时序不完整也接受）
+ *   4. 去重 / 构造记录 / 写 JSONL / 推进 offset
  */
 async function cmdDelayedCollect() {
   const pendingPath = process.argv[3];
@@ -257,7 +260,7 @@ async function cmdDelayedCollect() {
     });
     return;
   }
-  // userId 已由 stop hook 时刻 resolve（rendering 与原 cmdStop 等价）。
+  // userId 已在 stop Hook 时刻解析完成（处理方式与原 cmdStop 等价）。
   // assistantResponse 用作 history[] 缺最终 Response 步时的合成兜底。
   const ctx = {
     cwd,
@@ -278,20 +281,20 @@ async function cmdDelayedCollect() {
   try {
     process.stdout.write(JSON.stringify({ status }) + '\n');
   } catch {
-    // ignore
+    // stdout 已关闭时无法通知 Input 层；Hook 侧仍保持 fail-open，不再抛出第二次异常。
   }
 }
 
 /**
  * 核心采集流程（原 cmdStop 主体）。
  *
- * @param {object} ctx
- * @param {string}  ctx.cwd
+ * @param {object} ctx 一条 pending Stop 记录转换出的采集上下文。
+ * @param {string}  ctx.cwd 本次 Kiro 会话的工作目录，也是选择 transcript 的主键之一。
  * @param {number}  ctx.sinceMs            SQLite updated_at 游标
  * @param {number}  ctx.sessionSinceMs     session JSONL updated_at 游标
  * @param {string?} ctx.assistantResponse  stop 事件自带的合成兜底文本
- * @param {string}  ctx.userId
- * @param {boolean} ctx.allowFallback      true: timing 不全也强制 fallback emit
+ * @param {string}  ctx.userId 归一化事件写入的用户标识。
+ * @param {boolean} ctx.allowFallback 为 true 时，即使时序不完整也强制发出回退记录。
  * @returns {Promise<'ok'|'timing_pending'|'no_data'>}
  */
 async function runCollect(ctx) {
@@ -299,8 +302,8 @@ async function runCollect(ctx) {
   const runtimeConfig = loadHookRuntimeConfig(pilotDataDir());
 
   // Offset：处理时现取当前持久化值（参考 codex/claude-code 模式），与 pending 快照取 max。
-  // pending 快照在 stop 时刻写入，若那时 daemon 已挂、state 丢失，快照=0；处理时若 state
-  // 已恢复（current>0），用 current 避免 cold-start 回放。两者都 0 才真 cold-start → 走 stale 检查。
+  // pending 快照在 stop 时刻写入，若那时 daemon 已挂、state 丢失，快照为 0；处理时若 state
+  // 已恢复（current > 0），用当前值避免冷启动回放。两者都为 0 才是真冷启动，需检查陈旧数据。
   const currentSinceMs = loadOffset(cwd);
   const currentSessionSinceMs = loadSessionOffset(cwd);
   const sinceMs = Math.max(typeof ctx.sinceMs === 'number' ? ctx.sinceMs : 0, currentSinceMs || 0);
@@ -330,7 +333,7 @@ async function runCollect(ctx) {
       }
       await new Promise((r) => setTimeout(r, 200 * (1 << attempt)));
     }
-    // Cold-start stale-session skip（SQLite 路径，与 session_jsonl 路径对齐）：
+    // 冷启动陈旧会话跳过逻辑（SQLite 路径，与 session_jsonl 路径对齐）：
     // sinceMs===0（offset 快照在 stop 时已丢）且 SQLite 行 updated_at 距今 >5min
     // → 这是重启前遗留的旧 session 回放，整个跳过。
     if (transcript && transcript.steps.length > 0 && sinceMs === 0 &&
@@ -346,7 +349,7 @@ async function runCollect(ctx) {
     }
   }
 
-  // SQLite miss → session JSONL fallback (with retry + offset)
+  // SQLite 无数据/不可用时，带重试和 offset 回退到 session JSONL。
   if (!transcript || transcript.steps.length === 0) {
     transcript = await trySessionJsonl(cwd, sessionSinceMs, { allowFallback });
   }
@@ -355,7 +358,7 @@ async function runCollect(ctx) {
     return 'no_data';
   }
 
-  // step-level idempotent dedup
+  // 以 step.id 做幂等去重，防止同一 pending 重试重复输出。
   const currentConvId = transcript.conversationId || transcript.continuationId || 'unknown';
   const emittedMap = loadEmittedSteps(cwd);
   const seenIds = emittedMap.get(currentConvId) || new Set();
@@ -372,7 +375,7 @@ async function runCollect(ctx) {
 
   if (newSteps.length === 0) return 'ok';
 
-  // timing 完整性：fallback 模式即使不全也走；否则一旦有 0 → 退回 ready
+  // 时序完整性：回退模式即使不完整也继续；否则一旦出现 0 就退回 ready。
   const allTimingValid = newSteps.every((s) => s.startTimeMs > 0);
   if (!allTimingValid && !allowFallback) {
     return 'timing_pending';
@@ -407,7 +410,7 @@ async function runCollect(ctx) {
 
   if (!writeOk) return 'timing_pending';
 
-  // timing valid 才推进去重 + offset；fallback 强发也同样推进（避免下次重复处理）
+  // 时序有效时才推进去重和 offset；强制回退发出后也推进，避免下次重复处理。
   saveEmittedSteps(cwd, currentConvId, newSteps.map((s) => s.stepId));
   if (transcript.source === 'session_jsonl' && transcript.updatedMs) {
     saveSessionOffset(cwd, transcript.updatedMs);
@@ -419,15 +422,15 @@ async function runCollect(ctx) {
 }
 
 /**
- * session JSONL fallback：扫描 ~/.kiro/sessions/cli/ 找 cwd 匹配的最新 session。
+ * session JSONL 回退：扫描 ~/.kiro/sessions/cli/，查找 cwd 匹配的最新 session。
  * 带 3 次重试 + 指数退避（200ms, 400ms, 800ms），合计 ~1.4s。
  * 因为本函数现在由 delayedCollect 在 30s 等待后调用，sidecar 通常已就绪；
  * 这层重试仅吸收边界毛刺。
  *
- * @param {string} cwd
+ * @param {string} cwd 要匹配的 Kiro 会话工作目录。
  * @param {number} [sinceMs]            session offset，跳过已处理的旧 session
- * @param {object} [opts]
- * @param {boolean} [opts.allowFallback]  true: timing 不全也返回（让 caller emit fallback）
+ * @param {object} [opts] 回退行为选项。
+ * @param {boolean} [opts.allowFallback] 为 true 时，即使时序不完整也返回，让调用方发出回退记录。
  * @returns {Promise<import('./kiro-cli/transcript-parser.mjs').TranscriptData|null>}
  */
 async function trySessionJsonl(cwd, sinceMs = 0, opts = {}) {
@@ -443,9 +446,9 @@ async function trySessionJsonl(cwd, sinceMs = 0, opts = {}) {
     try {
       const session = await readSessionJsonl(cwd, { sinceUpdatedMs: sinceMs });
       if (session && session.steps.length > 0) {
-        // Cold-start stale-session skip: 重启后处理遗留的旧 pending 时，
+        // 冷启动陈旧会话跳过逻辑：重启后处理遗留的旧 pending 时，
         // sinceMs===0 且 session 已陈旧（>5min）→ 这是旧 session 回放，整个跳过。
-        // 用户当前 session 是 recent（<5min），仍正常采。
+        // 用户当前 session 仍较新（小于 5 分钟）时正常采集。
         if (sinceMs === 0 && session.updatedMs > 0 &&
             (Date.now() - session.updatedMs) > COLD_START_STALE_SESSION_MS) {
           logHookError({
@@ -456,7 +459,7 @@ async function trySessionJsonl(cwd, sinceMs = 0, opts = {}) {
           });
           return null;
         }
-        // Cold-start replay protection: sinceMs===0 表示无 prior offset（如 daemon
+        // 冷启动回放保护：sinceMs===0 表示没有先前 offset（例如 daemon
         // 重启擦了 session-offsets），此时 session 文件被从头读，含多个已发过的
         // 历史 Prompt。重发会产重复 span + 多 Prompt 一次采集被 run-gap 切碎。
         // 只保留最后一个 Prompt（最后一个唯一 turnStartMs 的 steps）。
@@ -539,7 +542,7 @@ function buildRecords(transcript, toolEvents, preToolEvents, cwd, userId, stopEv
       : {}),
   };
 
-  // ─── Run-boundary detection ───
+  // ─── 运行批次边界检测 ───
   // conversations_v2 将同 cwd 的多次 --no-interactive 运行合并为一个 conversation。
   // 按 step 时间间隔 > RUN_GAP_MS 拆分运行边界，每个 run 独立 trace_id。
   const RUN_GAP_MS = 30_000;
@@ -604,7 +607,7 @@ function buildRecords(transcript, toolEvents, preToolEvents, cwd, userId, stopEv
       }
     }
 
-    // ── Run-boundary detection ──
+    // ── 当前 step 的运行批次边界检测 ──
     // session_jsonl: 按 Prompt 边界切（turnStartMs 变化 = 新用户 turn = 新 run）。
     //   旧逻辑用 >30s 时间差会误切——inter-Prompt 用户思考时间、工具执行时间都会
     //   把一个 turn 切成 r0/r1/r2，且 daemon 重启后多 Prompt 一次采集时切得更碎。
@@ -623,15 +626,13 @@ function buildRecords(transcript, toolEvents, preToolEvents, cwd, userId, stopEv
       currentTurnId = `${turnIdBase}:r${runIndex}`;
       runStepRound = 0;
     }
-    // Only advance prevEndTimeMs when this step has valid timing; otherwise
-    // a 0-timing step would clobber the cursor and mask the next legitimate
-    // run boundary (allowFallback / partial-sidecar edge).
+    // 只有有效时间才推进 prevEndTimeMs；0 时间会覆盖游标并掩盖下一个真实运行边界。
     if (step.endTimeMs > 0 || step.startTimeMs > 0) {
       prevEndTimeMs = step.endTimeMs || step.startTimeMs;
     }
     runStepRound++;
 
-    // Per-step fields: baseFields + dynamic trace_id / turn_id + react attributes
+    // step 公共字段由 baseFields、动态 trace/turn 和 ReAct 属性组成。
     const stepFinishReason = step.kind === 'NotToolUse' ? 'stop' : 'tool_call';
     const stepFields = {
       ...baseFields,
@@ -666,10 +667,8 @@ function buildRecords(transcript, toolEvents, preToolEvents, cwd, userId, stopEv
     if (stepRound === 1) {
       currentFullHash = computeHash(INITIAL_HASH, inputMsgs);
       delta = inputMsgs;
-      // kiro-cli always logs full messages: step input is non-cumulative
-      // (only previous prompt or tool_result, not a running conversation).
-      // Don't use shared shouldLogFullMessages — that's for agents with
-      // cumulative context (Claude Code) where delta can reconstruct full.
+      // Kiro step 输入不累计，只含当前 prompt 或前一 tool_result，所以始终写完整 messages；
+      // shared shouldLogFullMessages 适用于 Claude 等可用 delta 重建累计上下文的 Agent。
       logFull = true;
     } else {
       currentFullHash = computeHash(runningHash, inputMsgs);
@@ -677,7 +676,7 @@ function buildRecords(transcript, toolEvents, preToolEvents, cwd, userId, stopEv
       logFull = inputMsgs.length > 0;
     }
 
-    // llm.request
+    // 构造 llm.request。
     const reqRecord = {
       time_unix_nano: msToUnixNanos(step.startTimeMs),
       'event.id': crypto.randomUUID(),
@@ -697,7 +696,7 @@ function buildRecords(transcript, toolEvents, preToolEvents, cwd, userId, stopEv
     }
     records.push(reqRecord);
 
-    // output messages:
+    // 构造 response 的 output messages。
     //   - NotToolUse 终步: 真 Response.content
     //   - ToolUse 步: 由 transcript tool_uses[] 合成 tool_call parts（derived=true，
     //     表示模型本轮产出即工具调用，无自然语言文本）。
@@ -908,7 +907,7 @@ function buildRecords(transcript, toolEvents, preToolEvents, cwd, userId, stopEv
 }
 
 /**
- * 规范化工具名：strip @namespace/ 前缀。
+ * 规范化工具名：去掉 @namespace/ 前缀。
  * hook 事件对 MCP 工具发 `@filesystem/write_file`，transcript 解析出 `write_file`；
  * builtin 工具无前缀，不变。规范化后两侧对齐，解决 MCP 工具匹配不上导致
  * tool.call/result 退化为 transcript_estimate 的问题。
@@ -922,7 +921,7 @@ function normalizeToolName(name) {
  * 通用 hook 事件 → tool_use 匹配（consume-on-match，按规范化名 + 顺序消费）。
  * 命中即 splice，解决同名并行工具串台。
  * 不再按 args 深比：hook(snake_case) 与 transcript(camelCase) 字段名永对不上，
- * 且串行工具按顺序消费即可区分（splice first-match 本身就是顺序语义）。
+ * 且串行工具按顺序消费即可区分（splice 的首次匹配本身就是顺序语义）。
  */
 function matchToolEvent(toolEvents, tool, nameKey = 'toolName') {
   const target = normalizeToolName(tool.name);
@@ -1020,7 +1019,7 @@ function deriveToolResultText(step, transcript, tool) {
   return '';
 }
 
-// ─── dispatcher ───
+// ─── 子命令分派 ───
 
 const DISPATCH = {
   'stop': cmdStop,

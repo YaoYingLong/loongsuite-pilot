@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
+# Collector 进程资源采样器，由 `loongsuite-pilot monitor start` 作为后台子进程启动。
+# 它周期性通过 ps/lsof/procfs 收集 CPU、内存、线程、文件描述符和网络连接，按小时写 CSV，
+# `scripts/lib/process-metrics.mjs` 和 Dashboard 随后读取这些 CSV。参数与环境变量可覆盖采样间隔、
+# PID、匹配正则、输出目录和保留时间；收到 TERM/INT 后循环退出，调用方负责 PID 文件清理。
+#
+# `env bash` 从 PATH 选择 Bash；严格模式使命令失败、未定义变量和管道中间失败立即反映为非零退出码。
 set -euo pipefail
 
+# `${VAR:-default}` 表示环境变量未设置或为空时采用默认值，便于服务管理脚本注入自定义数据目录。
 INTERVAL_SECONDS="${INTERVAL_SECONDS:-5}"
 DATA_DIR="${LOONGSUITE_PILOT_DATA_DIR:-$HOME/.loongsuite-pilot}"
 PID_FILE="${LOONGSUITE_PILOT_PID_FILE:-$DATA_DIR/loongsuite-pilot.pid}"
@@ -10,6 +17,7 @@ RETENTION_HOURS="${LOONGSUITE_PILOT_MONITOR_RETENTION_HOURS:-6}"
 CLEANUP_INTERVAL_SECONDS="${LOONGSUITE_PILOT_MONITOR_CLEANUP_INTERVAL_SECONDS:-300}"
 CSV_HEADER="timestamp,pid,ppid,command,cpu_percent,mem_percent,rss_kb,vsz_kb,elapsed,threads,open_files,inet_connections,tcp_established,tcp_listen,udp_connections"
 
+# 打印采样脚本参数和可覆盖环境变量，不启动监控循环。
 usage() {
     echo "Usage: $0 [--interval seconds] [--out-dir path] [--pid pid] [--pattern regex]"
     echo ""
@@ -56,10 +64,12 @@ mkdir -p "$OUT_DIR"
 STATUS_LOG="$OUT_DIR/loongsuite-pilot-monitor.log"
 LAST_CLEANUP_EPOCH=0
 
+# 完成 csv_file_for_now 对应的监控数据计算或安全格式化。
 csv_file_for_now() {
     echo "$OUT_DIR/loongsuite-pilot-process-$(date +%Y-%m-%d-%H).csv"
 }
 
+# 确保 ensure_csv_header 所需目录或稳定脚本与 current 版本一致。
 ensure_csv_header() {
     local csv_file="$1"
     if [ ! -f "$csv_file" ]; then
@@ -67,10 +77,12 @@ ensure_csv_header() {
     fi
 }
 
+# 把带时间戳的状态消息同时写入 stdout，便于后台日志定位采样阶段。
 log_status() {
     printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$STATUS_LOG"
 }
 
+# 按保留小时删除过期 CSV，并通过清理间隔限制 find 调用频率。
 cleanup_old_csvs() {
     local now_epoch
     now_epoch="$(date +%s)"
@@ -89,6 +101,7 @@ cleanup_old_csvs() {
     done
 }
 
+# 完成 count_lsof_rows 对应的监控数据计算或安全格式化。
 count_lsof_rows() {
     local pid="$1"
     shift
@@ -101,6 +114,7 @@ count_lsof_rows() {
     { lsof "$@" -p "$pid" 2>/dev/null || true; } | awk 'END { if (NR > 0) print NR - 1; else print 0 }'
 }
 
+# 完成 count_threads 对应的监控数据计算或安全格式化。
 count_threads() {
     local pid="$1"
 
@@ -112,6 +126,7 @@ count_threads() {
     { ps -M -p "$pid" 2>/dev/null || true; } | awk 'END { if (NR > 1) print NR - 1; else print 0 }'
 }
 
+# 优先使用 PID 文件，再按命令正则发现需要监控的 Collector 进程。
 discover_pids() {
     if [ -n "$TARGET_PID" ]; then
         if kill -0 "$TARGET_PID" 2>/dev/null; then
@@ -139,11 +154,13 @@ discover_pids() {
     '
 }
 
+# 完成 quote_csv 对应的监控数据计算或安全格式化。
 quote_csv() {
     local value="${1//\"/\"\"}"
     printf '"%s"' "$value"
 }
 
+# 采集单个 PID 的 ps/lsof/线程/网络指标并追加一行 CSV。
 sample_pid() {
     local pid="$1"
     local timestamp

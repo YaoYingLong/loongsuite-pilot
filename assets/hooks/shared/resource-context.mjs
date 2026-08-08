@@ -1,6 +1,15 @@
 // Copyright 2026 Alibaba Group Holding Limited
 // SPDX-License-Identifier: Apache-2.0
 
+/**
+ * 从 Hook 子进程环境变量提取资源归属和调用方自定义 span 属性。
+ *
+ * 各 Agent wrapper/processor 继承宿主进程环境，并调用本模块把 worker 名称、实例 ID 和
+ * `LOONGSUITE_PILOT_SPAN_ATTRIBUTES` 转为事件顶层字段。后续 normalization/trace flusher
+ * 再把允许的字段带入 span。输入是不可信环境变量，因此这里限制长度、拒绝敏感字段名和
+ * 管道保留前缀；所有告警只写 stderr，绝不抛错阻塞 Agent。
+ */
+
 const MAX_RESOURCE_FIELD_VALUE_LENGTH = 512;
 const SENSITIVE_FIELD_NAME_RE = /(^|[_.-])(TOKEN|SECRET|PASSWORD|CREDENTIAL|COOKIE)([_.-]|$)|^(API_KEY|API_HEADER)$/i;
 
@@ -9,15 +18,12 @@ export const DEFAULT_RESOURCE_ENV_FIELD_MAP = {
   AGENTTEAMS_INSTANCE_ID: 'agentteams.instance.id',
 };
 
-// Env carrying caller-supplied span attributes as `key=value,key=value`. The
-// host process (e.g. multica daemon) sets this per agent invocation; the hook
-// stamps the parsed pairs onto every record as top-level fields so the trace
-// flusher can pass matching keys through to span attributes.
+// 调用方用 `key=value,key=value` 传入 span 属性。宿主进程会为每次 Agent 调用设置它，
+// Hook 将解析结果铺到记录顶层，供 trace flusher 透传为 span attribute。
 const DEFAULT_SPAN_ATTRIBUTES_ENV = 'LOONGSUITE_PILOT_SPAN_ATTRIBUTES';
 
-// Prefixes reserved for converter-managed / pipeline fields. Caller-supplied
-// keys matching these are dropped so they can't clobber pipeline semantics.
-// Mirrors RESERVED_PREFIXES in src/normalization/global-attributes.ts.
+// 这些前缀由转换器或采集管道管理。拒绝同前缀自定义键，避免调用方覆盖事件语义；该列表应与
+// `src/normalization/global-attributes.ts` 的 `RESERVED_PREFIXES` 保持一致。
 const SPAN_ATTR_RESERVED_PREFIXES = [
   'gen_ai.',
   'git.',
@@ -43,7 +49,7 @@ function warnSkip(agentId, envName, reason) {
   try {
     process.stderr.write(`[${agentId || 'hook'}] skip resource marker ${envName}: ${reason}\n`);
   } catch {
-    // fail-open: hook marker collection must never block the host agent
+    // fail-open：资源标记采集失败绝不能阻塞宿主 Agent。
   }
 }
 
@@ -75,10 +81,13 @@ export function collectResourceAttributesFromEnv(env = process.env, opts = {}) {
 }
 
 /**
- * Parse caller-supplied span attributes from an env var (`key=value,key=value`).
- * Returns a flat `{ field: value }` map suitable for spreading onto records as
- * top-level fields. Reserved-prefix keys, sensitive names, over-long values, and
- * malformed pairs are dropped. Never throws — collection must not block the host.
+ * 解析环境变量中的调用方自定义 span 属性（`key=value,key=value`）。
+ *
+ * 返回扁平 `{ field: value }` 对象，可用展开语法放到事件顶层。格式错误、保留前缀、敏感
+ * 名称和超长值都会被丢弃；value 中第一个 `=` 之后的内容会原样保留。函数不抛异常。
+ * @param {NodeJS.ProcessEnv | Record<string, string>} env 环境变量映射，默认 `process.env`。
+ * @param {{agentId?: string, envName?: string}} opts 告警标识和可覆盖的变量名。
+ * @returns {Record<string, string>} 通过校验的自定义属性。
  */
 export function parseSpanAttributesFromEnv(env = process.env, opts = {}) {
   const agentId = opts.agentId || 'hook';

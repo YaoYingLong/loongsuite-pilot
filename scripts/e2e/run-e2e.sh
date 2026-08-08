@@ -1,23 +1,24 @@
 #!/usr/bin/env bash
-# L1 E2E runner — Docker quick check for current branch code.
+# L1 E2E Shell 入口：读取 `.env.e2e`，构建/启动 Docker 环境，再把场景交给 `run-l1.mjs`。
+# Docker、Node 或场景任一步失败都会因严格模式向调用方返回非零退出码。
 #
-# Usage:
+# 用法：
 #   ./scripts/e2e/run-e2e.sh                  # default scenario: install-smoke
 #   ./scripts/e2e/run-e2e.sh preflight        # validate container only
 #   ./scripts/e2e/run-e2e.sh install-smoke    # install + CLI-agent probe + JSONL/SLS check
 #   ./scripts/e2e/run-e2e.sh uninstall        # install + uninstall + residue check
 #
-# Required env (in .env.e2e):
+# 必需环境变量（写在 .env.e2e 中）：
 #   E2E_USER_ID
 #   E2E_CODEX_OPENAI_API_KEY / E2E_ANTHROPIC_API_KEY / E2E_QODER_PERSONAL_ACCESS_TOKEN
 #   E2E_SLS_PROJECT / E2E_SLS_LOGSTORE / E2E_SLS_ACCESS_KEY_ID / E2E_SLS_ACCESS_KEY_SECRET
-# Optional for full CLI coverage:
+# 完整 CLI 覆盖的可选环境变量：
 #   E2E_CURSOR_API_KEY / E2E_QWEN_API_KEY / E2E_OPENCODE_API_KEY
 #   E2E_QWEN_PROBE_CMD / E2E_OPENCODE_PROBE_CMD
-# Optional: E2E_SLS_ENDPOINT (default cn-hangzhou.log.aliyuncs.com)
-# Debug:    E2E_KEEP_ALIVE=1 (keep container on failure for docker exec)
+# 可选：E2E_SLS_ENDPOINT（默认 cn-hangzhou.log.aliyuncs.com）
+# 调试：E2E_KEEP_ALIVE=1（失败时保留容器，便于执行 docker exec）
 #
-# For L2 (complex scenarios / SSH remote), see docs/E2E-REMOTE-TEST-GUIDE.md.
+# L2（复杂场景/SSH 远程）请参阅 docs/E2E-REMOTE-TEST-GUIDE.md。
 
 set -euo pipefail
 cd "$(dirname "$0")/../.."

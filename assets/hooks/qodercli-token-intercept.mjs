@@ -1,13 +1,14 @@
-// BUN_OPTIONS preload script for qodercli token & system prompt capture.
-// Injected via: BUN_OPTIONS="--preload=<this-file>" qodercli ...
-// Writes to: ~/.loongsuite-pilot/logs/qodercli-intercept.jsonl
-//
-// Two hooks:
-//   JSON.parse  → captures token usage from SSE response (last event with .usage + .choices)
-//   JSON.stringify → captures system prompt before request encryption (first messages array with role=system)
-//
-// NOTE: This file uses require() which is Bun-specific in .mjs context.
-// It only runs under BUN_OPTIONS --preload inside a compiled Bun binary (qodercli).
+/**
+ * qodercli 的 token 与 system prompt 请求侧截获脚本。
+ *
+ * 通过 `BUN_OPTIONS="--preload=<本文件>" qodercli ...` 注入 Bun 进程，临时包装全局
+ * JSON.parse 以观察 SSE 尾部 usage/choices，包装 JSON.stringify 以在请求加密前取得首个
+ * role=system 消息。结果追加到 `~/.loongsuite-pilot/logs/qodercli-intercept.jsonl`，供后续
+ * token enricher 按 response id 合并；本文件不生成正式 history 事件。
+ *
+ * `.mjs` 中的 `require()` 是 Bun preload 特性，普通 Node.js 不应直接运行。每次包装先调用
+ * 原函数并返回同一结果，截获错误全部吞掉，不能改变 qodercli 行为。
+ */
 
 const fs = require("node:fs");
 const path = require("node:path");
@@ -23,8 +24,7 @@ const origStringify = JSON.stringify;
 let lastId = null;
 let systemPromptCaptured = false;
 
-// Global override of JSON.parse to intercept SSE-parsed token usage.
-// Adds ~0.01ms per call (~600 calls/session). Verified <0.2% overhead.
+// 全局包装 JSON.parse 捕获 SSE usage；实测每次约增加 0.01ms、会话总开销低于 0.2%。
 JSON.parse = function (text, reviver) {
   const result = origParse.call(JSON, text, reviver);
   try {
@@ -44,15 +44,14 @@ JSON.parse = function (text, reviver) {
         reasoning_tokens: (u.completion_tokens_details && u.completion_tokens_details.reasoning_tokens) || 0,
         total_tokens: u.total_tokens || 0,
       };
-      // Token records are ~200 bytes, well under PIPE_BUF — atomic on POSIX.
+      // token 记录约 200 字节，小于 POSIX PIPE_BUF，单次追加不会与同类小写入交错。
       fs.appendFileSync(INTERCEPT_FILE, origStringify.call(JSON, rec) + "\n");
     }
   } catch {}
   return result;
 };
 
-// Global override of JSON.stringify to capture system prompt before request encryption.
-// Each process captures at most once (systemPromptCaptured flag).
+// 全局包装 JSON.stringify，在请求加密前捕获 system prompt；每进程最多一次。
 JSON.stringify = function (value, replacer, space) {
   try {
     if (!systemPromptCaptured && value && typeof value === "object"

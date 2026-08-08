@@ -2,23 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 /**
- * state.mjs — Qwen Code CLI session state.
+ * Qwen Code CLI 会话状态。
  *
- * Adapted from assets/hooks/claude-code/state.mjs (same shape, different dir).
+ * 结构复用 Claude Code state，但目录独立。
  *
- * State path: ~/.loongsuite-pilot/state/qwen-code-cli/sessions/<sessionId>.json
+ * 路径：~/.loongsuite-pilot/state/qwen-code-cli/sessions/<sessionId>.json
  *
- * State file shape:
+ * 状态结构：
  *   {
  *     session_id, start_time, cwd,
  *     transcript_path, transcript_offset?,
- *     turn_count,                  // turns already exported (incl. skipped historic)
+ *     turn_count,                  // 已导出 turn 数（含冷启动跳过的历史）
  *     stop_time?,
- *     events: []                   // v2 subagent_start/stop accumulator (unused in v1)
+ *     events: []                   // v2 子 Agent 事件累积器，v1 尚未消费
  *   }
  *
- * Atomic write via temp + rename to avoid half-written reads when concurrent
- * hooks fire (qwen-code's SubagentStart/Stop hooks run alongside Stop).
+ * 使用临时文件 + rename 原子写，防止并发 SubagentStart/Stop 与 Stop 读到半截 JSON。
  */
 
 import fs from 'node:fs';
@@ -51,7 +50,7 @@ export function loadState(sessionId) {
     try {
       return JSON.parse(fs.readFileSync(sf, 'utf-8'));
     } catch (err) {
-      // corrupted — discard and start fresh
+      // 状态损坏时丢弃并重建，避免旧 JSON 阻断 Hook。
       // eslint-disable-next-line no-console
       console.error(
         `[qwen-code-cli-hook] state file for session ${sessionId} corrupted; starting fresh (${err.message})`,
@@ -88,9 +87,7 @@ export function clearState(sessionId) {
 }
 
 /**
- * Read a child (subagent) session state and delete it — used by SubagentStop
- * to merge child state into parent. v1 stores child events but doesn't process
- * them; v2 will unfurl subagent records into the trace.
+ * 读取并删除子 session state，供 SubagentStop 合并到父状态。v1 只保存不输出，v2 才展开 trace。
  */
 export function readAndDeleteChildState(childSessionId) {
   const sf = stateFilePath(childSessionId);
@@ -104,7 +101,7 @@ export function readAndDeleteChildState(childSessionId) {
   }
 }
 
-// ─── Cleanup helpers (for hook-watchdog) ───
+// ─── 清理辅助函数（供 hook-watchdog） ───
 
 export function listStateFiles() {
   try {

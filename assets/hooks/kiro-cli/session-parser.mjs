@@ -18,6 +18,10 @@
  *   session_state.rts_model_state.model_info.model_id
  *
  * fixture 来源: researcher 调研报告中的真实 session JSONL (kiro-cli v2.8.0)
+ *
+ * 调用者是 `kiro-cli-hook-processor.mjs` 的 delayedCollect 路径；当 SQLite 不可用或没有
+ * 新 step 时，本模块按 cwd 选择最新 sidecar/JSONL，恢复 step、工具结果、模型和 credit。
+ * 只读文件，不修改 session；损坏行会跳过，无法找到匹配数据时返回 null。
  */
 
 import fs from 'node:fs';
@@ -139,15 +143,12 @@ export function parseSessionLines(lines, sidecar) {
 
   const steps = [];
   let currentPrompt = '';
-  let currentTurnIndex = -1;  // incremented on each Prompt line; first Prompt → turn 0
+  let currentTurnIndex = -1;  // 每遇到一条 Prompt 递增；第一条 Prompt 对应 turn 0。
   let assistantIndex = 0;
   let toolResultIndex = 0;
   const toolResultMap = new Map();
-  // Per-turn pending step refs (assigned timing on turn flush). Each step
-  // starts with placeholder 0/0 timing; flushTurn divides the turn's
-  // turn_duration evenly across its AssistantMessages so:
-  //   - steps within one turn have non-overlapping start/end
-  //   - steps across turns map to their own turn metadata
+  // 每个 turn 暂存 step 引用，初始时间用 0/0 占位。flushTurn 根据 turn_duration 在
+  // AssistantMessage 间均分，使同 turn 的 step 不重叠、不同 turn 使用各自元数据。
   let pendingTurnSteps = [];
   let pendingTurnIndex = -1;
 
@@ -185,7 +186,7 @@ export function parseSessionLines(lines, sidecar) {
     const data = line.data || {};
 
     if (kind === 'Prompt') {
-      // New Prompt = turn boundary. Flush previous turn's steps first.
+      // 新 Prompt 是 turn 边界，先为上一 turn 的 step 固化时间。
       flushTurn();
       currentTurnIndex++;
       pendingTurnIndex = currentTurnIndex;
@@ -220,8 +221,7 @@ export function parseSessionLines(lines, sidecar) {
 
       const isToolUse = toolUses.length > 0;
 
-      // Timing assigned by flushTurn() once we know how many AssistantMessages
-      // belong to this turn. Initialize to 0/0 sentinel.
+      // 知道本 turn 的 AssistantMessage 总数后由 flushTurn 分配时间；此处先置 0/0 哨兵。
       const step = {
         index: assistantIndex,
         stepId: messageId,
@@ -241,12 +241,8 @@ export function parseSessionLines(lines, sidecar) {
       steps.push(step);
       pendingTurnSteps.push(step);
 
-      // Consume currentPrompt: only the first AssistantMessage after a Prompt
-      // carries the user input. Subsequent AssistantMessages in the same turn
-      // (tool-chain continuations after ToolResults) have no new user input —
-      // their inputMsgs come from toolUseResults instead. Without this clear,
-      // every step in a tool-chain duplicates role:user record → SLS shows
-      // s1==s2 / s3==s4 etc.
+      // currentPrompt 只供 Prompt 后第一条 AssistantMessage 消费；同 turn 后续工具链没有新
+      // user 输入，其 input 来自 toolUseResults。若不清空，每个 step 都会重复 role:user。
       currentPrompt = '';
       assistantIndex++;
       continue;
@@ -261,14 +257,10 @@ export function parseSessionLines(lines, sidecar) {
     }
   }
 
-  // Flush the final turn (no trailing Prompt to trigger boundary).
+  // 文件末尾没有下一个 Prompt 触发边界，显式固化最后一个 turn。
   flushTurn();
 
-  // Map tool results onto subsequent steps as toolUseResults.
-  // For step N (N > 0), the tool results from step N-1's tools form the
-  // input messages (role: "tool") for step N — matching the transcript-parser
-  // behavior where each history entry's user.content.ToolUseResults provides
-  // the prior step's tool outputs.
+  // 把 step N-1 的工具结果映射为 step N 的 role:tool 输入，与 SQLite history 语义一致。
   for (let i = 1; i < steps.length; i++) {
     const prevStep = steps[i - 1];
     if (!prevStep.tools || prevStep.tools.length === 0) continue;
@@ -356,7 +348,7 @@ export async function readSessionJsonl(cwd, opts = {}) {
     try {
       lines.push(JSON.parse(trimmed));
     } catch {
-      // skip malformed
+      // 跳过损坏 JSONL 行，继续恢复其余 step。
     }
   }
 
@@ -365,11 +357,8 @@ export async function readSessionJsonl(cwd, opts = {}) {
   const parsed = parseSessionLines(lines, best.sidecar);
   if (parsed.steps.length === 0) return null;
 
-  // NOTE on opts.sinceUpdatedMs: deliberately NOT used as a step filter.
-  // Step-level dedup happens upstream via `emitted-steps` state. A
-  // step-time-based filter would accidentally drop the whole transcript
-  // because step.endTimeMs typically <= session.updated_at (regression
-  // tested below: "sinceUpdatedMs >= updated_at" must still return full).
+  // `sinceUpdatedMs` 有意不作为 step 过滤器；上层用 emitted-steps 去重。step.endTimeMs 通常
+  // 小于 session.updated_at，若按 step 时间过滤会误丢整个 transcript。
   return {
     conversationId: parsed.conversationId,
     continuationId: parsed.continuationId,

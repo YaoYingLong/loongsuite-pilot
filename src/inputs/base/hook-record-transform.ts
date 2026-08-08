@@ -1,21 +1,35 @@
+/**
+ * 多个 Hook JSONL Input 共用的 canonical 字段转换。
+ *
+ * Claude、OpenCode、Pi、Qwen 等源记录字段接近统一 Schema；本函数处理新旧别名、JSON 内容、
+ * token/tool/error 字段，再调用 Git enrich。返回值已是 AgentActivityEntry，但 user/content/mask
+ * 仍由 InputManager 在更上层统一处理。
+ */
+
 import { ClientType } from '../../types/index.js';
 import type { AgentActivityEntry, AgentEventName } from '../../types/index.js';
 import { buildAgentActivityEntry, normalizeEventName, toJsonValue } from '../../normalization/entry-builder.js';
 import { enrichCanonicalEntryWithGit } from '../../normalization/enrich-git-context.js';
 
+/** 从 record 读取非空字符串。 */
 function getStringValue(data: Record<string, unknown>, key: string): string | undefined {
   const val = data[key];
   return typeof val === 'string' && val.length > 0 ? val : undefined;
 }
 
+/** 从 record 读取有限数字，过滤 NaN/Infinity。 */
 function getNumberValue(data: Record<string, unknown>, key: string): number | undefined {
   const val = data[key];
   return typeof val === 'number' && Number.isFinite(val) ? val : undefined;
 }
 
 /**
- * Shared transformRecord logic for hook-based CLI agent inputs
- * (Claude Code, Codex, and similar transcript-hook agents).
+ * 转换 Hook 记录并按指定 Agent namespace 补齐 Git/workspace。
+ *
+ * @param record 已解析的一行 Hook JSON。
+ * @param agentType 调用方固定 ClientType，覆盖源端可能过时的类型。
+ * @param gitNamespace 查找 `agent.<namespace>.cwd/workspace_roots` 的命名空间。
+ * @returns 标准事件；没有 event.name 时返回 null。
  */
 export async function transformHookRecord(
   record: Record<string, unknown>,
@@ -23,10 +37,12 @@ export async function transformHookRecord(
   gitNamespace: string,
 ): Promise<AgentActivityEntry | null> {
   const rawEventName = getStringValue(record, 'event.name');
+  // event.name 是统一事件的最低要求，缺失记录无法安全分类。
   if (!rawEventName) return null;
   const eventName = normalizeEventName(rawEventName);
 
   const entry = buildAgentActivityEntry({
+    // 先展开原记录保留 Agent 扩展，后续显式字段按 canonical/legacy 优先级覆盖。
     ...record,
     time_unix_nano: getStringValue(record, 'time_unix_nano'),
     observed_time_unix_nano: getStringValue(record, 'observed_time_unix_nano'),
@@ -64,6 +80,7 @@ export async function transformHookRecord(
     'error.message': getStringValue(record, 'error.message'),
   });
   if (entry) {
+    // enrich 是异步 Git 子进程调用，但失败在工具层 fail-open。
     await enrichCanonicalEntryWithGit(entry as Record<string, unknown>, record, gitNamespace);
   }
   return entry;

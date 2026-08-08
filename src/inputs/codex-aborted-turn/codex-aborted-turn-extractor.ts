@@ -1,3 +1,12 @@
+/**
+ * 旧 `CodexAbortedTurnInput` 的 rollout 语义提取器，非当前生产采集主链。
+ *
+ * 调用位置：input 从 checkpoint 指定的字节范围读取并解析 JSONL 后，先调用
+ * `extractCodexTranscriptMeta()` 读取会话元数据，再调用 `extractAbortedTurn()` 把松散的 Codex
+ * 记录聚合为强类型 timeline，随后交给 builder。所有函数均为同步纯转换，不读写文件或网络；
+ * 不可信字段通过 utils 做类型检查，无法确认的记录会跳过，只有真正看到目标 `turn_aborted`
+ * 且时间戳有效时才返回可恢复对象。
+ */
 import * as path from 'node:path';
 import type { JsonValue } from '../../types/index.js';
 import type {
@@ -12,11 +21,17 @@ import type {
 } from './codex-aborted-turn-types.js';
 import { asRecord, stringValue, timestampMs } from './codex-aborted-turn-utils.js';
 
+/** append 回调接收的临时事件类型；`sequence` 由提取器统一生成，调用者无需提供。 */
 type CodexTimelineEventInput =
   | Omit<CodexTimelineAssistantMessage, 'sequence'>
   | Omit<CodexTimelineToolCall, 'sequence'>
   | Omit<CodexTimelineToolResult, 'sequence'>;
 
+/**
+ * 从一条 `session_meta` 记录提取恢复所需的最小会话上下文。
+ * @param record 已完成 JSON 解析的一行 rollout 记录。
+ * @returns 类型或 payload 不匹配时返回 `null`；否则返回带默认 Provider 的元数据。
+ */
 export function extractCodexTranscriptMeta(record: Record<string, unknown>): CodexTranscriptMeta | null {
   if (record.type !== 'session_meta') return null;
   const payload = asRecord(record.payload);
@@ -35,6 +50,17 @@ export function extractCodexTranscriptMeta(record: Record<string, unknown>): Cod
   };
 }
 
+/**
+ * 扫描目标 turn 的记录范围，提取 prompt、模型、assistant 文本、工具调用/结果和 token 快照。
+ * 只有 `task_started/turn_context` 匹配 `expectedTurnId` 后的记录才进入 timeline；工具结果还必须
+ * 能匹配此前见过的 call ID。相同 token 累计值会去重，Codex 注入的 `<turn_aborted>` 用户消息
+ * 不会误当成真实 prompt。
+ * @param records 从 turn 起点到 abort 行末尾的已解析记录。
+ * @param meta 最近一条 session meta；缺失时使用回退值。
+ * @param fallbackSessionId 无 meta 时从文件名推导的 session ID。
+ * @param expectedTurnId checkpoint 正在跟踪的 turn ID。
+ * @returns 完整中断 turn；未找到有效 `turn_aborted` 时间时返回 `null`，让上层写恢复失败诊断。
+ */
 export function extractAbortedTurn(
   records: Record<string, unknown>[],
   meta: CodexTranscriptMeta | null,
@@ -55,6 +81,7 @@ export function extractAbortedTurn(
   let lastUsage: CodexTokenUsage | undefined;
   let sequence = 0;
 
+  /** 为 timeline 事件分配单调 sequence，确保相同毫秒内仍能按原始记录顺序稳定排序。 */
   const appendTimeline = (event: CodexTimelineEventInput): void => {
     const nextSequence = sequence++;
     if (event.kind === 'assistant_message') {
@@ -217,18 +244,24 @@ export function extractAbortedTurn(
   };
 }
 
+/**
+ * 从 `rollout-...-UUID.jsonl` 文件名提取 session ID。
+ * @returns 匹配 UUID 时返回 UUID，否则退回不带扩展名的完整文件名，保证始终有标识。
+ */
 export function sessionIdFromTranscriptPath(filePath: string): string {
   const base = path.basename(filePath, '.jsonl');
   const match = base.match(/([0-9a-f]{8}-[0-9a-f-]{27,})$/i);
   return match?.[1] ?? base;
 }
 
+/** 兼容指令既可能直接是字符串，也可能包装在 `{ text }` 对象中的两种 rollout 形状。 */
 function readInstructionText(value: unknown): string | undefined {
   const record = asRecord(value);
   if (record && typeof record.text === 'string' && record.text) return record.text;
   return stringValue(value);
 }
 
+/** 提取字符串或内容分片数组中的文本，并用换行连接；无法识别的分片会被忽略。 */
 function extractMessageText(content: unknown): string | undefined {
   if (typeof content === 'string' && content) return content;
   if (!Array.isArray(content)) return undefined;
@@ -241,10 +274,12 @@ function extractMessageText(content: unknown): string | undefined {
   return parts.length > 0 ? parts.join('\n') : undefined;
 }
 
+/** 识别 Codex 为中断恢复自动注入的标记，防止把控制消息计入用户 prompt。 */
 function isTurnAbortedInjection(text: string): boolean {
   return text.trimStart().startsWith('<turn_aborted>');
 }
 
+/** 尝试解析字符串形式的工具参数/结果；解析失败时保留原字符串而不是丢失数据。 */
 function parseMaybeJson(value: unknown): unknown {
   if (typeof value !== 'string') return value;
   try {
@@ -254,6 +289,10 @@ function parseMaybeJson(value: unknown): unknown {
   }
 }
 
+/**
+ * 递归把未知值过滤为可 JSON 序列化的值。
+ * 非有限数值、函数等非法值被省略；数组中非法元素会删除，对象中非法字段会跳过。
+ */
 function toJsonValue(value: unknown): JsonValue | undefined {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
   if (typeof value === 'number') return Number.isFinite(value) ? value : undefined;
@@ -273,6 +312,7 @@ function toJsonValue(value: unknown): JsonValue | undefined {
   return out;
 }
 
+/** 从 `token_count.info.last_token_usage` 读取累计 token；缺少必需输入/输出字段时返回空。 */
 function extractLastTokenUsage(value: unknown): CodexTokenUsage | undefined {
   const info = asRecord(value);
   const raw = info && asRecord(info.last_token_usage);
@@ -294,10 +334,12 @@ function extractLastTokenUsage(value: unknown): CodexTokenUsage | undefined {
   };
 }
 
+/** 仅接受有限 number，避免 `NaN/Infinity` 污染标准事件。 */
 function numberValue(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
+/** 比较两个累计 token 快照的所有字段，用于删除连续重复样本。 */
 function sameUsage(left: CodexTokenUsage | undefined, right: CodexTokenUsage): boolean {
   return left !== undefined
     && left.inputTokens === right.inputTokens

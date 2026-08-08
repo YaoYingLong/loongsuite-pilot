@@ -1,3 +1,4 @@
+/** Qoder CN SQLite 增量备用 Input；仅在更优先的 trace 数据源未启用时由 Orchestrator 选择。 */
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -40,12 +41,16 @@ interface QoderCnTokenInfo {
 }
 
 /**
- * QoderCN SQLite — token usage from SharedClientCache/cache/db/local.db.
+ * 从 Qoder CN `SharedClientCache/cache/db/local.db` 增量采集 token usage 的备用 Input。
+ *
+ * BaseSqliteInput 管理周期与 rowid；本类只读查询 chat_message 并生成 llm.response。首次启动
+ * baseline 当前最大 rowid，避免安装后回放全部历史，状态 key 和 ClientType 与国际版隔离。
  */
 export class QoderCnSqliteInput extends BaseSqliteInput {
   readonly id = 'qoder-cn-sqlite';
   readonly agentType = ClientType.QoderCn;
 
+  /** 解析 CN 数据库路径，并将通用状态与轮询配置交给 BaseSqliteInput。 */
   constructor(opts: QoderCnSqliteInputOptions) {
     const dataRoot = opts.dataRoot ?? resolveQoderCnRoot();
     super({
@@ -56,10 +61,12 @@ export class QoderCnSqliteInput extends BaseSqliteInput {
     });
   }
 
+  /** 返回 CN 数据库父目录，供 Agent 发现服务监听。 */
   static getWatchPaths(): string[] {
     return [path.dirname(resolveQoderCnDbPath(resolveQoderCnRoot()))];
   }
 
+  /** 检查默认 CN 数据库是否可访问，不存在或无权限时返回 false。 */
   static async checkAvailability(): Promise<boolean> {
     try {
       await fs.access(resolveQoderCnDbPath(resolveQoderCnRoot()));
@@ -69,6 +76,7 @@ export class QoderCnSqliteInput extends BaseSqliteInput {
     }
   }
 
+  /** 无历史游标时把当前最大可用 rowid 保存为 baseline；失败只告警，不阻止后续轮询。 */
   protected override async onStart(): Promise<void> {
     if (this.stateStore.get(this.id).lastRowId !== undefined) return;
 
@@ -80,6 +88,7 @@ export class QoderCnSqliteInput extends BaseSqliteInput {
     }
   }
 
+  /** 只读查询 lastRowId 之后含合法 token_info 的行，并保持 rowid 顺序。 */
   protected async readNewRows(lastRowId: number): Promise<SqliteRow[]> {
     const sql = `
       SELECT
@@ -101,6 +110,7 @@ export class QoderCnSqliteInput extends BaseSqliteInput {
     return queryReadonly<QoderCnTokenRow>(this.dbPath, sql, [lastRowId]);
   }
 
+  /** 把 CN token 行映射为标准 llm.response；无效 token JSON 返回 null，由基类跳过。 */
   protected async transformRow(row: SqliteRow): Promise<AgentActivityEntry | null> {
     const qoderCnRow = row as QoderCnTokenRow;
     const tokenInfo = parseTokenInfo(qoderCnRow.tokenInfo);
@@ -136,6 +146,7 @@ export class QoderCnSqliteInput extends BaseSqliteInput {
   }
 }
 
+/** 按当前平台和 XDG/APPDATA 约定解析 Qoder CN 数据根目录。 */
 function resolveQoderCnRoot(): string {
   if (process.platform === 'darwin') {
     return resolveHome(DEFAULT_QODER_CN_ROOT_MAC);
@@ -148,10 +159,12 @@ function resolveQoderCnRoot(): string {
   return resolveHome(DEFAULT_QODER_CN_ROOT_LINUX);
 }
 
+/** 将 CN 数据根目录和固定相对路径组合成数据库路径。 */
 function resolveQoderCnDbPath(dataRoot: string): string {
   return path.join(dataRoot, QODER_CN_DB_RELATIVE_PATH);
 }
 
+/** 查询含合法 token_info 的最大 rowid，空表用 0 表示。 */
 function readMaxEligibleRowId(dbPath: string): Promise<number> {
   const sql = `
     SELECT COALESCE(MAX(rowid), 0) AS maxRowId
@@ -164,6 +177,9 @@ function readMaxEligibleRowId(dbPath: string): Promise<number> {
     .then(rows => rows[0]?.maxRowId ?? 0);
 }
 
+/**
+ * 将 sqlite3 的只读打开、查询、关闭回调包装为 Promise；任一步错误都会拒绝 Promise。
+ */
 function queryReadonly<T>(
   dbPath: string,
   sql: string,
@@ -194,6 +210,7 @@ function queryReadonly<T>(
   });
 }
 
+/** 安全解析 CN token_info，只接受普通 JSON 对象。 */
 function parseTokenInfo(raw: string): QoderCnTokenInfo | null {
   try {
     const parsed = JSON.parse(raw) as unknown;
@@ -204,10 +221,12 @@ function parseTokenInfo(raw: string): QoderCnTokenInfo | null {
   }
 }
 
+/** 仅保留有限 number，过滤非数字和非有限值。 */
 function finiteNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined;
 }
 
+/** 输入与输出 token 均存在时相加，否则保持 undefined。 */
 function sumIfPresent(left: number | undefined, right: number | undefined): number | undefined {
   if (left === undefined || right === undefined) return undefined;
   return left + right;

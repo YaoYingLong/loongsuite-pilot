@@ -1,6 +1,8 @@
 /**
- * Helper module to export E2E scenario script generators for testing.
- * This separates the test-exportable functions from the main entry script.
+ * E2E 场景脚本生成器总入口。它组合安装参数、Agent matrix、凭据配置和各阶段 Bash 文本，
+ * 供 `run-l1.mjs` 与 Docker runner 复用，也让测试可单独导入生成器而不执行主程序。
+ * 返回的字符串可能安装/升级/卸载服务、创建用户、重启机器或写测试日志；只有 runner 真正执行时
+ * 才产生这些副作用，因此调用方必须使用隔离容器/测试机并处理超时与退出码。
  */
 
 import {
@@ -23,15 +25,15 @@ import {
 import { buildAgentProbeRemoteBody } from './agent-probe-body.mjs';
 
 /**
- * Default installer URL shared by run-remote-e2e and the per-scenario script generators.
- * Points at the loongsuite-dev OSS bucket so pre-release artifacts are exercised.
+ * `run-remote-e2e` 与各场景脚本生成器共用的默认安装器 URL。
+ * 指向 loongsuite-dev OSS bucket，确保测试覆盖预发布制品。
  */
 export const DEFAULT_E2E_INSTALLER_URL =
   'https://aliyun-observability-release-cn-shanghai.oss-cn-shanghai.aliyuncs.com/loongsuite-dev/loongsuite-pilot/loongsuite-pilot-installer-inner.sh';
 
 
 /**
- * Reboot autostart verification script generator.
+ * 生成“重启后自动启动”验证脚本。
  * 默认自动 sudo reboot。关键技巧：用 `nohup ... &` + `disown` 让 reboot 后台触发，
  * 然后本地脚本主动 exit 0，避免 SSH 被强制断开时得到 "Connection reset by peer" 被误判为失败。
  * @param {string} installerUrl
@@ -48,16 +50,16 @@ set -euo pipefail
 INSTALLER_URL='${u}'
 USER_ID='${id}'
 
-# Step 1: Install pilot
+# 步骤 1：安装 Pilot。
 echo "=== Phase 1: Install loongsuite-pilot ==="
 curl -fsSL "$INSTALLER_URL" | bash -s -- install --user.id "$USER_ID"${installTail}
 command -v loongsuite-pilot >/dev/null
 echo "install: loongsuite-pilot on PATH"
 
-# Step 2: Verify service is running
+# 步骤 2：确认服务正在运行。
 echo "=== Phase 2: Verify initial service status ==="
 loongsuite-pilot status
-# Check systemd (no sudo needed for is-active query) and launchd
+# 检查 systemd 与 launchd；systemctl is-active 查询不需要 sudo。
 if systemctl --user is-active --quiet loongsuite-pilot.service 2>/dev/null; then
   echo "✓ autostart: systemd user unit is active"
 elif systemctl is-active --quiet loongsuite-pilot.service 2>/dev/null; then
@@ -70,23 +72,23 @@ else
   echo "✗ WARNING: service not detected"
 fi
 
-# Step 3: Capture current version and diagnostics
+# 步骤 3：记录当前版本与诊断信息。
 loongsuite-pilot info
 echo "=== Pre-reboot diagnostics ==="
 ps aux | grep -E 'loongsuite-pilot|node.*dist/index' | grep -v grep || true
 ls -la "$HOME/.loongsuite-pilot/current" 2>/dev/null || true
 
-# Step 4: Stop service cleanly before reboot
+# 步骤 4：重启前正常停止服务。
 echo "=== Phase 3: Stop service and prepare reboot ==="
 loongsuite-pilot stop || true
 sleep 2
 
-# Write marker file (proves this is the same machine after reboot)
+# 写入 marker 文件，用于证明重启后连接的仍是同一台机器。
 echo "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$HOME/.loongsuite-pilot/.e2e-reboot-marker"
 echo "✓ Marker written: $HOME/.loongsuite-pilot/.e2e-reboot-marker"
 
-# Step 5: Auto-reboot
-# Check sudo availability (passwordless required for non-interactive ssh pipe)
+# 步骤 5：自动重启。
+# 检查 sudo 可用性；非交互 SSH 管道要求免密码 sudo。
 if ! sudo -n true 2>/dev/null; then
   echo "❌ ERROR: passwordless sudo is required for auto-reboot"
   echo ""
@@ -99,10 +101,10 @@ echo "=== Phase 4: Triggering reboot (SSH will disconnect — this is EXPECTED) 
 echo "ℹ  'Connection reset by peer' / 'Broken pipe' is normal: remote sshd is killed during reboot."
 echo "ℹ  The local runner treats this as SUCCESS for reboot-autostart scenario."
 
-# Key trick: schedule reboot asynchronously and exit immediately.
-# • nohup + & + disown — detach from current shell so SSH can close cleanly
-# • 'sleep 1' delay — gives the local side a chance to receive the final echoes
-# • redirect all output — prevents reboot daemon from holding stdout/stderr
+# 关键处理：异步安排重启并立即退出当前脚本。
+# nohup、后台执行与 disown：脱离当前 Shell，使 SSH 可以正常关闭。
+# sleep 1 延迟：给本地端留出接收最后几行输出的时间。
+# 重定向全部输出：避免重启后台进程继续占用 stdout/stderr。
 nohup bash -c 'sleep 1 && sudo reboot' >/dev/null 2>&1 &
 disown || true
 
@@ -111,20 +113,20 @@ echo "✓ Phase 1 complete. After ~30s, run:"
 echo "    export E2E_SCENARIO=post-reboot-verify"
 echo "    npm run test:e2e:remote"
 
-# Proactively exit with 0 so that SSH disconnect during reboot doesn't surface as error
+# 主动以 0 退出，避免重启导致的 SSH 断开被误报为脚本错误。
 exit 0
 `;
 }
 
 /**
- * Post-reboot verification script generator.
+ * 生成重启后的验证脚本。
  */
 export function postRebootVerificationScript() {
   return `
 set -euo pipefail
 echo "=== Post-Reboot Verification ==="
 
-# Check marker file
+# 检查重启前写入的 marker 文件。
 MARKER="$HOME/.loongsuite-pilot/.e2e-reboot-marker"
 if [ -f "$MARKER" ]; then
   echo "Reboot marker found (written at: $(cat "$MARKER"))"
@@ -133,14 +135,14 @@ else
   exit 1
 fi
 
-# Check if pilot command is available
+# 检查 Pilot 命令是否仍可用。
 if ! command -v loongsuite-pilot >/dev/null; then
   echo "ERROR: loongsuite-pilot not on PATH after reboot"
   exit 1
 fi
 echo "✓ loongsuite-pilot on PATH"
 
-# Check service status
+# 检查服务状态。
 if systemctl --user is-active --quiet loongsuite-pilot.service 2>/dev/null; then
   echo "✓ systemd user unit loongsuite-pilot.service is ACTIVE"
   systemctl --user status loongsuite-pilot.service --no-pager || true
@@ -158,7 +160,7 @@ else
   fi
 fi
 
-# Check updater daemon
+# 检查 Updater 守护进程。
 if systemctl --user is-active --quiet loongsuite-pilot-updater.service 2>/dev/null; then
   echo "✓ updater daemon is ACTIVE (user-level)"
 elif systemctl is-active --quiet loongsuite-pilot-updater.service 2>/dev/null; then
@@ -167,7 +169,7 @@ else
   echo "⚠ updater daemon not detected via systemd (may still be running)"
 fi
 
-# Verify data integrity
+# 验证数据目录完整性。
 if [ -d "$HOME/.loongsuite-pilot" ]; then
   echo "✓ data directory exists"
   ls -la "$HOME/.loongsuite-pilot/" || true
@@ -176,7 +178,7 @@ else
   exit 1
 fi
 
-# Quick version check
+# 快速检查版本。
 loongsuite-pilot info
 
 echo "=== Post-reboot verification PASSED ==="
@@ -184,7 +186,7 @@ echo "=== Post-reboot verification PASSED ==="
 }
 
 /**
- * Multi-account install script generator.
+ * 生成多账号安装场景脚本。
  */
 export function multiAccountInstallScript(installerUrl, userIds, env) {
   const u = installerUrl.replace(/'/g, `'\\''`);
@@ -199,7 +201,7 @@ USER_IDS='${ids}'
 echo "=== Multi-Account Install Test ==="
 echo "User IDs: $USER_IDS"
 
-# Parse comma-separated user IDs
+# 解析逗号分隔的用户 ID。
 IFS=',' read -ra USERS <<< "$USER_IDS"
 
 for i in "\${!USERS[@]}"; do
@@ -209,7 +211,7 @@ for i in "\${!USERS[@]}"; do
   echo ""
   echo "--- Installing for user\${i} (ID: $USER_ID) ---"
   
-  # Check if user exists, create if not
+# 用户不存在时先创建账号。
   if ! id "user\${i}" &>/dev/null; then
     echo "Creating user\${i}..."
     sudo useradd -m -s /bin/bash "user\${i}" || {
@@ -218,7 +220,7 @@ for i in "\${!USERS[@]}"; do
     }
   fi
   
-  # Install pilot for this user
+# 为当前用户安装 Pilot。
   if id "user\${i}" &>/dev/null; then
     sudo -u "user\${i}" bash -c "
       set -euo pipefail
@@ -228,14 +230,14 @@ for i in "\${!USERS[@]}"; do
       test -d \"\$HOME/.loongsuite-pilot\" && echo '✓ data dir created' || echo '✗ data dir missing'
     "
   else
-    # Fallback: install in isolated directory under current user
+# 降级方案：在当前用户目录下创建隔离安装目录。
     mkdir -p "$USER_HOME"
     AGENT_DATA_COLLECTION_CONFIG="$USER_HOME/config.json" curl -fsSL "$INSTALLER_URL" | bash -s -- install --user.id "$USER_ID"${installTail}
     echo "✓ Installed for user\${i} (isolated mode in $USER_HOME)"
   fi
 done
 
-# Verify all installations
+# 验证所有账号的安装结果。
 echo ""
 echo "=== Verification ==="
 for i in "\${!USERS[@]}"; do
@@ -256,7 +258,7 @@ echo "=== Multi-account install test completed ==="
 }
 
 /**
- * Auto-upgrade test script generator.
+ * 生成自动升级测试脚本。
  */
 export function autoUpgradeScript(installerUrl, userId, env) {
   const u = installerUrl.replace(/'/g, `'\\''`);
@@ -270,35 +272,35 @@ USER_ID='${id}'
 
 echo "=== Auto-Upgrade Test ==="
 
-# Phase 1: Initial install
+# 阶段 1：首次安装。
 echo "--- Phase 1: Install pilot ---"
 curl -fsSL "$INSTALLER_URL" | bash -s -- install --user.id "$USER_ID"${installTail}
 command -v loongsuite-pilot >/dev/null
 echo "✓ Initial install successful"
 
-# Capture initial version
+# 记录初始版本。
 INITIAL_VERSION=$(loongsuite-pilot info 2>&1 | head -1)
 INITIAL_COMMIT=$(cat "$HOME/.loongsuite-pilot/VERSION" | grep git_commit | cut -d'=' -f2)
 echo "Initial version: $INITIAL_VERSION"
 echo "Initial commit: $INITIAL_COMMIT"
 
-# Phase 2: Verify initial service running
+# 阶段 2：确认初始服务正在运行。
 echo ""
 echo "--- Phase 2: Verify initial service ---"
 loongsuite-pilot status || true
 ps aux | grep -E 'loongsuite-pilot|node.*dist/index' | grep -v grep || true
 
-# Phase 3: Trigger upgrade
+# 阶段 3：触发升级。
 echo ""
 echo "--- Phase 3: Trigger upgrade ---"
 echo "Running upgrade command..."
 curl -fsSL "$INSTALLER_URL" | bash -s -- upgrade
 
-# Wait for upgrade to complete
+# 等待升级完成。
 echo "Waiting 10s for upgrade to stabilize..."
 sleep 10
 
-# Phase 4: Verify upgraded version
+# 阶段 4：验证升级后的版本。
 echo ""
 echo "--- Phase 4: Verify upgraded version ---"
 if [ -f "$HOME/.loongsuite-pilot/VERSION" ]; then
@@ -317,7 +319,7 @@ else
   exit 1
 fi
 
-# Phase 5: Verify service restarted after upgrade
+# 阶段 5：验证升级后服务已经重启。
 echo ""
 echo "--- Phase 5: Verify service auto-restart ---"
 if systemctl --user is-active --quiet loongsuite-pilot.service 2>/dev/null; then
@@ -335,7 +337,7 @@ else
   fi
 fi
 
-# Phase 6: Verify data integrity
+# 阶段 6：验证数据完整性。
 echo ""
 echo "--- Phase 6: Verify data integrity ---"
 if [ -f "$HOME/.loongsuite-pilot/config.json" ]; then
@@ -489,7 +491,7 @@ _run_agent_matrix '${pkg}' '${bin}' '${label}' '${probeB64}'
   return `
 set +e
 ${prologue}
-# prepend npm global bin to avoid stale PATH symlinks
+# 把 npm 全局 bin 放到 PATH 前面，避免命中陈旧软链接。
 _NPM_PREFIX="$(npm config get prefix 2>/dev/null || true)"
 if [ -n "$_NPM_PREFIX" ] && [ -d "$_NPM_PREFIX/bin" ]; then
   export PATH="$_NPM_PREFIX/bin:$HOME/.local/bin:$PATH"
@@ -499,7 +501,7 @@ fi
 
 echo "[version-matrix] mode=serial; versions_per_agent=${n}; filter=\${E2E_AGENT_VERSIONS_FILTER:-<none>}; npm_prefix=\${_NPM_PREFIX:-<unknown>}"
 
-# remove stale ~/.local/bin/<bin> -> qodercli symlinks left by old scripts
+# 删除旧脚本遗留的 ~/.local/bin/<bin> -> qodercli 软链接。
 _cleanup_stale_bin() {
   _b="$1"
   [ "$_b" = "qoder" ] && return 0
@@ -521,7 +523,7 @@ if ! command -v node >/dev/null 2>&1; then
   exit 2
 fi
 
-# auto-upgrade Node via nvm if below min (old Node may crash newer CLI bundles)
+# Node 版本低于下限时通过 nvm 自动升级；旧 Node 可能无法运行新版 CLI bundle。
 _MIN_NODE_MAJOR="\${E2E_VERSION_MATRIX_MIN_NODE:-22}"
 _AUTO_UPGRADE_NODE="\${E2E_VERSION_MATRIX_AUTO_UPGRADE_NODE:-1}"
 _node_major() { node -v 2>/dev/null | sed -E 's/^v([0-9]+).*/\\1/'; }
@@ -557,7 +559,7 @@ if [ -z "$_cur_major" ] || [ "$_cur_major" -lt "$_MIN_NODE_MAJOR" ] 2>/dev/null;
   nvm use "$_MIN_NODE_MAJOR" >/dev/null 2>&1 || { echo "[version-matrix] ERROR: nvm use $_MIN_NODE_MAJOR failed"; exit 2; }
   nvm alias default "$_MIN_NODE_MAJOR" >/dev/null 2>&1 || true
 
-  # old-glibc hosts (Linux 7U / CentOS 7): apply Aliyun patchelf if node -v fails
+# 旧 glibc 主机（Linux 7U/CentOS 7）在 node -v 失败时应用阿里云 patchelf 兼容处理。
   _AUTO_PATCHELF="\${E2E_VERSION_MATRIX_AUTO_PATCHELF:-1}"
   _node_try="$(node -v 2>&1)"
   _node_try_st=$?
@@ -685,7 +687,7 @@ _run_agent_matrix() {
       npm uninstall -g "\${_pkg}" >/dev/null 2>&1 || true
       continue
     fi
-    # dedup codex [hooks.state."..."] to avoid duplicate-key warnings
+# 去重 Codex [hooks.state."..."]，避免 TOML 重复 key 警告。
     if [ "\${_bin}" = "codex" ] && [ -f "$HOME/.codex/config.toml" ]; then
       _cfg="$HOME/.codex/config.toml"
       awk '
@@ -768,6 +770,7 @@ const OPTIONAL_COVERAGE = [
   'gen_ai.tool.call.id',
 ];
 
+/** 列出指定目录顶层的 JSONL 文件；目录不存在或不是目录时返回空数组。 */
 function listJsonl(dir) {
   if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) return [];
   return fs.readdirSync(dir)
@@ -775,12 +778,14 @@ function listJsonl(dir) {
     .map(f => path.join(dir, f));
 }
 
+/** 内部函数同步地判断 matchesAgentFilter 的条件，不产生文件、网络或进程副作用。 */
 function matchesAgentFilter(file) {
   if (!AGENT_FILTER.length) return true;
   const base = path.basename(file, '.jsonl').toLowerCase();
   return AGENT_FILTER.some(a => base.startsWith(a + '-') || base === a);
 }
 
+/** 内部函数同步地判断 withinWindow 的条件，不产生文件、网络或进程副作用。 */
 function withinWindow(entry) {
   if (!SINCE_SECONDS || SINCE_SECONDS <= 0) return true;
   const ns = entry && entry.time_unix_nano;
@@ -789,6 +794,7 @@ function withinWindow(entry) {
   return (Date.now() - ms) <= SINCE_SECONDS * 1000;
 }
 
+/** 把计数除以总数并格式化为一位小数百分比，分母为零时返回 0.0%。 */
 function pct(num, total) {
   if (!total) return '0.0%';
   return ((num / total) * 100).toFixed(1) + '%';
@@ -886,7 +892,7 @@ export function buildJsonlValidationSh(env = process.env) {
   if ((env?.E2E_JSONL_VALIDATE ?? '1').toString().trim() === '0') return '';
   const b64 = Buffer.from(JSONL_VALIDATOR_JS, 'utf8').toString('base64');
   return `
-# === [jsonl-validate] AgentActivityEntry schema check (src/types/events.ts) ===
+# === [jsonl-validate] AgentActivityEntry schema 校验（src/types/events.ts）===
 if ! command -v node >/dev/null 2>&1; then
   echo "[jsonl-validate] WARN: node not on PATH — skipping schema check"
 else
@@ -912,12 +918,11 @@ fi
 }
 
 // ──────────────────────────────────────────────────────────
-// File Collection E2E validation
+// 文件采集 E2E 验证。
 // ──────────────────────────────────────────────────────────
 
 /**
- * Build a bash script that creates a file-collection config + test log files,
- * waits for pilot to pick them up, and verifies the pipeline processed them.
+ * 构建 Bash 脚本：创建文件采集配置和测试日志，等待 Pilot 发现，并验证管道已经处理这些文件。
  */
 export function buildFileCollectionValidationSh() {
   return `
@@ -925,7 +930,7 @@ set -euo pipefail
 echo ""
 echo "=== [file-collection-e2e] File Collection Pipeline Validation ==="
 
-# Step 0: Enable file collection in pilot config and restart
+# 步骤 0：在 Pilot 配置中启用文件采集并重启。
 echo "[file-collection-e2e] Step 0: Enabling fileCollection in config.json..."
 PILOT_CONFIG="$HOME/.loongsuite-pilot/config.json"
 
@@ -961,7 +966,7 @@ fc_state_file() {
   echo "$FC_STATE_DIR/$FC_CONFIG_NAME.json"
 }
 
-# Step 1: Create test log directory and write test data
+# 步骤 1：创建测试日志目录并写入测试数据。
 echo "[file-collection-e2e] Step 1: Creating test log files..."
 mkdir -p "$FC_TEST_LOG_DIR"
 for i in $(seq 1 20); do
@@ -969,11 +974,11 @@ for i in $(seq 1 20); do
 done
 echo "[file-collection-e2e] wrote 20 lines to $FC_TEST_LOG_DIR/app.log"
 
-# Step 2: Create file-collection config using real SLS endpoint from E2E env
+# 步骤 2：使用 E2E 环境中的真实 SLS endpoint 创建文件采集配置。
 echo "[file-collection-e2e] Step 2: Creating file-collection config..."
 mkdir -p "$FC_CONFIG_DIR"
 
-# Read SLS config from pilot's config.json (written by installer with real E2E_SLS_* values)
+# 从 Pilot config.json 读取安装器写入的真实 E2E_SLS_* 配置。
 FC_SLS_ENDPOINT=$(node -e "try{const c=require('$HOME/.loongsuite-pilot/config.json');const e=c.sls?.endpoint||'';console.log(e.replace(/^https?:\\/\\//,''))}catch{console.log('cn-hangzhou.log.aliyuncs.com')}" 2>/dev/null)
 FC_SLS_PROJECT=$(node -e "try{const c=require('$HOME/.loongsuite-pilot/config.json');console.log(c.sls?.project||'e2e-test-project')}catch{console.log('e2e-test-project')}" 2>/dev/null)
 FC_SLS_LOGSTORE=$(node -e "try{const c=require('$HOME/.loongsuite-pilot/config.json');console.log(c.sls?.logstore||'e2e-test-logstore')}catch{console.log('e2e-test-logstore')}" 2>/dev/null)
@@ -1002,8 +1007,8 @@ require('fs').writeFileSync(process.argv[5], JSON.stringify(config, null, 2));
 echo "[file-collection-e2e] config written: $FC_CONFIG_DIR/$FC_CONFIG_NAME.json"
 cat "$FC_CONFIG_DIR/$FC_CONFIG_NAME.json"
 
-# Step 3: Wait for pilot to detect the config and process files
-# FileCollectionManager rescans every 60s; we also trigger via fs.watch.
+# 步骤 3：等待 Pilot 发现配置并处理文件。
+# FileCollectionManager 每 60 秒重扫一次，同时也会由 fs.watch 触发。
 echo "[file-collection-e2e] Step 3: Waiting for pilot to process config (up to 90s)..."
 TIMEOUT=90
 ELAPSED=0
@@ -1019,17 +1024,17 @@ while [ $ELAPSED -lt $TIMEOUT ]; do
   ELAPSED=$((ELAPSED + 3))
 done
 
-# Step 4: Validate results
+# 步骤 4：验证处理结果。
 echo "[file-collection-e2e] Step 4: Validating results..."
 FC_FAIL=0
 
-# Check state file exists and is non-empty
+# 检查状态文件存在且非空。
 if [ -f "$(fc_state_file)" ]; then
   STATE_CONTENT=$(cat "$(fc_state_file)")
   STATE_SIZE=$(echo -n "$STATE_CONTENT" | wc -c | tr -d ' ')
   if [ "$STATE_SIZE" -gt 2 ]; then
     echo "[file-collection-e2e] OK: state file exists and has content (\${STATE_SIZE}B)"
-    # Check that offset was advanced (file was read)
+# 检查 offset 已推进，证明文件确实被读取。
     if echo "$STATE_CONTENT" | grep -q '"lastOffset"'; then
       echo "[file-collection-e2e] OK: state contains lastOffset (file was read)"
     else
@@ -1049,7 +1054,7 @@ else
   FC_FAIL=1
 fi
 
-# Check service log for file-collection activity
+# 检查服务日志中的文件采集活动。
 if grep -q "FileCollectionManager.*started" $FC_SERVICE_LOG_GLOB 2>/dev/null; then
   echo "[file-collection-e2e] OK: FileCollectionManager started in service log"
 else
@@ -1062,7 +1067,7 @@ else
   echo "[file-collection-e2e] WARN: FilePipeline start not found in service log"
 fi
 
-# Step 5: Test log rotation (write more data to verify incremental read)
+# 步骤 5：测试日志轮转，并追加数据验证增量读取。
 echo ""
 echo "[file-collection-e2e] Step 5: Testing incremental read..."
 OFFSET_BEFORE=""
@@ -1076,7 +1081,7 @@ for i in $(seq 21 30); do
 done
 echo "[file-collection-e2e] appended 10 more lines"
 
-# Wait for next poll cycle
+# 等待下一个轮询周期。
 sleep 15
 
 OFFSET_AFTER=""
@@ -1092,30 +1097,30 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────
-# Step 6: Rename rotation test
+# 步骤 6：测试 rename 轮转。
 # ──────────────────────────────────────────────────────────
 echo ""
 echo "[file-collection-e2e] Step 6: Testing RENAME rotation..."
 
-# 6a. Record current state (offset + inode) before rotation
+# 6a：轮转前记录当前 offset 与 inode。
 INODE_BEFORE=$(node -e "try{const s=require('$(fc_state_file)');const k=Object.keys(s)[0];const e=s[k]?.extra||{};console.log(e.inode||0)}catch{console.log(0)}" 2>/dev/null || echo "0")
 OFFSET_BEFORE=$(node -e "try{const s=require('$(fc_state_file)');const k=Object.keys(s)[0];console.log(s[k]?.lastOffset||0)}catch{console.log(0)}" 2>/dev/null || echo "0")
 echo "[file-collection-e2e] before rename: inode=$INODE_BEFORE offset=$OFFSET_BEFORE"
 
-# 6b. Append lines that haven't been collected yet (simulate unread tail)
+# 6b：追加尚未采集的行，模拟未读文件尾。
 for i in $(seq 1 5); do
   echo "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ) [INFO] rename-pre-rotate-line-$i" >> "$FC_TEST_LOG_DIR/app.log"
 done
 echo "[file-collection-e2e] appended 5 lines before rotation (these must be drained from old file)"
 
-# 6c. Simulate rename rotation: mv app.log -> app.log.1, create new app.log
+# 6c：模拟 rename 轮转，把 app.log 移为 app.log.1，再创建新的 app.log。
 mv "$FC_TEST_LOG_DIR/app.log" "$FC_TEST_LOG_DIR/app.log.1"
 for i in $(seq 1 5); do
   echo "$(date -u +%Y-%m-%dT%H:%M:%S.%3NZ) [INFO] rename-post-rotate-line-$i" >> "$FC_TEST_LOG_DIR/app.log"
 done
 echo "[file-collection-e2e] renamed app.log -> app.log.1, created new app.log with 5 lines"
 
-# 6d. Wait for poll cycle to detect rotation and drain
+# 6d：等待轮询发现轮转并读完旧文件。
 sleep 15
 
 INODE_AFTER=$(node -e "try{const s=require('$(fc_state_file)');const k=Object.keys(s)[0];const e=s[k]?.extra||{};console.log(e.inode||0)}catch{console.log(0)}" 2>/dev/null || echo "0")
@@ -1136,7 +1141,7 @@ else
   FC_FAIL=1
 fi
 
-# 6e. Verify old file drain via service log
+# 6e：通过服务日志确认旧文件已经读完。
 if grep -q "drained old file after rotation" $FC_SERVICE_LOG_GLOB 2>/dev/null; then
   echo "[file-collection-e2e] OK: old file drain logged (unread lines from app.log.1 collected)"
 else
@@ -1144,18 +1149,18 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────
-# Step 7: Copytruncate rotation test
+# 步骤 7：测试 copytruncate 轮转。
 # ──────────────────────────────────────────────────────────
 echo ""
 echo "[file-collection-e2e] Step 7: Testing COPYTRUNCATE rotation..."
 
-# 7a. Wait for current data to be collected
+# 7a：等待当前数据完成采集。
 sleep 15
 OFFSET_BEFORE_CT=$(node -e "try{const s=require('$(fc_state_file)');const k=Object.keys(s)[0];console.log(s[k]?.lastOffset||0)}catch{console.log(0)}" 2>/dev/null || echo "0")
 INODE_BEFORE_CT=$(node -e "try{const s=require('$(fc_state_file)');const k=Object.keys(s)[0];const e=s[k]?.extra||{};console.log(e.inode||0)}catch{console.log(0)}" 2>/dev/null || echo "0")
 echo "[file-collection-e2e] before copytruncate: inode=$INODE_BEFORE_CT offset=$OFFSET_BEFORE_CT"
 
-# 7b. Simulate copytruncate: cp app.log -> app.log.2, truncate app.log, write new data
+# 7b：复制 app.log 为 app.log.2、截断原文件并写入新数据，模拟 copytruncate。
 cp "$FC_TEST_LOG_DIR/app.log" "$FC_TEST_LOG_DIR/app.log.2"
 : > "$FC_TEST_LOG_DIR/app.log"
 for i in $(seq 1 5); do
@@ -1163,7 +1168,7 @@ for i in $(seq 1 5); do
 done
 echo "[file-collection-e2e] copytruncate done: truncated app.log, wrote 5 new lines"
 
-# 7c. Wait for poll cycle
+# 7c：等待下一个轮询周期。
 sleep 15
 
 INODE_AFTER_CT=$(node -e "try{const s=require('$(fc_state_file)');const k=Object.keys(s)[0];const e=s[k]?.extra||{};console.log(e.inode||0)}catch{console.log(0)}" 2>/dev/null || echo "0")
@@ -1183,21 +1188,21 @@ else
   FC_FAIL=1
 fi
 
-# Verify truncation detection in service log
+# 通过服务日志验证截断检测。
 if grep -q "copytruncate rotation" $FC_SERVICE_LOG_GLOB 2>/dev/null; then
   echo "[file-collection-e2e] OK: copytruncate rotation detected in service log"
 else
   echo "[file-collection-e2e] WARN: copytruncate detection not found in service log"
 fi
 
-# 7d. Edge case: copytruncate where new data exceeds old offset (signature-based detection)
+# 7d：边界场景，新数据超过旧 offset，验证基于签名的 copytruncate 检测。
 echo ""
 echo "[file-collection-e2e] Step 7b: Testing copytruncate with new data exceeding old offset..."
 sleep 15
 OFFSET_BEFORE_SIG=$(node -e "try{const s=require('$(fc_state_file)');const k=Object.keys(s)[0];console.log(s[k]?.lastOffset||0)}catch{console.log(0)}" 2>/dev/null || echo "0")
 echo "[file-collection-e2e] current offset: $OFFSET_BEFORE_SIG"
 
-# Simulate: cp + truncate + write MORE data than old file size
+# 模拟复制、截断，再写入比旧文件更大的数据量。
 cp "$FC_TEST_LOG_DIR/app.log" "$FC_TEST_LOG_DIR/app.log.3"
 : > "$FC_TEST_LOG_DIR/app.log"
 for i in $(seq 1 50); do
@@ -1220,7 +1225,7 @@ else
 fi
 
 # ──────────────────────────────────────────────────────────
-# Step 8: Rotated file count check
+# 步骤 8：检查轮转文件数量。
 # ──────────────────────────────────────────────────────────
 echo ""
 echo "[file-collection-e2e] Step 8: Rotated file handling summary..."
@@ -1232,7 +1237,7 @@ echo "[file-collection-e2e] INFO: glob pattern *.log only matches app.log, rotat
 ls -la "$FC_TEST_LOG_DIR"/ 2>/dev/null
 
 # ──────────────────────────────────────────────────────────
-# Step 9: Verify data delivery status
+# 步骤 9：验证数据投递状态。
 # ──────────────────────────────────────────────────────────
 echo ""
 echo "[file-collection-e2e] Step 9: Verifying data delivery..."
@@ -1251,7 +1256,7 @@ else
   echo "[file-collection-e2e] OK: no failed-log (all data delivered to SLS successfully)"
 fi
 
-# Cleanup
+# 清理
 echo ""
 echo "[file-collection-e2e] Cleaning up test config..."
 rm -f "$FC_CONFIG_DIR/$FC_CONFIG_NAME.json"
@@ -1268,10 +1273,10 @@ fi
 }
 
 // ──────────────────────────────────────────────────────────
-// Helpers used by both run-l1.mjs and run-docker-e2e.mjs.
-// Moved from run-docker-e2e.mjs so L1 can reuse without copy.
+// run-l1.mjs 与 run-docker-e2e.mjs 共用的辅助函数；移到本模块后 L1 无需复制实现。
 // ──────────────────────────────────────────────────────────
 
+/** 生成仅检查操作系统、Node、npm、Agent CLI 和网络前置条件的 Bash，不安装 Pilot。 */
 export function preflightScript() {
   return `
 set -euo pipefail
@@ -1296,6 +1301,7 @@ echo "Running inside Docker container"
 `;
 }
 
+/** 生成从当前挂载源码构建发布包并调用本地安装器的 Bash，供 L1 场景复用。 */
 export function localBuildInstallScript(userId, env) {
   const id = (userId || '').replace(/'/g, `'\\''`);
 
@@ -1349,6 +1355,7 @@ const os = require('os');
 const path = require('path');
 const p = path.join(os.homedir(), '.loongsuite-pilot', 'config.json');
 const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
+/** 同步地对 redact 输入中的凭据字段脱敏，避免测试日志泄露 secret。 */
 function redact(value, key = '') {
   if (Array.isArray(value)) return value.map(v => redact(v));
   if (value && typeof value === 'object') {
@@ -1369,9 +1376,8 @@ echo "[installer-e2e] installer flow complete"
 }
 
 /**
- * Build a bash script that validates cli-probe.cjs detection results.
- * Runs the probe independently and asserts expected agents are detected
- * (cursor via ~/.cursor path, CLI agents via command lookup).
+ * 构建验证 cli-probe.cjs 发现结果的 Bash 脚本：独立运行 probe，并断言发现预期 Agent。
+ * Cursor 通过 `~/.cursor` 路径识别，CLI Agent 通过命令查找识别。
  */
 export function buildProbeDetectionValidationScript(requiredAgentsCsv = 'claude-code,codex,qoder,cursor,qwen-code-cli,opencode') {
   const requiredAgents = requiredAgentsCsv.split(',').map(s => s.trim()).filter(Boolean).join(' ');
@@ -1418,6 +1424,7 @@ echo "[probe-validate] ALL expected agents detected successfully"
 `;
 }
 
+/** 生成下载/执行卸载器并检查服务、命令与已注入配置残留的 Bash。 */
 export function uninstallScript(installerUrl) {
   const u = installerUrl.replace(/'/g, `'\\''`);
   return `
@@ -1429,8 +1436,8 @@ echo "uninstall: script finished"
 }
 
 /**
- * Build a bash script that checks all required agents have produced non-empty JSONL files.
- * @param {string} requiredAgentsCsv - comma-separated agent prefixes (e.g. "claude-code,codex,qoder")
+ * 构建 Bash 脚本，检查全部必需 Agent 都已生成非空 JSONL 文件。
+ * @param {string} requiredAgentsCsv 逗号分隔的 Agent 前缀，例如 `claude-code,codex,qoder`。
  */
 export function buildJsonlAgentCoverageCheck(requiredAgentsCsv) {
   const agents = requiredAgentsCsv.split(',').map(s => s.trim()).filter(Boolean);
@@ -1471,11 +1478,10 @@ export function buildJsonlAgentCoverageCheck(requiredAgentsCsv) {
 }
 
 /**
- * Build script that writes agent configs (codex config.toml, claude onboarding, proxy).
- * Should run before `waitForPilotReady`: pilot polls discovery every 30s, so as long
- * as configs land before the 180s readiness wait completes, pilot will pick them up
- * within the wait window. (Runs after `loongsuite-pilot start` in install-smoke; the
- * first poll may see no configs, but a subsequent poll will.)
+ * 构建写入 Agent 配置的脚本，包括 Codex config.toml、Claude onboarding 与 proxy。
+ * 它应在 `waitForPilotReady` 前运行：Pilot 每 30 秒轮询发现，只要配置在 180 秒就绪等待结束前
+ * 落盘，就会在窗口内被发现。install-smoke 中它在 `loongsuite-pilot start` 后运行，因此首次轮询
+ * 可能尚无配置，但后续轮询会看到。
  */
 export function buildAgentConfigSetupScript(env) {
   let body = '';
@@ -1485,6 +1491,7 @@ export function buildAgentConfigSetupScript(env) {
   return body;
 }
 
+/** 内部函数同步地判断 shouldEnsureAgentClis 的条件，不产生文件、网络或进程副作用。 */
 function shouldEnsureAgentClis(env, useMatrixProbe) {
   const v = env.E2E_ENSURE_AGENT_CLIS?.trim().toLowerCase();
   if (v === '0' || v === 'false' || v === 'no') return false;
@@ -1492,6 +1499,7 @@ function shouldEnsureAgentClis(env, useMatrixProbe) {
   return useMatrixProbe;
 }
 
+/** 导出函数同步地构建 buildAgentEnsureOnlyScript 对应的配置或脚本文本；只有调用方执行返回值时才产生外部副作用。 */
 export function buildAgentEnsureOnlyScript(env) {
   const useMatrix = env.E2E_USE_MATRIX_PROBE?.trim() === '1';
   if (!shouldEnsureAgentClis(env, useMatrix)) return '';
@@ -1501,8 +1509,8 @@ export function buildAgentEnsureOnlyScript(env) {
 }
 
 /**
- * Build the probe-only script (ensure CLIs + run probes).
- * Agent configs must already be written and plugins deployed before this runs.
+ * 构建仅执行 probe 的脚本，先确认 CLI 再运行 probes。
+ * 调用前必须已经写好 Agent 配置并部署插件。
  */
 export function buildAgentProbeOnlyScript(env) {
   const useMatrix = env.E2E_USE_MATRIX_PROBE?.trim() === '1';
@@ -1528,6 +1536,7 @@ export function buildAgentProbeOnlyScript(env) {
   return body;
 }
 
+/** 导出函数同步地构建 buildProbeEnvInjections 对应的配置或脚本文本；只有调用方执行返回值时才产生外部副作用。 */
 export function buildProbeEnvInjections(env) {
   const chunks = [buildRemoteSecretExportsSh(env)];
   const tok = normalizeE2eQoderPersonalAccessToken(env.E2E_QODER_PERSONAL_ACCESS_TOKEN);

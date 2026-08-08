@@ -1,3 +1,12 @@
+/**
+ * Agent 安装可用性的通用只读探测工具。
+ *
+ * 声明中的 paths 与 commands 是“或”关系：路径支持逐层 `*`/`?` 匹配，命令通过
+ * Windows `where.exe` 或 Unix `which` 子进程查询 PATH。缺失目录、权限错误和非零
+ * 退出码都按“未检测到”处理，不向安装器或 Collector 抛出探测异常。
+ */
+
+
 import { execFile } from 'node:child_process';
 import { promises as fsp } from 'node:fs';
 import * as path from 'node:path';
@@ -46,6 +55,7 @@ export function commandExists(command: string): Promise<boolean> {
   });
 }
 
+/** 判断路径片段是否包含本模块支持的 `*` 或 `?`。 */
 function hasGlob(p: string): boolean {
   return p.includes('*') || p.includes('?');
 }
@@ -64,6 +74,9 @@ async function globHasMatch(pattern: string): Promise<boolean> {
   return walk(root, segments, startIdx);
 }
 
+/**
+ * 逐路径层递归匹配；普通片段直接下探，glob 片段才 readdir，所有 I/O 异常返回 false。
+ */
 async function walk(current: string, segments: string[], idx: number): Promise<boolean> {
   if (idx >= segments.length) {
     // 所有片段均已消费后仍需 stat，确认最终条目真实存在。
@@ -94,6 +107,7 @@ async function walk(current: string, segments: string[], idx: number): Promise<b
   return false;
 }
 
+/** 将单个 glob 片段转换为首尾锚定正则，其余正则元字符按字面转义。 */
 function globToRegex(glob: string): RegExp {
   // 仅赋予 * 和 ? 通配语义，其余正则特殊字符全部按字面量转义。
   let body = '';

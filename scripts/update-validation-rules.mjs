@@ -1,13 +1,15 @@
 #!/usr/bin/env node
 
 /**
- * Parse gen-ai.md from local file or GitLab API and generate/update
- * docs/trace-validation-rules.json.
+ * Trace 校验规则生成器：从本地 `gen-ai.md` 或 GitLab raw URL 读取语义约定，
+ * 解析属性表、Span 类型与 operation kind 映射，再生成 `docs/trace-validation-rules.json`。
+ * 该工具用于维护校验基线，不参与 Collector 运行时；网络/解析/写文件错误会沿 `await`
+ * 传播到顶层并使进程以退出码 1 结束。
  *
- * Usage:
+ * 用法：
  *   node scripts/update-validation-rules.mjs --spec-file <path>
  *   node scripts/update-validation-rules.mjs --spec-url <gitlab-raw-url>
- *   node scripts/update-validation-rules.mjs                  (default: local arms/ copy)
+ *   node scripts/update-validation-rules.mjs                  （默认读取本地 arms 副本）
  */
 
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
@@ -20,7 +22,7 @@ const TAG = '[update-rules]';
 const DEFAULT_SPEC = path.resolve(__dirname, '..', '..', 'arms', 'semantic-conventions', 'arms_docs', 'trace', 'gen-ai.md');
 const OUTPUT_PATH = path.resolve(__dirname, '..', 'docs', 'trace-validation-rules.json');
 
-// ─── CLI ─────────────────────────────────────────────────────────────────────
+// ─── 命令行参数解析 ──────────────────────────────────────────────────────────
 
 const { values: opts } = parseArgs({
   options: {
@@ -32,8 +34,13 @@ const { values: opts } = parseArgs({
   strict: true,
 });
 
-// ─── Fetch spec content ─────────────────────────────────────────────────────
+// ─── 获取规范内容 ────────────────────────────────────────────────────────────
 
+/**
+ * 按 CLI 选择从 URL 异步 fetch 或从本地同步读取语义约定 Markdown。
+ * @returns {Promise<string>} 完整规范文本。
+ * @throws {Error} 网络非 2xx；本地文件不存在时以退出码 2 结束。
+ */
 async function fetchSpec() {
   if (opts['spec-url']) {
     console.log(`${TAG} fetching from URL: ${opts['spec-url']}`);
@@ -50,7 +57,7 @@ async function fetchSpec() {
   return readFileSync(filePath, 'utf8');
 }
 
-// ─── Markdown Parser ────────────────────────────────────────────────────────
+// ─── Markdown 解析器 ─────────────────────────────────────────────────────────
 
 const SECTION_MAP = {
   '公共部分':    'COMMON',
@@ -75,6 +82,12 @@ const LEVEL_MAP = {
   '可选':          'optional',
 };
 
+/**
+ * 解析规范中的一级 Span kind、Attributes/Resources Markdown 表格和中英文约束级别。
+ * 循环状态跟踪当前 section/表格，非目标章节会忽略。
+ * @param {string} md Markdown 原文。
+ * @returns {Record<string,{attrs:object[],resources:object[]}>} 按 Span kind 分组的原始规则。
+ */
 function parseSpec(md) {
   const lines = md.split('\n');
   const sections = {};
@@ -86,7 +99,7 @@ function parseSpec(md) {
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
 
-    // Detect top-level section: "# SectionName"
+    // 识别一级章节标题，例如 `# SectionName`。
     const h1 = line.match(/^# (.+)/);
     if (h1) {
       const name = h1[1].trim();
@@ -102,7 +115,7 @@ function parseSpec(md) {
       continue;
     }
 
-    // Detect "## Resources" sub-section
+    // 识别 `## Resources` 资源属性子章节。
     if (line.trim() === '## Resources') {
       inResourceTable = true;
       inAttrTable = false;
@@ -119,15 +132,15 @@ function parseSpec(md) {
       continue;
     }
 
-    // Parse table header
+    // 解析 Markdown 表头并记住各列位置。
     if ((inAttrTable || inResourceTable) && (line.includes('AttributeKey') || line.includes('ResourceKey'))) {
       headerCols = line.split('|').map(c => c.trim()).filter(Boolean);
       continue;
     }
-    // Skip separator line
+    // 跳过表头下方的 `---` 分隔行。
     if (line.match(/^\|\s*---/)) continue;
 
-    // Parse table data row
+    // 逐行解析表格数据，遇到非表格行即结束当前表。
     if ((inAttrTable || inResourceTable) && line.startsWith('|') && currentSection) {
       const cols = line.split('|').map(c => c.trim()).filter(Boolean);
       if (cols.length < 4) continue;
@@ -137,14 +150,13 @@ function parseSpec(md) {
 
       const typeStr = cols[2]?.toLowerCase().trim() || 'string';
 
-      // Find the requirement level — scan columns from right to look for known level strings
-      // This handles tables with missing columns (e.g. gen_ai.tool.name has no Example column)
+      // 从右向左寻找已知 requirement level，兼容缺列的表格，例如 tool.name 没有 Example。
       let levelStr = '';
       for (let ci = 3; ci < cols.length; ci++) {
         const val = cols[ci].trim();
         if (LEVEL_MAP[val]) { levelStr = val; break; }
       }
-      // Also check if cols[4] is a known level (standard 6-column table)
+      // 标准六列表格的 level 位于 cols[4]，也显式检查这个常见位置。
       if (!levelStr && cols[4] && LEVEL_MAP[cols[4].trim()]) {
         levelStr = cols[4].trim();
       }
@@ -152,13 +164,13 @@ function parseSpec(md) {
       const level = LEVEL_MAP[levelStr];
       if (!level) continue;
 
-      // Extract expected value from Example column (cols[3] in standard 6-col tables)
+      // 从 Example 列提取期望值；标准六列表格中它位于 cols[3]。
       const example = cols[3]?.replace(/`/g, '').trim() || '';
       const isExampleALevel = !!LEVEL_MAP[example];
 
       const attr = { key, type: normalizeType(typeStr) };
 
-      // Determine expectedValue for span.kind fields
+      // 对 span.kind 字段进一步推导结构化 expectedValue。
       if (key === 'gen_ai.span.kind') {
         if (!isExampleALevel && example && SECTION_MAP[example] !== undefined) {
           attr.expectedValue = example;
@@ -181,6 +193,11 @@ function parseSpec(md) {
   return sections;
 }
 
+/**
+ * 将规范中的类型文本归一化为校验器支持的 integer/number/string_array/string。
+ * @param {string} t 原始类型描述。
+ * @returns {string} 稳定规则类型。
+ */
 function normalizeType(t) {
   if (t.includes('int')) return 'integer';
   if (t.includes('float') || t.includes('double')) return 'number';
@@ -188,8 +205,13 @@ function normalizeType(t) {
   return 'string';
 }
 
-// ─── Operation-Kind Mapping Parser ──────────────────────────────────────────
+// ─── Operation 与 Span Kind 映射解析器 ──────────────────────────────────────
 
+/**
+ * 从 operation.name 映射表解析每个操作所属 `gen_ai.span.kind`。
+ * @param {string} md 同一份规范 Markdown。
+ * @returns {Record<string,string>} operation name 到 Span kind 的映射。
+ */
 function parseOperationKindMapping(md) {
   const mapping = {};
   const lines = md.split('\n');
@@ -214,7 +236,7 @@ function parseOperationKindMapping(md) {
     }
   }
 
-  // Add known non-standard mappings
+  // 补充规范表格之外、由当前设计明确约定的映射。
   if (!mapping['enter']) mapping['enter'] = 'ENTRY';
   if (!mapping['react']) mapping['react'] = 'STEP';
   if (!mapping['run_task']) mapping['run_task'] = 'TASK';
@@ -225,27 +247,27 @@ function parseOperationKindMapping(md) {
   return mapping;
 }
 
-// ─── Build Rules JSON ───────────────────────────────────────────────────────
+// ─── 构建规则 JSON ───────────────────────────────────────────────────────────
 
-// Overrides: design decisions that deviate from the raw spec levels
+// 覆盖项：当前设计决策与原始规范 requirement level 不同的部分。
 const LEVEL_OVERRIDES = {
-  // Per design doc: these are MUST on ALL spans
+  // 设计文档规定：这些字段在所有 span 上都是 MUST。
   'gen_ai.session.id': 'must',
   'gen_ai.user.id': 'must',
   'gen_ai.agent.name': 'must',
-  // Per design doc: tool.name is MUST for TOOL spans
+  // 设计文档规定：TOOL span 的 tool.name 是 MUST。
   'TOOL:gen_ai.tool.name': 'must',
-  // Per design doc: agent.name is MUST on AGENT span
+  // 设计文档规定：AGENT span 的 agent.name 是 MUST。
   'AGENT:gen_ai.agent.name': 'must',
 };
 
-// Attributes that belong to per-kind rules, not common (even though they appear in the common table)
+// 这些属性虽然出现在公共表中，实际应归到各 kind 规则，不能写入 common。
 const PER_KIND_ONLY_KEYS = new Set([
   'gen_ai.span.kind',
   'gen_ai.operation.name',
 ]);
 
-// Attributes that the spec marks as "可选" but the design doc elevates to SHOULD
+// 规范标为“可选”但设计文档提升为 SHOULD 的属性。
 const OPTIONAL_TO_SHOULD = {
   'RERANKER:reranker.query': true,
   'RERANKER:reranker.model_name': true,
@@ -260,7 +282,7 @@ const OPTIONAL_TO_SHOULD = {
   'EMBEDDING:gen_ai.usage.total_tokens': true,
 };
 
-// Attributes that require captureMessageContent
+// 仅在启用 captureMessageContent 时才应校验的内容属性。
 const MESSAGE_CONTENT_KEYS = new Set([
   'gen_ai.input.messages', 'gen_ai.output.messages',
   'gen_ai.system_instructions', 'gen_ai.tool.definitions',
@@ -268,7 +290,7 @@ const MESSAGE_CONTENT_KEYS = new Set([
   'gen_ai.input.multimodal_metadata', 'gen_ai.output.multimodal_metadata',
 ]);
 
-// Schema mappings for known attributes
+// 已知属性到校验值类型的 schema 映射。
 const SCHEMA_MAP = {
   'gen_ai.input.messages': 'input_messages',
   'gen_ai.output.messages': 'output_messages',
@@ -277,7 +299,7 @@ const SCHEMA_MAP = {
   'gen_ai.retrieval.documents': 'retrieval_documents',
 };
 
-// Span kind metadata from design doc (these are structural, not derivable from the attribute tables)
+// Span kind 的结构元数据来自设计文档，无法单从属性表推导。
 const SPAN_KIND_META = {
   ENTRY:     { namePattern: 'enter_ai_application_system', operationName: 'enter', multiplicity: 'exactly_one', parentKind: null, allowedChildren: ['AGENT'] },
   AGENT:     { namePattern: '{gen_ai.operation.name} {gen_ai.agent.name}', operationName: ['invoke_agent', 'create_agent'], multiplicity: 'exactly_one', parentKind: 'ENTRY', allowedChildren: ['STEP'],
@@ -293,8 +315,15 @@ const SPAN_KIND_META = {
   TASK:      { namePattern: 'run_task {gen_ai.task.name}', operationName: 'run_task', multiplicity: 'zero_or_more', parentKind: null, allowedChildren: [] },
 };
 
+/**
+ * 将解析结果、项目覆盖项和固定时间/语义/消息 Schema 规则组合成最终 JSON 对象。
+ * 函数会提升部分 optional 属性、补齐 service.name 等兜底规则，但不写文件。
+ * @param {object} sections `parseSpec` 的结果。
+ * @param {object} operationKindMapping operation 映射。
+ * @returns {object} `trace-validation-rules.json` 的完整结构。
+ */
 function buildRulesJson(sections, operationKindMapping) {
-  // Common attributes (exclude per-kind-only keys)
+  // 构建公共属性，同时排除只能属于某个 kind 的 key。
   const commonRaw = sections['COMMON']?.attrs || [];
   const commonMust = [];
   const commonShould = [];
@@ -306,7 +335,7 @@ function buildRulesJson(sections, operationKindMapping) {
     else if (level === 'should') commonShould.push(buildAttrEntry(a, null));
   }
 
-  // Span kinds
+  // Span 类型。
   const spanKinds = {};
   for (const [kind, meta] of Object.entries(SPAN_KIND_META)) {
     const sectionAttrs = sections[kind]?.attrs || [];
@@ -316,7 +345,7 @@ function buildRulesJson(sections, operationKindMapping) {
     for (const a of sectionAttrs) {
       const overrideLevel = LEVEL_OVERRIDES[`${kind}:${a.key}`] || LEVEL_OVERRIDES[a.key];
       let level = overrideLevel || a.level;
-      // Elevate optional→should for specific attributes per design doc
+  // 按设计文档把指定属性从 optional 提升为 should。
       if (level === 'optional' && OPTIONAL_TO_SHOULD[`${kind}:${a.key}`]) level = 'should';
       const entry = buildAttrEntry(a, kind);
 
@@ -330,7 +359,7 @@ function buildRulesJson(sections, operationKindMapping) {
     spanKinds[kind] = kindDef;
   }
 
-  // Resource attributes
+  // 构建 Resource 属性规则。
   const resourceRaw = sections['COMMON']?.resources || [];
   const resMust = [];
   const resShould = [];
@@ -340,11 +369,11 @@ function buildRulesJson(sections, operationKindMapping) {
     if (a.level === 'must') resMust.push(entry);
     else if (a.level === 'should') resShould.push(entry);
   }
-  // Ensure service.name is always must
+  // 强制保证 service.name 始终属于 must。
   if (!resMust.some(r => r.key === 'service.name')) {
     resMust.push({ key: 'service.name', type: 'string' });
   }
-  // Ensure acs.arms.service.feature is should
+  // 强制保证 acs.arms.service.feature 属于 should。
   if (!resShould.some(r => r.key === 'acs.arms.service.feature')) {
     resShould.push({ key: 'acs.arms.service.feature', type: 'string', expectedValue: 'genai_app' });
   }
@@ -393,6 +422,12 @@ function buildRulesJson(sections, operationKindMapping) {
   };
 }
 
+/**
+ * 把单条规范属性转换为校验器条目，并附加数值下界、Schema 和内容采集前置条件。
+ * @param {object} raw 解析后的属性。
+ * @param {string|null} spanKind 所属 Span kind；当前只作为扩展参数保留。
+ * @returns {object} 规则条目。
+ */
 function buildAttrEntry(raw, spanKind) {
   const entry = { key: raw.key, type: raw.type };
   if (raw.expectedValue) entry.expectedValue = raw.expectedValue;
@@ -402,12 +437,18 @@ function buildAttrEntry(raw, spanKind) {
   return entry;
 }
 
-// ─── Diff ───────────────────────────────────────────────────────────────────
+// ─── 差异比较 ──────────────────────────────────────────────────────────────────
 
+/**
+ * 比较旧/新规则的 Span kind、属性级别和 operation 映射，生成面向维护者的变更摘要。
+ * @param {object} oldRules 已存在规则。
+ * @param {object} newRules 新生成规则。
+ * @returns {string[]} 以 +、-、^、v、~ 标识变化的文本行。
+ */
 function diffRules(oldRules, newRules) {
   const changes = [];
 
-  // Compare span kinds
+  // 比较各 span kind 的字段规则。
   for (const kind of new Set([...Object.keys(oldRules.spanKinds || {}), ...Object.keys(newRules.spanKinds || {})])) {
     const oldK = oldRules.spanKinds?.[kind];
     const newK = newRules.spanKinds?.[kind];
@@ -425,7 +466,7 @@ function diffRules(oldRules, newRules) {
     for (const k of oldMustKeys) { if (!newMustKeys.has(k) && newKeys.has(k)) changes.push(`v ${kind}: ${k} downgraded from MUST`); }
   }
 
-  // Compare operation mapping
+  // 比较 operation 到 kind 的映射。
   for (const op of new Set([...Object.keys(oldRules.operationKindMapping || {}), ...Object.keys(newRules.operationKindMapping || {})])) {
     const oldV = oldRules.operationKindMapping?.[op];
     const newV = newRules.operationKindMapping?.[op];
@@ -437,8 +478,13 @@ function diffRules(oldRules, newRules) {
   return changes;
 }
 
-// ─── Main ───────────────────────────────────────────────────────────────────
+// ─── 主流程 ────────────────────────────────────────────────────────────────────
 
+/**
+ * 异步命令入口：读取规范、解析、构建、可选 diff，最后同步写 JSON 输出文件。
+ * fetch/解析/写入错误通过 rejected Promise 传播到文件末尾的 catch，并设置退出码 1。
+ * @returns {Promise<void>}
+ */
 async function main() {
   const specContent = await fetchSpec();
   console.log(`${TAG} spec loaded (${specContent.length} chars)`);
@@ -455,7 +501,7 @@ async function main() {
 
   const newRules = buildRulesJson(sections, operationKindMapping);
 
-  // Diff against existing
+  // 与当前落盘规则比较并按 --diff 决定输出方式。
   const outputPath = opts.output;
   if (existsSync(outputPath)) {
     const oldRules = JSON.parse(readFileSync(outputPath, 'utf8'));
@@ -474,7 +520,7 @@ async function main() {
   writeFileSync(outputPath, JSON.stringify(newRules, null, 2) + '\n', 'utf8');
   console.log(`${TAG} rules written to ${outputPath}`);
 
-  // Verify
+  // 验证生成结果。
   const verify = JSON.parse(readFileSync(outputPath, 'utf8'));
   const kindCount = Object.keys(verify.spanKinds).length;
   const totalAttrs = Object.values(verify.spanKinds).reduce((sum, k) => sum + k.attributes.must.length + k.attributes.should.length, 0);

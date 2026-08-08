@@ -1,15 +1,18 @@
 #!/bin/bash
-# test-detect-init-runner.sh — Runs inside Docker container
-# Called by test-detect-init-system.sh
+# 在 Docker 容器内运行的 init system 探测用例，由 `test-detect-init-system.sh` 调用。
+# 它内联生产脚本的探测函数，通过伪造命令/目录覆盖 systemd-user、systemd-system、init.d 等分支，
+# 汇总 PASS/FAIL 并以失败数决定退出码；不注册真实宿主机服务。
 
+# 这里仅使用 `-e`：未捕获命令失败即停止；测试断言会显式记录预期失败。
 set -e
 
 PASS=0
 FAIL=0
 
-# --- Inline the functions under test ---
+# --- 内联待测函数 ---
 DATA_DIR_BASE="/tmp/pilot-test"
 
+# 只读判断 has_sudo_interactive 对应条件，以 Shell 退出码 0/非 0 表示真/假。
 has_sudo_interactive() {
     [ "$(id -u)" -eq 0 ] && return 0
     if sudo -n true 2>/dev/null; then
@@ -21,11 +24,13 @@ has_sudo_interactive() {
     fi
 }
 
+# 只读判断 has_sudo_noninteractive 对应条件，以 Shell 退出码 0/非 0 表示真/假。
 has_sudo_noninteractive() {
     [ "$(id -u)" -eq 0 ] && return 0
     sudo -n true 2>/dev/null
 }
 
+# 在用户 systemd 不可用时检查可提权的 systemd-system 或传统 init.d。
 _detect_system_level_init() {
     if [ -d /run/systemd/system ] && command -v systemctl &>/dev/null; then
         echo "systemd-system"
@@ -36,6 +41,7 @@ _detect_system_level_init() {
     fi
 }
 
+# 按 launchd、systemd-user、systemd-system、init.d 的可用性和权限选择服务管理器。
 detect_init_system() {
     local interactive="${1:-true}"
     local INIT_TYPE_FILE="$DATA_DIR/init-type"
@@ -73,6 +79,7 @@ detect_init_system() {
 
 export -f has_sudo_interactive has_sudo_noninteractive _detect_system_level_init detect_init_system
 
+# 执行一个 init 探测断言，更新 PASS/FAIL 计数但继续运行后续场景。
 check() {
     local num="$1" desc="$2" expected="$3" actual="$4"
     actual=$(echo "$actual" | tr -d '[:space:]')
@@ -85,12 +92,12 @@ check() {
     fi
 }
 
-# ========== Setup ==========
+# ========== 准备测试环境 ==========
 mkdir -p /run/systemd/system
 mkdir -p /etc/init.d
 
-# ========== Scenario 1: systemd-user (mocked) ==========
-# Mock systemctl --user show-environment to succeed
+# ========== 场景 1：systemd-user（mock） ==========
+# 模拟 systemctl --user show-environment 成功
 cat > /usr/local/bin/systemctl <<'MOCK'
 #!/bin/bash
 if [[ "$1" == "--user" && "$2" == "show-environment" ]]; then exit 0; fi
@@ -104,26 +111,26 @@ chown testuser:testuser "$DATA_DIR"
 result=$(su -s /bin/bash testuser -c 'export DATA_DIR=/home/testuser/.loongsuite-pilot; eval "$(declare -f has_sudo_interactive has_sudo_noninteractive _detect_system_level_init detect_init_system)"; detect_init_system true' 2>/dev/null)
 check 1 "systemd-user (mocked systemctl --user)" "systemd-user" "$result"
 
-# Remove mock
+# 移除 mock
 rm -f /usr/local/bin/systemctl
 
-# ========== Scenario 2: No systemd-user, sudo + systemd-system ==========
+# ========== 场景 2：无 systemd-user，具备 sudo 与 systemd-system ==========
 result=$(su -s /bin/bash testuser -c 'export DATA_DIR=/home/testuser/.loongsuite-pilot; eval "$(declare -f has_sudo_interactive has_sudo_noninteractive _detect_system_level_init detect_init_system)"; detect_init_system true' 2>/dev/null)
 check 2 "No systemd-user, sudo + systemd-system" "systemd-system" "$result"
 
-# ========== Scenario 3: No systemd, only init.d ==========
+# ========== 场景 3：无 systemd，仅有 init.d ==========
 mv /usr/bin/systemctl /usr/bin/systemctl.bak 2>/dev/null || true
 result=$(su -s /bin/bash testuser -c 'export DATA_DIR=/home/testuser/.loongsuite-pilot; eval "$(declare -f has_sudo_interactive has_sudo_noninteractive _detect_system_level_init detect_init_system)"; detect_init_system true' 2>/dev/null)
 check 3 "No systemd, only init.d" "initd" "$result"
 mv /usr/bin/systemctl.bak /usr/bin/systemctl 2>/dev/null || true
 
-# ========== Scenario 4: Root + systemd ==========
+# ========== 场景 4：Root + systemd ==========
 export DATA_DIR="/root/.loongsuite-pilot"
 mkdir -p "$DATA_DIR"
 result=$(detect_init_system true)
 check 4 "Root + systemd-system" "systemd-system" "$result"
 
-# ========== Scenario 5: Root + no systemd, only init.d ==========
+# ========== 场景 5：Root + 无 systemd，仅有 init.d ==========
 mv /usr/bin/systemctl /usr/bin/systemctl.bak 2>/dev/null || true
 rm -rf /run/systemd/system
 result=$(detect_init_system true)
@@ -131,7 +138,7 @@ check 5 "Root + no systemd, only init.d" "initd" "$result"
 mv /usr/bin/systemctl.bak /usr/bin/systemctl 2>/dev/null || true
 mkdir -p /run/systemd/system
 
-# ========== Scenario 6: No init system, no sudo ==========
+# ========== 场景 6：无 init system 且无 sudo ==========
 mv /usr/bin/systemctl /usr/bin/systemctl.bak 2>/dev/null || true
 rm -rf /run/systemd/system /etc/init.d
 export DATA_DIR="/home/nopwduser/.loongsuite-pilot"
@@ -142,11 +149,11 @@ check 6 "No init system + sudo needs password" "none" "$result"
 mv /usr/bin/systemctl.bak /usr/bin/systemctl 2>/dev/null || true
 mkdir -p /run/systemd/system /etc/init.d
 
-# ========== Scenario 7: interactive=false + sudo needs password ==========
+# ========== 场景 7：interactive=false 且 sudo 需要密码 ==========
 result=$(su -s /bin/bash nopwduser -c 'export DATA_DIR=/home/nopwduser/.loongsuite-pilot; eval "$(declare -f has_sudo_interactive has_sudo_noninteractive _detect_system_level_init detect_init_system)"; detect_init_system false' 2>/dev/null)
 check 7 "interactive=false, sudo needs password" "none" "$result"
 
-# ========== Scenario 8: Cached init-type=nohup → ignored ==========
+# ========== 场景 8：缓存 init-type=nohup → 忽略 ==========
 export DATA_DIR="/home/testuser/.loongsuite-pilot"
 echo "nohup" > "$DATA_DIR/init-type"
 chown testuser:testuser "$DATA_DIR/init-type"
@@ -154,18 +161,18 @@ result=$(su -s /bin/bash testuser -c 'export DATA_DIR=/home/testuser/.loongsuite
 check 8 "Cached nohup ignored → re-detects systemd-system" "systemd-system" "$result"
 rm -f "$DATA_DIR/init-type"
 
-# ========== Scenario 9: Valid cached init-type=initd → honored ==========
+# ========== 场景 9：合法缓存 init-type=initd → 采用 ==========
 echo "initd" > "$DATA_DIR/init-type"
 chown testuser:testuser "$DATA_DIR/init-type"
 result=$(su -s /bin/bash testuser -c 'export DATA_DIR=/home/testuser/.loongsuite-pilot; eval "$(declare -f has_sudo_interactive has_sudo_noninteractive _detect_system_level_init detect_init_system)"; detect_init_system true' 2>/dev/null)
 check 9 "Valid cached init-type=initd honored" "initd" "$result"
 rm -f "$DATA_DIR/init-type"
 
-# ========== Scenario 10: interactive=false + NOPASSWD sudo ==========
+# ========== 场景 10：interactive=false + NOPASSWD sudo ==========
 result=$(su -s /bin/bash testuser -c 'export DATA_DIR=/home/testuser/.loongsuite-pilot; eval "$(declare -f has_sudo_interactive has_sudo_noninteractive _detect_system_level_init detect_init_system)"; detect_init_system false' 2>/dev/null)
 check 10 "interactive=false + NOPASSWD sudo → systemd-system" "systemd-system" "$result"
 
-# ========== Results ==========
+# ========== 结果 ==========
 echo ""
 echo "============================================"
 echo " Results: $PASS passed, $FAIL failed"

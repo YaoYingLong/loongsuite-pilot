@@ -17,6 +17,10 @@ const logger = createLogger('UpdaterMain');
 
 const DEFAULT_CONFIG_PATH = '~/.loongsuite-pilot/config.json';
 
+/**
+ * 初始化独立进程。自动更新关闭时正常退出；运行时注册 SIGTERM/SIGINT，停止 Updater
+ * 后最多等待 Metrics 10 秒 flush。初始化异常由文件末尾 catch 以退出码 1 结束。
+ */
 async function main(): Promise<void> {
   // 数据目录用于存放 updater 日志、版本指针、运行状态以及 collector PID 文件。
   // LOONGSUITE_PILOT_DATA_DIR 可覆盖默认的 ~/.loongsuite-pilot 目录。
