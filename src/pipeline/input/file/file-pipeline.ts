@@ -52,6 +52,11 @@ export class FilePipeline implements Pipeline {
 
   /**
    * 校验第一 input 类型，创建 tailer/sender/watcher/state，并预编译 glob basename 正则。
+   *
+   * 构造阶段不读文件、不启动 watcher 和 timer。四个组件的职责分开：Watcher 只给变化提示，
+   * Tailer 决定真实 byte offset，Sender 管理发送背压，StateStore 负责跨重启 checkpoint。
+   *
+   * @param opts PipelineManager 已校验的配置，以及状态/失败日志/数据目录。
    * @throws 配置不是 input_file 时抛出，由 PipelineManager 记录并跳过该 Pipeline。
    */
   constructor(opts: FilePipelineOptions) {
@@ -89,7 +94,15 @@ export class FilePipeline implements Pipeline {
     this.stateStore = new StateStore(this.stateFilePath);
   }
 
-  /** 恢复 checkpoint、建立 watcher、启动 sender，首轮同步 poll 后创建周期任务。 */
+  /**
+   * 恢复 checkpoint、建立 watcher、启动 Sender，首轮同步 poll 后创建周期任务。
+   *
+   * 首轮 `await pollCycle()` 可保证 `start()` 返回时旧 checkpoint 已经过校验，且已有增量至少
+   * 尝试进入 Sender。定时器在首轮之后创建，避免启动阶段与第一轮并发。这里没有 `unref()`，
+   * 因而该 timer 属于 Pipeline 的保活资源，必须由 `stop()` 清除。
+   *
+   * @throws 状态目录、checkpoint 加载或首轮保存失败时向 PipelineManager 抛出。
+   */
   async start(): Promise<void> {
     if (this.running) return;
     this.running = true;
@@ -118,6 +131,10 @@ export class FilePipeline implements Pipeline {
   /**
    * 系统唤醒后刷新 reader 活跃时间、重建 watcher、强制下轮 rescan 并保存状态。
    * 错误被记录但不会停止 Pipeline，最后异步触发一次 poll。
+   *
+   * `fs.watch` 句柄在系统睡眠后可能已经失效；重建监听不能代替完整扫描，所以还把
+   * `lastRescanTime` 归零。末尾使用 `void pollCycle()`，恢复通知无需等待实际文件读取结束，
+   * 而 `polling` 门会处理它与周期 timer 的碰撞。
    */
   async handleWake(event?: WakeEvent): Promise<void> {
     if (!this.running) return;
@@ -143,7 +160,13 @@ export class FilePipeline implements Pipeline {
     void this.pollCycle();
   }
 
-  /** 停止新 poll，关闭 watcher，把 pending 尽量入队，排空 sender 并持久化 checkpoint。 */
+  /**
+   * 停止新 poll，关闭 watcher，把进程内 pending 尽量入队，排空 Sender 并持久化 checkpoint。
+   *
+   * 调用顺序先阻止新数据，再关闭下游资源。这里对 pending 的 `enqueue()` 返回值不做分支处理，
+   * 且 pending 本身不落盘；若停止时 Sender 已满或进程在 checkpoint 保存后突然崩溃，相关行的
+   * 恢复语义需要结合部署侧重启策略确认。最后一次 StateStore 保存失败会向上抛出。
+   */
   async stop(): Promise<void> {
     if (!this.running) return;
     this.running = false;
@@ -170,6 +193,10 @@ export class FilePipeline implements Pipeline {
   /**
    * 单轮串行轮询。dirty、活跃 reader 和 30 秒 rescan 三个来源合并去重；每文件最多读取
    * 50ms，sender 高水位时只检查 rotation 并延后，防止单个热文件饿死其他文件。
+   *
+   * `polling` 是互斥门，不是任务队列：重入触发会直接返回，由下一次 timer/dirty 提示再处理。
+   * 外层 catch 把单轮错误转为日志，使 `setInterval` 后续仍能运行；finally 始终释放互斥门。
+   * 文件级 try/catch 又把单个坏文件与其他文件隔离。
    */
   private async pollCycle(): Promise<void> {
     // running/polling 双门控保证 setInterval 与 wake 不会让状态并发修改。
@@ -207,6 +234,7 @@ export class FilePipeline implements Pipeline {
         if (!this.running) return;
 
         try {
+          // pending 行对应 Tailer 已推进的 offset，只存在当前进程内，所以优先级高于继续读新字节。
           const pending = this.pendingLines.get(filePath);
           if (pending) {
             // pending 对应已经从 tailer 读出的行，必须先入 sender 才能继续推进此文件。
@@ -232,6 +260,7 @@ export class FilePipeline implements Pipeline {
           const sliceStart = Date.now();
           let hasMore = true;
 
+          // 时间片循环可能连续读取多个 4 MiB 块，但 50ms 后主动让出机会给其他文件。
           while (hasMore && Date.now() - sliceStart < READ_TIME_SLICE_MS) {
             const result = await this.tailer.readNewLines(filePath);
 
@@ -277,7 +306,13 @@ export class FilePipeline implements Pipeline {
     return this.patternMatchers.some((m) => dir === m.dir && m.regex.test(name));
   }
 
-  /** 从 StateStore 恢复 checkpoint，并让 FileTailer 校验 inode/dev/签名。 */
+  /**
+   * 从 StateStore 恢复所有 checkpoint，并让 FileTailer 校验 inode/dev/签名。
+   *
+   * key 可能是旧版纯路径，也可能是 `<path>*<dev>*<inode>`。不属于当前 glob 的状态被忽略；
+   * 字段缺失表示旧状态不足以安全续读，也不会创建 reader。恢复失败不删除磁盘状态，随后新读
+   * 取会从当前物理文件建立 reader。
+   */
   private async loadCheckpoints(): Promise<void> {
     const allKeys = this.stateStore.keys();
     for (const key of allKeys) {
@@ -304,7 +339,12 @@ export class FilePipeline implements Pipeline {
     }
   }
 
-  /** 用 tailer 当前全部 reader 状态覆盖 StateStore，并删除已不存在的旧 key。 */
+  /**
+   * 用 Tailer 当前全部 reader 状态覆盖 StateStore 内存，并删除已不存在的旧 key。
+   *
+   * 本方法只同步内存对象，不执行磁盘 I/O；调用方随后必须 `await stateStore.save()`。先写全部
+   * 当前 key、再删旧 key，可让 rotation 队列变化在一次原子 JSON 保存中共同生效。
+   */
   private saveCheckpoints(): void {
     const allCheckpoints = this.tailer.getAllReaderCheckpoints();
     const currentKeys = new Set<string>();

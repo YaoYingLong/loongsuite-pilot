@@ -19,19 +19,24 @@ const ZERO_TRACE = '0'.repeat(32);
 const ZERO_SPAN = '0'.repeat(16);
 
 interface ResolveState {
+  /** true 表示 traceparent 已通过格式校验；false 是本 turn 已尝试但未命中的负缓存。 */
   resolved: boolean;
+  /** 从 traceparent 提取的 32 位十六进制 Trace ID。 */
   traceId?: string;
+  /** 上游 Span ID，只写给本地 turn 的根用户事件。 */
   parentSpanId?: string;
 }
 
 interface TraceLinkerOptions {
   /** `other` 首次未命中时的重试次数；关联记录可能稍晚落盘。 */
   retries?: number;
+  /** 两次磁盘查询间的非阻塞等待毫秒数。 */
   retryDelayMs?: number;
 }
 
 /** 解析并校验 W3C traceparent；拒绝格式错误和全零 ID。 */
 function parseTraceparent(tp: string): { traceId: string; spanId: string } | null {
+  // 当前只接受 W3C version 00 的标准四段格式；flags 可取任意两位十六进制值。
   const m = TRACEPARENT_RE.exec(tp.trim());
   if (!m) return null;
   const traceId = m[1].toLowerCase();
@@ -46,10 +51,12 @@ function extractUserText(entry: AgentActivityEntry): string {
   if (!Array.isArray(delta)) return '';
   let text = '';
   for (const msg of delta) {
+    // JsonValue 还可能是 null、标量或数组，只有普通消息对象才可能包含 parts。
     if (!msg || typeof msg !== 'object' || Array.isArray(msg)) continue;
     const parts = (msg as Record<string, JsonValue>).parts;
     if (!Array.isArray(parts)) continue;
     for (const part of parts) {
+      // 关联写入端对完整 prompt 求 hash，因此按原顺序拼接全部 text part，不加分隔符。
       if (!part || typeof part !== 'object' || Array.isArray(part)) continue;
       const p = part as Record<string, JsonValue>;
       if (p.type === 'text' && typeof p.content === 'string') text += p.content;
@@ -72,11 +79,16 @@ const sleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms
  * trace_id，但永不改变 gen_ai.turn.id；所有异常 fail-open。
  */
 export class TraceLinker {
+  /** 磁盘 JSONL 的索引与一次性消费实现。 */
   private readonly store: CorrelationStore;
+  /** 首次查询之外允许的额外重试次数；总尝试次数为 retries + 1。 */
   private readonly retries: number;
   private readonly retryDelayMs: number;
+  /** `${sessionId}|${turnId}` 到成功或失败解析结果，供同 turn 后续分批事件复用。 */
   private readonly cache = new Map<string, ResolveState>();
+  /** 每个 session 首次见到的 turnId，用于限制 session 级 traceparent 只挂第一轮。 */
   private readonly firstTurnBySession = new Map<string, string>();
+  /** session 最近处理时间，为 AcpCorrelateRetentionService 的内存淘汰提供依据。 */
   private readonly sessionLastAccess = new Map<string, number>();
 
   /** @param opts 重试参数主要供测试和特殊部署调整。 */
@@ -88,6 +100,7 @@ export class TraceLinker {
 
   /** 顺序处理批次事件；单条失败记录警告后继续，并原地修改命中的 entry。 */
   async stamp(entries: AgentActivityEntry[]): Promise<void> {
+    // 顺序 await 很重要：同批的根 `other` 必须先填缓存，随后 request/response/tool 才能复用。
     for (const entry of entries) {
       try {
         await this.stampEntry(entry);
@@ -123,11 +136,13 @@ export class TraceLinker {
     const tp = await this.resolveWithRetry(sessionId, text, isFirstTurn);
 
     if (!tp) {
+      // 记录负缓存，避免同 turn 后续工具事件再次触发磁盘读取和延迟重试。
       this.cache.set(key, { resolved: false });
       return;
     }
     const parsed = parseTraceparent(tp);
     if (!parsed) {
+      // 文件存在但 traceparent 非法时同样 fail-open；原采集 trace_id 保持不变。
       this.cache.set(key, { resolved: false });
       return;
     }
@@ -148,6 +163,7 @@ export class TraceLinker {
       for (let attempt = 0; attempt <= this.retries; attempt += 1) {
         const turnTp = this.store.resolveTurn(sessionId, text);
         if (turnTp) return turnTp;
+        // 最后一次失败后不再 sleep，避免已经确定回退时额外增加一个延迟周期。
         if (attempt < this.retries) await sleep(this.retryDelayMs);
       }
     }
@@ -174,6 +190,7 @@ export class TraceLinker {
 
   /** 将上下文写回事件；parent_span_id 只属于 turn 根 `other`。 */
   private apply(entry: AgentActivityEntry, state: ResolveState): void {
+    // trace_id 覆盖采集器本地生成值，使一个 turn 内所有事件落到同一条上游 Trace。
     if (state.traceId) entry.trace_id = state.traceId;
     if (entry['event.name'] === 'other' && state.parentSpanId) {
       entry.parent_span_id = state.parentSpanId;

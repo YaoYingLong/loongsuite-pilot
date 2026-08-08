@@ -33,6 +33,9 @@ const logger = createLogger('HookStrategy');
  * 把 hook event 名(JSON 中的 PascalCase,如 "SessionStart") → mjs handler 期望的
  * subcommand 名(kebab-case,如 "session-start")。两端必须保持一致,否则 trust hash
  * 会因 command 字符串差异而对不上。
+ * @param event Agent hooks JSON 中的事件 key。
+ * @returns 传给单入口 Hook 脚本的 kebab-case 第一个命令行参数。
+ * @remarks 该函数是纯字符串转换；新增事件时还需确认 Hook handler 实际实现了同名子命令。
  */
 function eventToSubcommand(event: string): string {
   return event.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
@@ -41,6 +44,9 @@ function eventToSubcommand(event: string): string {
 /**
  * Windows 必须用 `powershell -File` 调用 ps1 才能正确接收 stdin；经 cmd/child_process
  * 直接执行裸 ps1 路径会丢失管道输入。
+ * @param cmd 已展开 HOME/Pilot 占位符的 Hook 命令及可选原参数。
+ * @returns Windows + `.ps1` 时加上 `powershell -NoProfile -ExecutionPolicy Bypass -File`；其他情况原样返回。
+ * @remarks 当前按空格切分第一项，声明中脚本路径若自身含空格需另行验证引号兼容性。
  */
 function wrapPs1Command(cmd: string): string {
   if (process.platform !== 'win32') return cmd;
@@ -55,6 +61,10 @@ function wrapPs1Command(cmd: string): string {
 /**
  * 拼 hooks.json 中实际写入的 command 字符串。
  * 必须与 codex trust hash 算用的字符串完全一致。
+ * @param hookCommand Agent 声明的 Hook 脚本入口。
+ * @param event 当前正在生成的 hooks JSON 事件名。
+ * @param style `kebab-case`/`as-is` 决定附加的子命令，未配置时不附加。
+ * @returns HookManager 应写入的精确 command；该值同时作为 Codex trust hash 的输入。
  */
 function formatHookCommand(
   hookCommand: string,
@@ -76,22 +86,36 @@ function formatHookCommand(
  *
  * detect/needsDeploy 只读检查；deploy/undeploy 通过 HookManager 修改 Agent JSON，Codex
  * 还同步 config.toml trust，Kiro 使用专用 flat Agent 文件格式。
+ *
+ * 实例由 `DeploymentManager` 持有，本身没有 timer/子进程。真实资源是用户 Agent
+ * 的 settings/hooks JSON 以及 Codex `config.toml` trust block；运行期 HookWatchdog 会重新调用
+ * `needsDeploy()` 和 `deploy()`，修复被 Agent 升级或用户工具覆盖的项。
  */
 export class HookStrategy implements DeployStrategy {
   private readonly hookManager: HookManager;
 
-  /** @param hookManager 负责 settings JSON 具体数组读写。 */
+  /**
+   * @param hookManager 负责 settings JSON 中 flat/nested Hook 数组的具体读写与第三方条目保留。
+   * @remarks 构造阶段仅保存引用，不读写 Agent 配置。
+   */
   constructor(hookManager: HookManager) {
     this.hookManager = hookManager;
   }
 
-  /** 按声明路径/命令判断 Agent 是否存在。 */
+  /**
+   * 按声明路径/命令判断 Agent 是否存在，是 DeploymentManager 部署流程的第一道准入检查。
+   * @returns detection path/command 任一命中时为 `true`；只读文件系统/PATH，不修改 settings。
+   */
   async detect(def: AgentDefinition): Promise<boolean> {
     return detectAgent(def.detection);
   }
 
   /**
    * 检查专用设置结构、预期 Hook、retired Hook 和 Codex version 字段；任一不符合即需修复。
+   * @param def 已加载并展开路径的 Hook Agent 声明。
+   * @param _record 为统一 `DeployStrategy` 签名保留；Hook 完整性以实际 settings 为准，不信任状态记录。
+   * @returns 发现历史字段、Kiro 定义不完整、当前 Hook 缺失或 retired Hook 残留时为 `true`。
+   * @remarks 方法会读 JSON 但不写入；HookWatchdog 将 `true` 解释为需要自愈部署。
    */
   async needsDeploy(def: AgentDefinition, _record?: DeployedAgentRecord): Promise<boolean> {
     if (await this.needsSettingsRepairForCodex(def)) {
@@ -103,6 +127,7 @@ export class HookStrategy implements DeployStrategy {
     }
 
     const hookDefs = this.buildHookDefinitions(def);
+    // 当前事件必须全部存在；第一个缺失即可确定需修复，无需继续打开同一份文件。
     for (const hookDef of hookDefs) {
       if (!(await this.hookManager.isHookInstalled(hookDef))) {
         return true;
@@ -116,7 +141,11 @@ export class HookStrategy implements DeployStrategy {
     return false;
   }
 
-  /** Codex hooks.json 只能有 hooks 顶层字段；存在历史 version 或结构损坏时需要修复。 */
+  /**
+   * 检查 Codex `hooks.json` 是否存在旧 Pilot 曾注入的顶层 `version`。
+   * @returns 非 Codex hooks 路径或无历史 version 时为 `false`；存在时为 `true`。
+   * @remarks Codex 对该 JSON 使用 deny_unknown_fields，所以 Cursor 需要的 `version` 在 Codex 中会使整份 Hook 配置失效。
+   */
   private async needsSettingsRepairForCodex(def: AgentDefinition): Promise<boolean> {
     const settingsPath = def.hook?.settingsPath;
     if (!settingsPath) return false;
@@ -131,6 +160,10 @@ export class HookStrategy implements DeployStrategy {
   /**
    * 确保 settings 文件，移除 retired/replaced Hook，安装当前事件，合并可选 env，最后为
    * Codex 写 trust。Kiro 分支采用专用格式并提前返回。
+   *
+   * @param def 必须包含 hook 配置的 AgentDefinition。
+   * @returns 所有必要 Hook 已幂等安装时 `success:true`；缺配置或关键 JSON 读写失败时返回错误结果。
+   * @remarks env 合并和 Codex trust 写入是非阻断增强；它们失败会记录，但基础 transcript Hook 仍可工作。
    */
   async deploy(def: AgentDefinition): Promise<DeployResult> {
     const hookConfig = def.hook;
@@ -151,6 +184,7 @@ export class HookStrategy implements DeployStrategy {
         return { success: true, agentId: def.id, deployMode: 'hook' };
       }
 
+      // 先删 retired 再安装当前事件，可防止旧新事件在一次 Agent 操作中重复上报。
       const retiredHookDefs = this.buildRetiredHookDefinitions(def);
       for (const retiredHookDef of retiredHookDefs) {
         const removed = await this.hookManager.uninstallHook(retiredHookDef);
@@ -182,6 +216,7 @@ export class HookStrategy implements DeployStrategy {
 
       const hookDefs = this.buildHookDefinitions(def);
       for (const hookDef of hookDefs) {
+        // 先检查再写入，使周期 Watchdog 修复在配置正常时不会不必要地改变文件 mtime。
         const installed = await this.hookManager.isHookInstalled(hookDef);
         if (!installed) {
           const ok = await this.hookManager.installHook(hookDef);
@@ -286,7 +321,11 @@ export class HookStrategy implements DeployStrategy {
     }
   }
 
-  /** 卸载当前、retired 及 replaceHookCommands 匹配项；Codex 同时移除 trust block。 */
+  /**
+   * 卸载当前、retired 及 `replaceHookCommands` 匹配项；Codex 同时移除归本项目拥有的 trust block。
+   * @returns 所有当前 Hook 删除都成功时为 `true`；单个失败仍继续处理其余事件并最终返回 `false`。
+   * @remarks trust 清理失败是非阻断告警，不改变 Hook JSON 卸载结果。本方法不删用户第三方 Hook。
+   */
   async undeploy(def: AgentDefinition): Promise<boolean> {
     const hookDefs = this.buildHookDefinitions(def);
     let allOk = true;
@@ -312,6 +351,8 @@ export class HookStrategy implements DeployStrategy {
   /**
    * 回读 hooks.json,找到 pilot hook command 在每个 event 数组中的实际 group index。
    * 支持 nested format({hooks:[{command}]}) 和 flat format({command})两种结构。
+   * @returns event -> group index 的部分 Map；读取失败或事件未命中时省略对应 key，trust writer 回退为 0。
+   * @remarks index 是 trust state key 的一部分；第三方 Hook 位于 Pilot 前面时，不能假设 Pilot 永远是第 0 组。
    */
   private async resolveGroupIndices(def: AgentDefinition): Promise<Record<string, number>> {
     const result: Record<string, number> = {};
@@ -351,7 +392,11 @@ export class HookStrategy implements DeployStrategy {
     return result;
   }
 
-  /** 把当前事件逐一转换为 HookDefinition，并按 eventSubcommand 拼出精确命令。 */
+  /**
+   * 把当前事件逐一转换为 HookManager 可处理的 `HookDefinition`。
+   * @returns 每个 event 一项，其 command 已按 `eventSubcommand` 拼成精确文本；缺 hook 配置返回空数组。
+   * @remarks 命令文本不仅决定实际执行，也是 Codex trust hash 输入，不可在两条路径各自拼接。
+   */
   private buildHookDefinitions(def: AgentDefinition): HookDefinition[] {
     const hookConfig = def.hook;
     if (!hookConfig) return [];
@@ -369,7 +414,10 @@ export class HookStrategy implements DeployStrategy {
     }));
   }
 
-  /** 把 retiredEvents 转换为仅用于卸载的 HookDefinition。 */
+  /**
+   * 把 `retiredEvents` 转换为仅用于卸载的 `HookDefinition`。
+   * @returns 去重后的历史事件，并过滤仍在当前 events 中的项，避免先删掉仍需使用的 Hook。
+   */
   private buildRetiredHookDefinitions(def: AgentDefinition): HookDefinition[] {
     const hookConfig = def.hook;
     if (!hookConfig?.retiredEvents?.length) return [];
@@ -396,6 +444,11 @@ export class HookStrategy implements DeployStrategy {
    * token 则不重复追加，以便与用户 preload 共存。
    *
    * 失败为非致命，deploy 调用方负责捕获。
+   *
+   * @param settingsPath Agent 会读取的 settings JSON。
+   * @param env 声明希望注入/更新的顶层 env 键值。
+   * @returns 无差异时不写文件并立即兑现；有差异时等待原子 JSON 替换。
+   * @throws 读写或现有 JSON 结构异常，由 `deploy()` 转为非阻断告警。
    */
   private async applyEnvToSettings(
     settingsPath: string,
@@ -442,6 +495,9 @@ export class HookStrategy implements DeployStrategy {
    * 文件结构（round3 实证，hook.rs Hook 扁平结构无 type 字段）：
    *   { "name": "...", "tools": [...], "hooks": { "<event>": [{"command": "..."}] } }
    * 每个 hook 条目是 flat {command, matcher?}（无 type 字段，否则 Kiro loader 拒绝）。
+   * @param def 包含 `hook.kiroAgent` 的声明，调用前由 `deploy()` 完成前置检查。
+   * @returns Agent JSON 和可选默认 Agent 设置处理完成后兑现。
+   * @remarks 合并时保留其他顶层字段与第三方 Hook，只替换 command 以本项目入口开头的条目。
    */
   private async deployKiroAgent(def: AgentDefinition): Promise<void> {
     const hookConfig = def.hook!;
@@ -466,12 +522,12 @@ export class HookStrategy implements DeployStrategy {
       if (hookConfig.matcher) entry['matcher'] = hookConfig.matcher;
 
       const arr = Array.isArray(hooks[event]) ? (hooks[event] as unknown[]) : [];
-      // 移除旧的 pilot hook 条目（command 以 hookCommandBase 开头），保留第三方
+      // 移除旧的 Pilot Hook 条目（command 以 hookCommandBase 开头），保留第三方条目。
       const filtered = arr.filter((e) => {
         const existingCmd = (e as any)?.command;
         return typeof existingCmd !== 'string' || !existingCmd.startsWith(hookCommandBase);
       });
-      // 幂等：已存在则不重复 push
+      // 幂等性：精确命令已存在时不重复 push。
       const present = filtered.some((e) => (e as any)?.command === cmd);
       if (!present) filtered.push(entry);
       hooks[event] = filtered;
@@ -486,6 +542,9 @@ export class HookStrategy implements DeployStrategy {
 
   /**
    * ~/.kiro/settings/cli.json 尚未设置时写 chat.defaultAgent，使 Kiro 默认加载 Pilot Agent。
+   * @param agentName `kiroAgent.name` 声明的默认 Agent 名。
+   * @returns 已有用户选择时不写盘；否则等待 cli.json 写入。所有错误在内部降级为告警。
+   * @remarks 这是一次性默认值，不覆盖用户已选 Agent，用户仍可使用 `--agent` 临时切换。
    */
   private async setKiroDefaultAgentIfMissing(agentName: string): Promise<void> {
     // 这是 CLI 默认选择文件，不是 hookConfig.settingsPath 的 Agent 定义；两路径并非一一对应。
@@ -503,7 +562,11 @@ export class HookStrategy implements DeployStrategy {
     }
   }
 
-  /** 验证 Kiro Agent 文件的 name、tools 和每个事件 flat command 是否完整。 */
+  /**
+   * 验证 Kiro Agent 文件中每个声明事件的 flat command 是否完整。
+   * @returns 文件/hooks/事件数组缺失或任一精确 command 未命中时为 `true`；全部存在时为 `false`。
+   * @remarks 现有实现不比较 name/tools 字段，文件头部的历史表述需以此代码行为为准。
+   */
   private async kiroAgentNeedsDeploy(def: AgentDefinition): Promise<boolean> {
     const hookConfig = def.hook!;
     const settings = await readJsonFile<Record<string, unknown>>(resolveHome(hookConfig.settingsPath));
@@ -524,6 +587,10 @@ export class HookStrategy implements DeployStrategy {
   /**
    * 确保 settings 文件存在且顶层结构有效。Cursor hooks.json 需要 version；Codex 使用
    * deny_unknown_fields，只允许 hooks，必须移除旧版注入的 version。
+   * @param settingsPath 经 AgentDefLoader 展开后的 Agent 配置路径。
+   * @returns 缺失文件已初始化、需要的 version 已补齐/清理，或无需修改时兑现。
+   * @throws JSON 写入失败传给 `deploy()` 转为失败结果。
+   * @remarks 非 hooks.json 文件不会在缺失时自动初始化；Kiro 分支会在专用方法中创建。
    */
   private async ensureSettingsFile(settingsPath: string): Promise<void> {
     const isHooksJson = settingsPath.endsWith('hooks.json');

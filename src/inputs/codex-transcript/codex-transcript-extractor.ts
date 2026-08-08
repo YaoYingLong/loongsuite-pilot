@@ -251,20 +251,24 @@ function extractCodexTurn(
 
     if (record.type === 'event_msg') {
       if (payload.type === 'user_message') {
+        // event_msg.user_message 是一种 prompt 形态；appendPrompt 会过滤空值和中断控制注入。
         appendPrompt(stringValue(payload.message));
         markActivity(timestamp);
         continue;
       }
       if (payload.type === 'agent_message') {
+        // agent_message 表示这一轮 LLM 已产生响应证据；若前一工具 wave 已闭合，先结算旧 step。
         const active = activeStep();
         if (active && stepToolsComplete(active.step)) flushCurrentStep();
         const message = stringValue(payload.message);
         if (message) {
+          // 响应文本可能在没有显式 request 记录时出现，因此按上次活动时间惰性创建 step。
           const next = beginStep(lastActivityAtMs || timestamp, source);
           touchStep(next, source);
           const nextStep = next.step;
           nextStep.responseAtMs = timestamp;
           nextStep.hasResponseEvidence = true;
+          // 某些 Codex 版本会在不同记录形态重复同一句 agent_message，只去掉相邻重复项。
           if (nextStep.reasoning[nextStep.reasoning.length - 1] !== message) {
             nextStep.reasoning.push(message);
           }
@@ -273,6 +277,7 @@ function extractCodexTurn(
         continue;
       }
       if (payload.type === 'web_search_start') {
+        // start/end 事件为 web_search_call 补充比 response_item 时间更精确的执行边界。
         const callId = stringValue(payload.call_id);
         if (callId) webSearchStarts.set(callId, timestamp);
         const active = activeStep();
@@ -281,6 +286,7 @@ function extractCodexTurn(
         touchStep(next, source);
         const nextStep = next.step;
         nextStep.responseAtMs = timestamp;
+        // 搜索开始本身证明模型已返回工具选择，即使没有 assistant 文本也应形成 llm.response。
         nextStep.hasResponseEvidence = true;
         markActivity(timestamp);
         continue;
@@ -288,12 +294,14 @@ function extractCodexTurn(
       if (payload.type === 'web_search_end') {
         const callId = stringValue(payload.call_id);
         if (callId) {
+          // 先缓存结束时间；若对应 tool 已经创建，则立即补齐工具和 step 的完成时间。
           webSearchEnds.set(callId, timestamp);
           const envelope = toolSteps.get(callId);
           const step = envelope?.step;
           const tool = step?.tools.find(candidate => candidate.callId === callId);
           if (tool) {
             tool.completedAtMs = timestamp;
+            // 非空断言成立是因为 tool 只能从上面可选链得到的 step 中找到。
             step!.completedAtMs = Math.max(step!.completedAtMs, timestamp);
             touchStep(envelope!, source);
           }
@@ -306,6 +314,7 @@ function extractCodexTurn(
         if (!usage) continue;
         const envelope = activeStep();
         if (envelope?.step.hasResponseEvidence) {
+          // 累计快照归属于当前 response wave，并把 LLM 标记为闭合；随后 flush 允许下个 wave 新建 step。
           envelope.step.tokenUsage = usage;
           envelope.step.completedAtMs = Math.max(envelope.step.completedAtMs, timestamp);
           envelope.llmClosed = true;
@@ -316,18 +325,22 @@ function extractCodexTurn(
         } else if (!sameUsage(lastUsage, usage)) {
           // 未锚定样本不能顺延给下一个 response wave，否则会把前一请求的 usage 记到后一请求。
           unmatchedTokenUsages.push(usage);
+          // 仍更新 lastUsage，避免连续相同的未锚定样本重复进入诊断数组。
           lastUsage = usage;
         }
         continue;
       }
       if (payload.type === 'task_complete' && stringValue(payload.turn_id) === expectedTurnId) {
+        // task_complete 提供正常终态和可选最终文本；终态之后的记录属于后续 turn，无需继续扫描。
         status = 'completed';
         sawTerminal = true;
         terminalAtMs = timestamp;
+        // 最终文本不一定另有 agent_message，暂存后由终态收尾逻辑补入最后一个 step。
         finalText = stringValue(payload.last_agent_message);
         break;
       }
       if (payload.type === 'turn_aborted' && stringValue(payload.turn_id) === expectedTurnId) {
+        // turn_aborted 没有正常最终文本，Builder 会把最后 response/tool result 标记为 cancelled。
         status = 'interrupted';
         sawTerminal = true;
         terminalAtMs = timestamp;
@@ -341,6 +354,7 @@ function extractCodexTurn(
     if (itemType === 'message') {
       const role = stringValue(payload.role);
       if (role === 'assistant') {
+        // assistant message 属于当前 LLM 输出 wave；若上一工具阶段已闭合，先开始一个新 step。
         const active = activeStep();
         if (active && stepToolsComplete(active.step)) flushCurrentStep();
         const envelope = beginStep(lastActivityAtMs || timestamp, source);
@@ -354,6 +368,7 @@ function extractCodexTurn(
           step.reasoning.push(message);
         }
       } else if (role) {
+        // user/system 等非 assistant 消息属于请求上下文，而不是模型输出。
         const message = transcriptInputMessage(role, payload.content);
         if (message) {
           inputMessages.push(message);
@@ -365,6 +380,7 @@ function extractCodexTurn(
     }
 
     if (itemType === 'reasoning') {
+      // reasoning item 本身可能不带可展示文本，但它仍是 response 已开始的证据和 step 边界锚点。
       const active = activeStep();
       if (active && stepToolsComplete(active.step)) flushCurrentStep();
       const envelope = beginStep(lastActivityAtMs || timestamp, source);
@@ -383,6 +399,7 @@ function extractCodexTurn(
       const active = activeStep();
       if (active && stepToolsComplete(active.step)) flushCurrentStep();
       if (call.name === 'web_search') {
+        // web_search 的 event_msg start/end 比 response_item 时间更准确，优先用已缓存边界覆盖。
         call.startedAtMs = webSearchStarts.get(call.callId) ?? (lastActivityAtMs || timestamp);
         call.completedAtMs = webSearchEnds.get(call.callId) ?? timestamp;
       }
@@ -391,11 +408,13 @@ function extractCodexTurn(
       const step = envelope.step;
       step.responseId ??= stringValue(payload.id);
       if (call.name !== 'web_search') {
+        // 普通工具调用紧随 LLM response；第一个工具决定 response 时间，后续工具取更早边界。
         step.responseAtMs = step.tools.length === 0
           ? call.startedAtMs
           : Math.min(step.responseAtMs, call.startedAtMs);
         step.hasResponseEvidence = true;
       } else if (!step.hasResponseEvidence) {
+        // 只有 web_search 且尚无其他 response 证据时，搜索完成时间可作为该 wave 的响应锚点。
         step.responseAtMs = call.name === 'web_search'
           ? call.completedAtMs ?? call.startedAtMs
           : call.startedAtMs;
@@ -415,6 +434,7 @@ function extractCodexTurn(
     const step = envelope.step;
     const tool = step.tools.find(candidate => candidate.callId === toolOutput.callId);
     if (!tool) continue;
+    // callId 精确匹配成功后，输出时间闭合工具 span，并把该源记录范围并入所属 step。
     tool.completedAtMs = timestamp;
     tool.output = toolOutput.output;
     step.completedAtMs = Math.max(step.completedAtMs, timestamp);

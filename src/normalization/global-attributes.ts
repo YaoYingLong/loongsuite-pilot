@@ -98,6 +98,12 @@ export class GlobalAttributesProvider {
   private cachedFileAttrs: Record<string, string> = {};
   private cachedMerged: Record<string, string>;
 
+  /**
+   * 清洗启动基线并初始化动态文件缓存；构造时不读取文件。
+   *
+   * @param baseline ConfigLoader 合并后的 config/env 属性；保留 namespace 会在这里删除。
+   * @param filePath 运行时可更新的 JSON 对象文件路径。
+   */
   constructor(baseline: Record<string, string>, filePath: string) {
     this.baseline = sanitizeAttributes(baseline);
     // 通常是 `<dataDir>/span-attributes.json`，由 CLI 原子更新。
@@ -105,7 +111,14 @@ export class GlobalAttributesProvider {
     this.cachedMerged = { ...this.baseline };
   }
 
-  /** 返回“启动基线 < 动态文件”的合并结果；mtime 未变化时直接复用缓存。 */
+  /**
+   * 返回“启动基线 < 动态文件”的合并结果；同名动态属性覆盖基线。
+   *
+   * 每次调用同步 stat，但只有 mtime 改变才同步 read/parse 小文件。文件删除时立即回退基线；
+   * 临时读取或 JSON 解析失败时保留最近一次成功缓存且不提交新 mtime，让下次调用继续重试。
+   *
+   * @returns 内部缓存对象本身，调用方应只读；直接修改会污染后续 resolve 结果。
+   */
   resolve(): Record<string, string> {
     let mtimeMs: number;
     try {
@@ -135,11 +148,15 @@ export class GlobalAttributesProvider {
     return this.cachedMerged;
   }
 
-  /** 返回当前合并结果的属性名列表。 */
+  /** 返回当前合并结果的属性名数组副本；调用时会先执行一次 resolve 检查。 */
   keys(): string[] {
     return Object.keys(this.resolve());
   }
 
+  /**
+   * 同步读取并校验动态 JSON 文件。
+   * @returns `ok=false` 表示暂态错误应保留旧缓存；可解析但非对象返回 ok=true 的空属性以明确清空。
+   */
   private readFileAttrs(): { ok: boolean; attrs: Record<string, string> } {
     // 同步读取使一次 resolve() 得到单一快照，文件很小且只在 mtime 改变后执行。
     let raw: string;

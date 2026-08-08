@@ -37,10 +37,13 @@ export interface LocalWorkerInstance {
   workDir: string;
   /** 相对于实例目录的凭据文件路径，避免把 token 明文写入 instance.json。 */
   bootstrapTokenRef: string;
+  /** Runtime 专属参数；由 worker manifest 通过 `${instance:<name>}` 按需展开。 */
   runtimeOptions: RuntimeOptions;
   /** 声明式启停开关，由 ActivationService 收敛为实际进程状态。 */
   enabled: boolean;
+  /** 实例首次建立时间，ISO 8601 字符串，重连时保持不变。 */
   createdAt: string;
+  /** 最后一次 CLI 修改期望配置的时间，不代表 Worker 心跳时间。 */
   updatedAt: string;
 }
 
@@ -81,47 +84,75 @@ export interface LocalWorkerView {
 const LOCAL_WORKER_HEARTBEAT_STALE_MS = 120_000;
 
 // 以下路径函数集中定义实例目录约定，避免 CLI、激活服务和 Supervisor 各自拼接出不同路径。
-/** 返回 `<dataDir>/local-workers`。 */
+/**
+ * 返回 Local Worker 持久化根目录。
+ * @param dataDir 允许带 `~` 的 Pilot 数据根。
+ * @returns 已展开 HOME 的 `<dataDir>/local-workers` 路径；不创建目录。
+ */
 export function localWorkerRoot(dataDir: string): string {
   return path.join(resolveHome(dataDir), 'local-workers');
 }
 
-/** 返回单实例隔离目录。 */
+/**
+ * 返回单实例的隔离目录，是凭据、状态、日志和 Runtime 包的共同父目录。
+ * @returns `<dataDir>/local-workers/<instanceId>`；调用方必须使用由本模块分配的 ID。
+ */
 export function instanceDir(dataDir: string, instanceId: string): string {
   return path.join(localWorkerRoot(dataDir), instanceId);
 }
 
-/** 返回实例期望配置 instance.json 路径。 */
+/**
+ * 返回实例期望配置 `instance.json` 路径。
+ * @remarks CLI 写该文件，ActivationService 读它；文件本身不存放 bootstrap token。
+ */
 export function instanceConfigPath(dataDir: string, instanceId: string): string {
   return path.join(instanceDir(dataDir, instanceId), 'instance.json');
 }
 
-/** 根据 instance 中的相对引用返回凭据绝对路径。 */
+/**
+ * 根据 instance 中的相对引用返回 bootstrap token 绝对路径。
+ * @param instance 其 id 决定隔离目录，`bootstrapTokenRef` 决定目录内相对位置。
+ * @returns Worker manifest 中 `bootstrapTokenFile` 占位符的值。
+ */
 export function bootstrapTokenPath(dataDir: string, instance: LocalWorkerInstance): string {
   return path.join(instanceDir(dataDir, instance.id), instance.bootstrapTokenRef);
 }
 
-/** 返回实例状态快照目录。 */
+/**
+ * 返回实例状态快照目录。
+ * @returns Supervisor、Worker、Runtime 和 Matrix 跨进程交换 JSON 的共同目录。
+ */
 export function stateDir(dataDir: string, instanceId: string): string {
   return path.join(instanceDir(dataDir, instanceId), 'state');
 }
 
-/** 返回实例日志目录。 */
+/**
+ * 返回实例日志目录。
+ * @returns Worker stdout/stderr 合并追加的 `worker.log` 所在目录。
+ */
 export function logDir(dataDir: string, instanceId: string): string {
   return path.join(instanceDir(dataDir, instanceId), 'logs');
 }
 
-/** 返回实例独享 Runtime 包目录。 */
+/**
+ * 返回实例独享 Runtime 包目录。
+ * @remarks 每个实例独立获取/替换包，避免重连或升级一个 Worker 影响另一个。
+ */
 export function bundleDir(dataDir: string, instanceId: string): string {
   return path.join(instanceDir(dataDir, instanceId), 'bundle');
 }
 
 /**
  * 删除实例的全部持久化目录。
- * 必须先 disconnect，并等待 ActivationService 确认相关 PID 已退出，避免删除仍在运行的
- * Worker 所依赖的 token、状态目录和日志句柄。
+ *
+ * Worker CLI `delete` 调用。必须先 disconnect，并等待 ActivationService 确认相关 PID
+ * 已退出，避免删除仍在运行的 Worker 所依赖的 token、状态目录和日志句柄。
+ *
+ * @param dataDir Pilot 数据根。
+ * @param instanceId 要删除的 `lw_` 实例 ID。
+ * @returns 目录递归删除完成后兑现。
+ * @throws 实例不存在、仍 enabled、任一已知 PID 存活，或文件系统删除失败。
  */
-/** 前置条件不满足时抛错，满足后递归删除实例目录。 */
 export async function deleteLocalWorkerInstance(dataDir: string, instanceId: string): Promise<void> {
   const instance = await readLocalWorkerInstance(dataDir, instanceId);
   if (!instance) throw new Error(`local worker not found: ${instanceId}`);
@@ -135,8 +166,16 @@ export async function deleteLocalWorkerInstance(dataDir: string, instanceId: str
   await fs.rm(instanceDir(dataDir, instanceId), { recursive: true, force: true });
 }
 
-/** 创建一个默认启用的新实例，并持久化运行目录、凭据和实例配置。 */
-/** 校验 runtime/token、分配 ID、创建隔离目录与凭据，并写默认 enabled 实例。 */
+/**
+ * 校验 Runtime/token、分配 ID，创建默认启用的新实例并持久化隔离目录与凭据。
+ *
+ * CLI `worker connect` 调用。方法只建立期望状态；ActivationService 通过 watch/poll
+ * 在另一个异步流程中获取 Runtime 包并启动 Worker。
+ *
+ * @param opts runtime 和 bootstrapToken 必填；workDir 默认当前目录；runtimeOptions 会被规范化。
+ * @returns 已写入 `instance.json` 的实例对象。
+ * @throws 必填值为空、ID 多次冲突或目录/凭据/配置写入失败。
+ */
 export async function connectLocalWorker(opts: ConnectLocalWorkerOptions): Promise<LocalWorkerInstance> {
   const runtime = opts.runtime.trim();
   if (!runtime) throw new Error('runtime is required');
@@ -171,9 +210,13 @@ export async function connectLocalWorker(opts: ConnectLocalWorkerOptions): Promi
 
 /**
  * 重新启用已有实例，并按需更新凭据、工作目录和 Runtime 参数。
- * 未提供的可选项沿用旧值；runtimeOptions 只要显式传入（包括空对象）就整体替换。
+ *
+ * CLI 对已存在的“位置实例 ID”再次 connect 时调用。未提供的可选项沿用旧值；
+ * `runtimeOptions` 只要显式传入（包括空对象）就整体替换，不做按键合并。
+ *
+ * @returns 已设为 `enabled:true` 并原子写回的新快照。
+ * @throws 实例不存在、显式 token 为空或凭据/配置写入失败。
  */
-/** 重连实例；未提供字段沿用旧值，显式 runtimeOptions 整体替换。 */
 export async function reconnectLocalWorker(opts: ReconnectLocalWorkerOptions): Promise<LocalWorkerInstance> {
   const instance = await readLocalWorkerInstance(opts.dataDir, opts.instanceId);
   if (!instance) throw new Error(`local worker not found: ${opts.instanceId}`);
@@ -200,7 +243,11 @@ export async function reconnectLocalWorker(opts: ReconnectLocalWorkerOptions): P
   return updated;
 }
 
-/** 读取实例配置；缺失或 JSON 无效时返回 null，并规范化旧数据中的 runtimeOptions。 */
+/**
+ * 容错读取实例配置，并在内存中规范化旧数据的 `runtimeOptions`。
+ * @returns 完整实例快照；文件缺失或 JSON 无效时返回 `null`。
+ * @remarks 规范化结果不自动写回，只有之后的 reconnect/enable 操作才会持久化新形式。
+ */
 export async function readLocalWorkerInstance(
   dataDir: string,
   instanceId: string,
@@ -213,7 +260,11 @@ export async function readLocalWorkerInstance(
   };
 }
 
-/** 将外部或旧版本数据收敛为仅包含非空键及 string/boolean 值的 Runtime 参数。 */
+/**
+ * 将 CLI/旧版本数据收敛为仅包含非空键及 string/boolean 值的 Runtime 参数。
+ * @param value 可能来自用户参数或未校验 JSON，因此类型为 `unknown`。
+ * @returns 新对象；boolean 保留，非 null/undefined 其他值转字符串，非普通对象返回空对象。
+ */
 function normalizeRuntimeOptions(value: unknown): RuntimeOptions {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   const out: RuntimeOptions = {};
@@ -228,7 +279,11 @@ function normalizeRuntimeOptions(value: unknown): RuntimeOptions {
   return out;
 }
 
-/** 扫描所有 `lw_` 实例目录，忽略无关目录和无法读取的实例，并按 ID 稳定排序。 */
+/**
+ * 扫描所有 `lw_` 实例目录，供 ActivationService 收敛和 CLI list 共用。
+ * @returns 按 ID 稳定排序的可读实例；根目录不存在返回空数组，无关/损坏实例被忽略。
+ * @remarks 顺序读取避免短时间打开大量文件；实例通常很少，无需并发优化。
+ */
 export async function listLocalWorkerInstances(dataDir: string): Promise<LocalWorkerInstance[]> {
   const root = localWorkerRoot(dataDir);
   let entries: string[];
@@ -250,6 +305,9 @@ export async function listLocalWorkerInstances(dataDir: string): Promise<LocalWo
 /**
  * 更新实例的期望启用状态。
  * 此函数本身不操作进程；ActivationService 通过目录监听或定时扫描异步完成启动/停止。
+ * @param enabled `false` 表示期望停止，`true` 表示期望运行。
+ * @returns 已写回并刷新 `updatedAt` 的实例快照。
+ * @throws 实例不存在或 JSON 写入失败。
  */
 export async function setLocalWorkerEnabled(
   dataDir: string,
@@ -263,7 +321,10 @@ export async function setLocalWorkerEnabled(
   return updated;
 }
 
-/** 并行读取各实例的运行快照，生成 CLI 展示视图。 */
+/**
+ * 并行读取各实例的运行快照，生成 CLI 展示视图。
+ * @returns 顺序与 `listLocalWorkerInstances()` 一致的视图数组；每个实例的多份状态 JSON 并行读取。
+ */
 export async function listLocalWorkerViews(dataDir: string): Promise<LocalWorkerView[]> {
   const instances = await listLocalWorkerInstances(dataDir);
   const views = await Promise.all(instances.map(instance => readLocalWorkerView(dataDir, instance)));
@@ -274,6 +335,9 @@ export async function listLocalWorkerViews(dataDir: string): Promise<LocalWorker
  * 合并 instance.json 与四类状态快照，计算一个容错的 LocalWorkerView。
  * 快照由不同进程独立写入，字段允许缺失或处于不同版本，因此所有读取都采用安全转换
  * 和多来源回退，不把单个损坏快照升级为整个 list/status 命令失败。
+ * @param instance 已读取的期望配置，避免再次打开 `instance.json`。
+ * @returns 可直接序列化为 JSON 或终端表格的统一视图。
+ * @remarks 状态优先级有意让 enabled=false 覆盖残留 PID，让 failed/degraded 覆盖过期的 running 快照。
  */
 export async function readLocalWorkerView(
   dataDir: string,
@@ -338,13 +402,19 @@ export async function readLocalWorkerView(
   };
 }
 
-/** 从实例引用的独立凭据文件读取 bootstrap token。 */
-/** 文件缺失/不可读时透传异常给 Worker 启动流程。 */
+/**
+ * 从实例引用的独立凭据文件读取 bootstrap token。
+ * @returns trim 后的 token；凭据不会进入日志或 `LocalWorkerView`。
+ * @throws 文件缺失/不可读时透传给 Worker 启动流程，使本轮收敛显式失败。
+ */
 export async function readBootstrapToken(dataDir: string, instance: LocalWorkerInstance): Promise<string> {
   return (await fs.readFile(bootstrapTokenPath(dataDir, instance), 'utf-8')).trim();
 }
 
-/** 同时检查 worker.pid 与 Supervisor 状态中的 PID，任一仍存活都禁止删除实例。 */
+/**
+ * 同时检查 `worker.pid` 与 Supervisor 状态中的 PID，弥补两份快照不同步的窗口。
+ * @returns 任一去重后 PID 存活时为 `true`，使 delete 拒绝移除 Worker 正在使用的目录。
+ */
 async function hasRunningLocalWorkerProcess(dataDir: string, instanceId: string): Promise<boolean> {
   const pids = new Set<number>();
   const pidFromFile = await readPidFile(path.join(stateDir(dataDir, instanceId), 'worker.pid'));
@@ -362,7 +432,10 @@ async function hasRunningLocalWorkerProcess(dataDir: string, instanceId: string)
   return false;
 }
 
-/** 容错解析正整数 PID；文件缺失或非法返回 undefined。 */
+/**
+ * 容错解析正整数 PID。
+ * @returns 正整数 PID；文件缺失/不可读/非法时返回 `undefined`，不阻断第二状态来源检查。
+ */
 async function readPidFile(pidPath: string): Promise<number | undefined> {
   try {
     const pid = Number.parseInt((await fs.readFile(pidPath, 'utf-8')).trim(), 10);
@@ -372,7 +445,11 @@ async function readPidFile(pidPath: string): Promise<number | undefined> {
   }
 }
 
-/** 最多尝试五次随机 ID，避免极低概率碰撞或命中已有实例目录。 */
+/**
+ * 生成 `lw_` + 16 位 Base32 的随机 ID，并与已持久化实例核对碰撞。
+ * @returns 首个未使用 ID；最多尝试五次。
+ * @throws 五次都碰撞时抛错，让 connect 在创建任何实例文件前终止。
+ */
 async function createInstanceId(dataDir: string): Promise<string> {
   for (let attempt = 0; attempt < 5; attempt += 1) {
     const id = `lw_${base32(crypto.randomBytes(10)).slice(0, 16).toLowerCase()}`;
@@ -381,7 +458,11 @@ async function createInstanceId(dataDir: string): Promise<string> {
   throw new Error('failed to allocate local worker instance id');
 }
 
-/** 将凭据写入独立文件，并在支持 chmod 的平台尽力设置为 0600。 */
+/**
+ * 将凭据写入独立文件，并在支持 chmod 的平台尽力设置为 0600。
+ * @param dir 实例隔离目录；函数自行创建 `credentials` 子目录。
+ * @throws 主写入失败会使 connect/reconnect reject；额外 chmod 失败仅作跨平台兼容降级。
+ */
 async function writeBootstrapToken(dir: string, token: string): Promise<void> {
   const tokenPath = path.join(dir, 'credentials', 'bootstrap-token');
   await ensureDir(path.dirname(tokenPath));
@@ -389,8 +470,10 @@ async function writeBootstrapToken(dir: string, token: string): Promise<void> {
   await fs.chmod(tokenPath, 0o600).catch(() => {});
 }
 
-/** 将随机字节编码为不区分大小写文件系统也可安全使用的 Base32 文本。 */
-/** 把随机字节编码为无填充 Base32，用于可读实例 ID。 */
+/**
+ * 把随机字节编码为无填充 Base32，便于作为跨平台目录名和人类可读实例 ID。
+ * @returns 只包含 `A-Z2-7` 的文本；调用方再截断并转小写。
+ */
 function base32(bytes: Buffer): string {
   const alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
   let bits = 0;
@@ -427,8 +510,10 @@ function isWorkerDegraded(worker: Record<string, unknown> | null): boolean {
   return phase === 'degraded' || reason.includes('degraded');
 }
 
-/** 同时兼容秒、毫秒、纯数字字符串和 ISO 日期字符串格式的时间戳。 */
-/** 兼容 ISO 字符串与毫秒/秒数值时间戳，统一返回毫秒。 */
+/**
+ * 兼容 ISO 字符串、纯数字字符串与毫秒/秒数值时间戳，统一为 Unix 毫秒。
+ * @returns 可比较的毫秒值；空值/非法日期返回 `undefined`，使视图不会因旧版快照中断。
+ */
 function readTimestampMs(value: unknown): number | undefined {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return value > 1_000_000_000_000 ? value : value * 1000;

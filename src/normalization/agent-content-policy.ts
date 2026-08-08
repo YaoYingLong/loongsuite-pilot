@@ -63,6 +63,7 @@ export function applyAgentContentPolicy(
   entry: AgentActivityEntry,
   config: AgentsConfig,
 ): AgentActivityEntry {
+  // 策略解析只看 Agent 类型和配置，不读取内容本身，避免“先接触敏感值再决定”的额外处理。
   const agentConfig = resolveAgentConfig(entry, config);
   // 即使内容允许也返回浅拷贝，防止后续处理意外修改 Input 持有的对象。
   if (agentConfig.captureMessageContent) return { ...entry };
@@ -84,7 +85,12 @@ export function applyAgentContentPolicy(
   return next;
 }
 
-/** 按精确 agent type、公开别名、默认值的优先级解析策略。 */
+/**
+ * 按精确 agent type、公开别名、默认值的优先级解析策略。
+ *
+ * 精确配置可覆盖别名组；例如 qoder-cn 可与 qoder 使用不同开关。配置项缺失时使用允许内容的
+ * 默认值，确保旧配置升级后行为与历史版本一致。
+ */
 function resolveAgentConfig(
   entry: AgentActivityEntry,
   config: AgentsConfig,

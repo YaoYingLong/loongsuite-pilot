@@ -24,12 +24,19 @@ export abstract class BaseFlusher {
   /** 停止定时器、提交余量并释放网络/文件资源。 */
   abstract shutdown(): Promise<void>;
 
-  /** 可选异步初始化；无初始化需求的子类继承空实现。 */
+  /**
+   * 可选异步初始化；无初始化需求的子类继承立即兑现的空实现。
+   * 子类通常在这里创建目录、启动 timer 或验证连接；构造函数应只保存配置。
+   */
   async start(): Promise<void> {
     // 子类可覆盖，例如创建目录、启动定时器或初始化客户端。
   }
 
-  /** 原样输出 session/诊断等非 AgentActivityEntry 数据；默认不处理。 */
+  /**
+   * 输出 session/诊断等非 AgentActivityEntry 数据；默认立即兑现且不处理。
+   * @param _topic 下游用于路由或文件命名的主题。
+   * @param _payload 尚未经过标准事件序列化的对象；覆盖实现必须自行处理安全与失败策略。
+   */
   async sendRaw(_topic: string, _payload: Record<string, unknown>): Promise<void> {
     // 下划线参数表示基类有意不使用；需要原始通道的子类自行覆盖。
   }

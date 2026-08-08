@@ -828,11 +828,14 @@ export class WukongInput extends BaseInput {
 
     // 合成 step 中同时有工具和最终文本时拆为两步：step 1 声明并执行工具，step 2 只输出最终答案，从而同时满足工具配对与末步无 tool_call 规则。
     if (!hasStepEvents && currentStep && currentStep.hasToolCalls && allToolStartTimes.length > 0) {
+      // 第一段 LLM span 对应“模型决定调用工具”；单独生成 span ID，父级仍是当前 step span。
       const midLlmSpanId = generateSpanId();
       const midOutputParts: Array<Record<string, string>> = [];
       for (const tc of toolCallParts) {
+        // 这里只需要把调用声明放进 assistant 输出，参数和结果已由独立 tool.* 事件承载。
         midOutputParts.push({ type: tc.type, id: tc.id, name: tc.name });
       }
+      // request 从 run/step 起点开始；response 人为放在第一个工具开始前 1ms，维持父子时序。
       const midReqTs = runStartedTs ?? currentStep.startTimestamp;
       const firstToolTs = minOf(allToolStartTimes);
       const lastToolTs = maxOf(allToolStartTimes, allToolEndTimes);
@@ -840,6 +843,7 @@ export class WukongInput extends BaseInput {
 
       // 生成 step 1 的工具调用型 llm.request/response。
       entries.push(buildAgentActivityEntry({
+        // 请求事件没有自己的 span_id；与随后 response 通过稳定 event.id、turn 和 step 关联。
         timestamp: midReqTs,
         'event.id': hashId([sessionId, msg.id, 'request', String(currentStep.stepIndex)]),
         'event.name': 'llm.request',
@@ -849,6 +853,7 @@ export class WukongInput extends BaseInput {
         'gen_ai.request.model': model,
         'gen_ai.response.id': runId,
         'trace_id': traceId,
+        // 用户输入只随 turn 的第一步发送，后续步骤通过上下文延续，避免重复整段 prompt。
         ...(userContent && currentStep.stepIndex === 1 ? {
           'gen_ai.input.messages_delta': [
             { role: 'user', parts: [{ type: 'text', content: userContent }] },
@@ -857,6 +862,7 @@ export class WukongInput extends BaseInput {
         attributes: { source: 'wukong', message_id: msg.id, conversation_id: msg.conversationId },
       }));
       entries.push(buildAgentActivityEntry({
+        // response 使用独立 LLM span，并挂到 step span 下，形成 agent.step -> llm.response 层级。
         timestamp: midRespTs,
         'event.id': hashId([sessionId, msg.id, 'response', String(currentStep.stepIndex)]),
         'event.name': 'llm.response',
@@ -876,8 +882,10 @@ export class WukongInput extends BaseInput {
           ],
         } : {}),
         ...(midOutputParts.length > 0 ? {
+          // tool_call parts 告诉下游本次 response 的结束原因是等待工具，而不是最终回答。
           'gen_ai.output.messages': [{ role: 'assistant', parts: midOutputParts }],
         } : {}),
+        // Wukong API 未提供该中间 wave 的 token 明细；显式置 0 保持 Schema 数值字段完整。
         'gen_ai.usage.input_tokens': 0,
         'gen_ai.usage.output_tokens': 0,
         'gen_ai.usage.cache_read.input_tokens': 0,
@@ -887,6 +895,7 @@ export class WukongInput extends BaseInput {
 
       // 所有工具完成后再开始 step 2，承载最终答案。
       stepIndex++;
+      // 加 1ms 避免最终 step 与最后工具结果同一时刻，保证可视化时间轴严格有序。
       const finalStepStart = lastToolTs + 1;
       currentStep = {
         stepIndex,
@@ -896,6 +905,7 @@ export class WukongInput extends BaseInput {
         startTimestamp: finalStepStart,
         stepSpanId: generateSpanId(),
       };
+      // 新 step 不再携带上一 step 的工具声明；最终输出会作为纯文本 response。
       toolCallParts.length = 0;
       // 覆盖 runFinishedTs，使最终 step 的响应时间严格晚于工具。
       if (!runFinishedTs || runFinishedTs <= finalStepStart) {
@@ -1301,14 +1311,17 @@ export class WukongInput extends BaseInput {
     if (content) {
       switch (activityType) {
         case 'TERMINAL':
+          // 终端活动把命令作为参数，把 stdout/exit_code 作为结果，便于还原命令执行。
           args = content.command ? { command: content.command } : undefined;
           result = { output: content.output, exit_code: content.exit_code };
           break;
         case 'FILE_WRITE':
+          // 写文件源事件通常只提供路径和最终状态，不在这里读取文件正文以避免额外 I/O。
           args = compactObject({ path: content.path ?? content.file_path });
           result = { status: content.status ?? 'done' };
           break;
         case 'FILE_READ':
+          // 读取活动保留行号范围和返回片段；compactObject 会删除不同版本缺失的字段。
           args = compactObject({ path: content.path, start_line: content.start_line });
           result = compactObject({
             content: content.content,
@@ -1319,14 +1332,17 @@ export class WukongInput extends BaseInput {
           });
           break;
         case 'GREP_SEARCH':
+          // grep 的 query 是输入，matches/output 是输出；两种结果字段兼容不同 CLI 版本。
           args = content.query ? { query: content.query } : undefined;
           result = content.matches ?? content.output;
           break;
         case 'SEARCH':
+          // 通用搜索可一次提交多个 query，并在结果中保留来源状态。
           args = compactObject({ queries: content.queries, search_type: content.search_type });
           result = compactObject({ results: content.results, status: content.status });
           break;
         case 'DIRECTORY_LIST':
+          // 目录列表优先使用直接 entries/output，旧版本则由 files/count/status 组合结果。
           args = content.path ? { path: content.path } : undefined;
           result = content.entries ?? content.output ?? compactObject({
             files: content.files,
@@ -1335,6 +1351,7 @@ export class WukongInput extends BaseInput {
           });
           break;
         case 'SKILL':
+          // Skill 活动把名称、用途和元数据作为调用参数，把输出或错误作为结果。
           args = compactObject({ skill_name: content.skill_name, purpose: content.purpose, meta: content.meta });
           result = compactObject({
             output: content.output,
@@ -1343,15 +1360,18 @@ export class WukongInput extends BaseInput {
           });
           break;
         case 'ARTIFACT':
+          // Artifact 没有独立调用参数，只记录生成产物元数据和生成时间。
           result = compactObject({ artifactsMetadata: content.artifactsMetadata, generatedAt: content.generatedAt });
           break;
         default:
+          // 未知 activity 保留通用 input/output/result，确保新增类型不会被完全丢弃。
           args = content.input ?? undefined;
           result = content.output ?? content.result ?? undefined;
           break;
       }
     }
 
+    // 每条 call/result 记录拥有独立事件 span ID，但共享 step 或 agent parent，供转换器建立层级。
     const callSpanId = generateSpanId();
     const resultSpanId = generateSpanId();
     const parentSpanId = step?.stepSpanId ?? agentSpanId;
@@ -1373,6 +1393,7 @@ export class WukongInput extends BaseInput {
       attributes: { source: 'wukong', message_id: msg.id },
     });
 
+    // 状态与 error.message 分开保存：状态供聚合，原始错误文本供排障。
     const toolResultStatus = resolveActivityResultStatus(content);
     const errorMessage = typeof content?.error_message === 'string' && content.error_message.length > 0
       ? content.error_message
@@ -1411,8 +1432,10 @@ export class WukongInput extends BaseInput {
     let cursor: string | undefined;
     let hasMore = false;
     do {
+      // cursor 只在服务端声明 hasMore 时携带；首页不传 cursor。
       const params: Record<string, unknown> = { limit: TASK_BATCH_LIMIT };
       if (cursor) params.cursor = cursor;
+      // execFile 不经过 Shell，JSON 参数作为单独 argv 传入；timeout/maxBuffer 防止子进程失控。
       const { stdout, stderr } = await execFile(
         this.cliPath,
         ['agent', 'data', 'list_tasks', '--json', JSON.stringify(params)],
@@ -1434,9 +1457,11 @@ export class WukongInput extends BaseInput {
         throw new Error('unexpected listTasks response structure');
       }
       const resp = parsed as ListTasksResponse;
+      // 没有 session_id 的任务无法调用 getMessages，也无法生成稳定会话事件，因此过滤。
       for (const item of resp.items) {
         if (item.session_id != null) allTasks.push(item as WukongTask & { session_id: string });
       }
+      // 服务端若错误地给出 hasMore 但没有 nextCursor，do/while 会自然停止，避免死循环。
       cursor = resp.hasMore ? resp.nextCursor : undefined;
       hasMore = !!resp.hasMore;
     } while (cursor && allTasks.length < MAX_TASKS);

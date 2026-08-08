@@ -13,24 +13,36 @@ const logger = createLogger('MultiFlusher');
 
 /**
  * 将同一事件/批次并行分发给多个 BaseFlusher。
- * 生命周期方法同样扇出，因此每个子通道负责自己的幂等关闭。
+ *
+ * 本类不复制 entry，所有下游收到同一只读对象引用；因此 Flusher 实现不得原地修改事件。
+ * send/sendBatch/flush/shutdown 都使用 allSettled，把某个后端失败限制在该后端。代价是调用方无法
+ * 通过 Promise rejection 得知部分输出丢失，只能依赖这里的日志和各 Flusher 指标。
  */
 export class MultiFlusher extends BaseFlusher {
   readonly name = 'multi';
   private readonly flushers: BaseFlusher[];
 
-  /** @param flushers 已各自完成构造和 start 的下游通道。 */
+  /**
+   * @param flushers 已各自完成构造和 start 的下游通道；本类不代替它们执行 start。
+   */
   constructor(flushers: BaseFlusher[]) {
     super();
     this.flushers = flushers;
   }
 
-  /** 返回内部通道列表，供指标/诊断层定位具体 SLS 等实现。 */
+  /**
+   * 返回内部通道数组，供指标/诊断层定位具体实现。
+   * 当前返回真实数组而非副本，调用方应只读；push/splice 会直接改变后续扇出目标。
+   */
   getFlushers(): BaseFlusher[] {
     return this.flushers;
   }
 
-  /** 并行发送单条事件，并逐个记录 reject；方法自身正常兑现。 */
+  /**
+   * 并行发送单条事件，等待所有通道 settle，再逐个记录 reject。
+   * `Promise.allSettled` 结果与输入 Promise 保持索引对应，便于准确输出失败 Flusher 名称；即使全部
+   * 通道失败，本方法也正常兑现。
+   */
   async send(entry: AgentActivityEntry): Promise<void> {
     // allSettled 保留与 flushers 相同的索引顺序，便于标出失败通道名。
     const results = await Promise.allSettled(
@@ -63,12 +75,18 @@ export class MultiFlusher extends BaseFlusher {
     }
   }
 
-  /** 尽力 flush 全部通道；单个 reject 不阻断其余调用。 */
+  /**
+   * 并行尽力 flush 全部通道；单个 reject 不阻断其余调用，也不会在本层记录具体原因。
+   * 失败诊断依赖各子 Flusher 自身实现。
+   */
   async flush(): Promise<void> {
     await Promise.allSettled(this.flushers.map(r => r.flush()));
   }
 
-  /** 并行关闭全部下游；所有 Promise settled 后返回。 */
+  /**
+   * 并行关闭全部下游；所有 Promise settled 后返回。
+   * 关闭 rejection 被吞掉，因此 Orchestrator 能继续退出，但不能把正常返回理解为所有缓冲均送达。
+   */
   async shutdown(): Promise<void> {
     await Promise.allSettled(this.flushers.map(r => r.shutdown()));
   }

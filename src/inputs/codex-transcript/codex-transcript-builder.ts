@@ -70,7 +70,9 @@ export function buildCodexTranscriptSegment(
   const traceId = hashId([turn.sessionId, turn.transcriptTurnId, 'trace'], 32);
   const agentSpanId = hashId([turn.sessionId, turn.transcriptTurnId, 'agent'], 16);
   const turnId = `${turn.sessionId}:${turn.transcriptTurnId}`;
+  // 源记录偶尔不带模型；统一使用 unknown 可保持 schema 稳定，同时明确表示“未知”而非空字符串。
   const model = turn.model || 'unknown';
+  // base 中只放 turn 内所有事件都相同的字段，后续 request/response/tool 构建时再补事件专有字段。
   const base: Record<string, JsonValue> = {
     trace_id: traceId,
     'gen_ai.session.id': turn.sessionId,
@@ -88,7 +90,9 @@ export function buildCodexTranscriptSegment(
   const contextStepCount = opts.contextStepCount ?? turn.steps.length;
   let nextInputContext = inputContext;
 
+  // 用户输入作为 other 边界事件单独输出。增量恢复时 includePrompt=false，避免重复发送同一 prompt。
   if (includePrompt && turn.prompt) {
+    // request 和 response 共用同一个 llmSpanId，转换为 OTLP 后形成同一 LLM span 的起止证据。
     records.push(buildEntry({
       ...base,
       timestamp: turn.startedAtMs,
@@ -129,6 +133,7 @@ export function buildCodexTranscriptSegment(
       ...sharedLlmFields(turn),
     }));
 
+    // 只有最后一个 step 会继承 turn 的 interrupted/completed 终态；中间 step 按工具或 stop 判断。
     const terminalStep = index === turn.steps.length - 1;
     records.push(buildEntry({
       ...base,
@@ -153,7 +158,9 @@ export function buildCodexTranscriptSegment(
       records.push(...buildToolEntries(turn, tool, toolIndex, base, stepId, stepSpanId));
     }
 
+    // 当前 step 的工具请求和结果会成为下一次 LLM request 的增量上下文。
     inputContext = advanceInputContext(inputContext, step);
+    // 解析器可能只确认前若干 step 可提交，此时返回的 checkpoint 上下文也必须停在相同边界。
     if (index + 1 === contextStepCount) nextInputContext = inputContext;
   }
 
@@ -190,9 +197,11 @@ function contextFromMessages(
   previousFullMessages: JsonValue[] | undefined,
   delta: JsonValue[],
 ): CodexTranscriptInputContext {
+  // 一旦完整上下文因超限被丢弃，后续保持 undefined；不能用不完整片段冒充完整会话历史。
   const fullMessages = previousFullMessages === undefined
     ? undefined
     : [...previousFullMessages, ...delta];
+  // Buffer.byteLength 按真实 UTF-8 字节计算，中文等多字节字符不会被低估。
   const retainFullMessages = fullMessages !== undefined
     && Buffer.byteLength(JSON.stringify(fullMessages), 'utf8') <= MAX_INPUT_MESSAGES_BYTES;
   return {

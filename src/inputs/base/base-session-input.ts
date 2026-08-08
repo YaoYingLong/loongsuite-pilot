@@ -14,7 +14,7 @@ import { BaseInput, type InputOptions } from './base-input.js';
 export interface SessionInputOptions extends InputOptions {
   /** session 文件扫描根目录。 */
   sessionDir: string;
-  /** 文件名 pattern，例如 `rollout-*.jsonl`。 */
+  /** 文件名 pattern，例如 `rollout-*.jsonl`；匹配规则由具体子类实现。 */
   filePattern: string;
 }
 
@@ -27,14 +27,22 @@ export abstract class BaseSessionInput extends BaseInput {
   protected readonly sessionDir: string;
   protected readonly filePattern: string;
 
-  /** 保存扫描根与 pattern；不在构造阶段访问文件系统。 */
+  /**
+   * 保存扫描根与 pattern；不在构造阶段访问文件系统。
+   * @param opts BaseInput 依赖、session 根目录和文件名 pattern。
+   */
   constructor(opts: SessionInputOptions) {
     super(opts);
     this.sessionDir = opts.sessionDir;
     this.filePattern = opts.filePattern;
   }
 
-  /** 顺序处理发现到的文件，保持子类返回顺序。 */
+  /**
+   * 先发现文件，再逐文件串行处理并拼接结果。
+   *
+   * 串行 `await` 避免多个大 session 同时分配整段 Buffer，也保持 `discoverSessionFiles()` 的顺序。
+   * 文件级 stat/open 异常的处理方式由 `processFile()` 决定。
+   */
   protected async collect(): Promise<AgentActivityEntry[]> {
     const files = await this.discoverSessionFiles();
     const allEntries: AgentActivityEntry[] = [];
@@ -46,7 +54,13 @@ export abstract class BaseSessionInput extends BaseInput {
     return allEntries;
   }
 
-  /** 按路径状态 key 增量读取文件，并为 inode/截断变化重置 offset。 */
+  /**
+   * 按 `<inputId>:<filePath>` 状态 key 增量读取一个文件，并处理 inode/截断变化。
+   *
+   * `stat.size` 固定本轮边界，并发追加留到下轮；文件句柄在 finally 中关闭。offset 在逐行解析
+   * 前推进到该边界，所以坏 JSON、转换异常以及末尾尚未写完的半行都不会重试。这种基类只适合
+   * writer 每次原子追加完整 JSONL 行的简单 session；需要断行缓存的来源应使用专用 Input。
+   */
   private async processFile(filePath: string): Promise<AgentActivityEntry[]> {
     const stateKey = `${this.id}:${filePath}`;
     let stat;
@@ -56,6 +70,7 @@ export abstract class BaseSessionInput extends BaseInput {
       return [];
     }
 
+    // 当前读取值未参与后续计算；真正使用的 offset 会在 inode 检查后重新读取，此变量用途待确认。
     const prevOffset = this.stateStore.getOffset(stateKey);
     const prevState = this.stateStore.get(stateKey);
     const prevInode = prevState.extra?.inode as number | undefined;
@@ -78,10 +93,12 @@ export abstract class BaseSessionInput extends BaseInput {
       this.stateStore.setOffset(stateKey, 0);
       this.stateStore.update(stateKey, { extra: { inode: Number((stat as any).ino) } });
     }
+    // 等于表示没有新增；小于已在上面按 copytruncate 重置，不会落入这里。
     if (stat.size <= offset) return [];
 
     const handle = await fs.open(filePath, 'r');
     try {
+      // Buffer 长度使用字节差，不能用字符串字符数代替，中文在 UTF-8 下通常占多个字节。
       const buf = Buffer.alloc(stat.size - offset);
       await handle.read(buf, 0, buf.length, offset);
       const text = buf.toString('utf-8');
@@ -106,10 +123,19 @@ export abstract class BaseSessionInput extends BaseInput {
     }
   }
 
-  /** 发现本轮需要处理的 session 文件。 */
+  /**
+   * 发现本轮需要处理的 session 文件。
+   * @returns Promise 兑现为文件路径列表；建议返回稳定顺序，基类不会额外排序。
+   */
   protected abstract discoverSessionFiles(): Promise<string[]>;
 
-  /** 转换单条已解析 JSON；返回 null 跳过。 */
+  /**
+   * 转换单条已解析 JSON。
+   * @param record JSON.parse 得到的对象。
+   * @param filePath 记录来源文件，供提取 session ID 或补充 source 属性。
+   * @returns 标准事件；null 表示有意跳过。
+   * @throws 异常被当前行的 catch 隔离，该行 offset 已经推进。
+   */
   protected abstract processSessionLine(
     record: Record<string, unknown>,
     filePath: string,

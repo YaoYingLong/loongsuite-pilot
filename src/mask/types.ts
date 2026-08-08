@@ -18,15 +18,25 @@ export interface SensitiveRulesManifest {
 
 /** 单条可序列化规则声明。 */
 export interface SensitiveRuleDefinition {
+  /** 稳定规则 ID，只用于诊断与范围来源记录。 */
   id: string;
+  /** 用户配置可启停的敏感信息大类。 */
   type: MaskType;
+  /** 决定 RuleLoader 编译哪一种 matcher。 */
   kind: MaskRuleKind;
+  /** 命中后写入的固定占位符。 */
   replacement: string;
+  /** 运行正式 matcher 前必须命中的低成本关键词列表。 */
   prefilter: string[];
+  /** regex 类型的正则源码。 */
   pattern?: string;
+  /** regex flags；RuleLoader 会保证包含全局标志 g。 */
   flags?: string;
+  /** block 类型的开始 marker 正则源码。 */
   beginPattern?: string;
+  /** block 类型的结束 marker 正则源码。 */
   endPattern?: string;
+  /** urlWithPassword 允许的协议名，不含尾部冒号。 */
   schemes?: string[];
 }
 
@@ -49,8 +59,11 @@ export interface MaskRange {
 
 /** 调用方可覆盖的性能/安全上限。 */
 export interface StringMaskOptions {
+  /** 超过该 UTF-8 字节数后启用关键词窗口扫描。 */
   largeStringThresholdBytes?: number;
+  /** 关键词两侧保留的 UTF-16 code unit 数。 */
   keywordContextWindow?: number;
+  /** 允许整体替换的单个私钥块最大 UTF-8 字节数。 */
   privateKeyBlockLimit?: number;
 }
 

@@ -337,10 +337,12 @@ function buildToolEntries(
   base: Record<string, JsonValue>,
   step: number,
 ): AgentActivityEntry[] {
+  // step/span ID 由稳定业务键哈希得到；同一 turn 重试恢复时仍生成相同标识，便于下游幂等。
   const stepId = `${base['gen_ai.turn.id']}:s${step}`;
   const stepSpanId = hashId([turn.sessionId, turn.transcriptTurnId, 'step', String(step)], 16);
   const spanId = hashId([turn.sessionId, turn.transcriptTurnId, 'tool', tool.callId], 16);
   const records = [buildEntry({
+    // tool.call 使用真实调用时刻，父 span 指向该 wave 的 agent.step。
     ...base,
     timestamp: tool.timestampMs,
     'event.id': hashId([turn.sessionId, turn.transcriptTurnId, 'tool-call', tool.callId], 32),
@@ -350,8 +352,10 @@ function buildToolEntries(
     'gen_ai.step.id': stepId,
     'gen_ai.tool.name': tool.name,
     'gen_ai.tool.call.id': tool.callId,
+    // 参数可能因旧 rollout 形态缺失；只在确实存在时输出，避免用空对象伪造信息。
     ...(tool.input !== undefined ? { 'gen_ai.tool.call.arguments': tool.input } : {}),
   })];
+  // 是否找到匹配结果决定 tool.result 的状态和时间来源。
   const completed = result !== undefined;
   const resultEntry: Record<string, JsonValue> = {
     ...base,
@@ -363,9 +367,12 @@ function buildToolEntries(
     'gen_ai.step.id': stepId,
     'gen_ai.tool.name': tool.name,
     'gen_ai.tool.call.id': tool.callId,
+    // 中断时仍未返回的工具也生成配对 result，状态 cancelled，使 trace 结构保持闭合。
     'tool.result.status': completed ? 'success' : 'cancelled',
   };
+  // 只有真实完成结果才能携带 output；cancelled 结果不猜测工具输出。
   if (completed && result.output !== undefined) resultEntry['gen_ai.tool.call.result'] = result.output;
+  // duration 仅对真实结果计算，并过滤时钟异常导致的负数。
   const duration = completed ? result.timestampMs - tool.timestampMs : undefined;
   if (duration !== undefined && duration >= 0) resultEntry['gen_ai.tool.call.duration'] = duration;
   records.push(buildEntry(resultEntry));
@@ -382,6 +389,7 @@ function requestTimestamp(wave: ToolWave): number {
 
 /** 把已完成工具结果包装成下一 LLM 请求的 `tool_call_response` 消息；无结果时省略。 */
 function toolResultInput(wave: ToolWave): JsonValue | undefined {
+  // flatMap 同时完成“查找结果”和“过滤未完成调用”：没有 result 时返回空数组。
   const completed = wave.calls.flatMap(tool => {
     const result = wave.results.get(tool.callId);
     return result ? [{
@@ -390,6 +398,7 @@ function toolResultInput(wave: ToolWave): JsonValue | undefined {
       response: result.output ?? null,
     }] : [];
   });
+  // 没有任何已完成工具时不生成 role=tool 消息，避免空消息污染下一次 LLM request。
   return completed.length > 0 ? [{ role: 'tool', parts: completed }] : undefined;
 }
 

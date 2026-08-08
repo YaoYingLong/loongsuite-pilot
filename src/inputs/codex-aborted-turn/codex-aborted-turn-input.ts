@@ -145,16 +145,21 @@ export class CodexAbortedTurnInput extends BaseInput {
    * @returns 本文件本轮恢复出的事件；同时更新内存 StateStore 状态。
    */
   private async processFile(filePath: string): Promise<AgentActivityEntry[]> {
+    // checkpoint 以完整路径为命名空间；同一天生成的多个 rollout 文件不会共享游标。
     const key = this.stateKey(filePath);
     let stat;
     try {
+      // inode 用于识别“路径相同、实体已被轮转替换”的情况，size 用于限定本轮读取上界。
       stat = await fs.stat(filePath);
     } catch {
+      // 文件可能在目录扫描后被 Codex 删除或移动；将它视为本轮无数据，不阻断其他文件。
       return [];
     }
 
     let checkpoint = this.readCheckpoint(key);
     if (!checkpoint) {
+      // 没有持久化状态时从文件头扫描；正常启动会先执行 onStart() 建立文件末尾 baseline，
+      // 因而该分支主要覆盖“启动后新建文件”和状态文件被清理的场景。
       checkpoint = {
         inode: stat.ino,
         scanOffset: 0,
@@ -166,23 +171,29 @@ export class CodexAbortedTurnInput extends BaseInput {
         emittedHookGapTurnIds: [],
       };
     } else if (checkpoint.inode !== stat.ino) {
+      // 文件轮转后旧 offset 对新文件没有意义。直接在新文件末尾重建 baseline，可避免误重放历史内容。
       await this.baselineFile(filePath, key);
       return [];
     }
 
     if (stat.size <= checkpoint.scanOffset) {
+      // 即使没有新增 transcript，也要推进基于时间的 Hook 缺失检查，否则诊断只能等下一次写文件才触发。
       await this.emitDueHookGapWarnings(checkpoint);
       this.saveCheckpoint(key, checkpoint);
       return [];
     }
+    // 固定本轮终点为 stat.size；Codex 在读取期间继续追加的数据留给下一轮，避免边读边追造成饥饿。
     const lines = await readJsonLines(filePath, checkpoint.scanOffset, stat.size);
+    // 尾部若只有半行，readJsonLines 不推进 nextOffset；下一轮会从同一字节重新读取完整 JSON。
     if (lines.nextOffset === checkpoint.scanOffset) return [];
 
     const entries: AgentActivityEntry[] = [];
     for (const line of lines.items) {
+      // rollout 是外部数据源，payload 必须先做运行时类型收窄，不能仅依赖 TypeScript 静态类型。
       const payload = asRecord(line.record.payload);
       if (!payload) continue;
       if (line.record.type === 'session_meta') {
+        // 只保存最近 meta 的字节位置，真正恢复 turn 时再按需回读，避免把大段说明长期放进 checkpoint。
         checkpoint.latestSessionMetaOffset = line.startOffset;
         checkpoint.latestSessionId = extractCodexTranscriptMeta(line.record)?.sessionId ?? checkpoint.latestSessionId;
         continue;
@@ -191,6 +202,7 @@ export class CodexAbortedTurnInput extends BaseInput {
       if (line.record.type === 'event_msg' && payload.type === 'task_started') {
         const turnId = stringValue(payload.turn_id);
         if (turnId && (!checkpoint.activeTurn || checkpoint.activeTurn.turnId !== turnId)) {
+          // task_started 是首选边界；保存行首 offset 后，中断时即可回读该 turn 的全部记录。
           checkpoint.activeTurn = {
             turnId,
             startOffset: line.startOffset,
@@ -203,6 +215,7 @@ export class CodexAbortedTurnInput extends BaseInput {
       if (line.record.type === 'turn_context') {
         const turnId = stringValue(payload.turn_id);
         if (turnId && (!checkpoint.activeTurn || checkpoint.activeTurn.turnId !== turnId)) {
+          // 某些 transcript 可能缺少 task_started，turn_context 作为兼容起点保证仍可恢复。
           checkpoint.activeTurn = {
             turnId,
             startOffset: line.startOffset,
@@ -212,38 +225,49 @@ export class CodexAbortedTurnInput extends BaseInput {
         continue;
       }
 
+      // 后续两个终态都属于 event_msg；其他 response_item 已在发生中断后通过范围回读统一解析。
       if (line.record.type !== 'event_msg') continue;
       if (payload.type === 'task_complete') {
         const turnId = stringValue(payload.turn_id);
         if (turnId && checkpoint.activeTurn?.turnId === turnId && !checkpoint.emittedHookGapTurnIds.includes(turnId)) {
+          // 正常完成的数据应由 Hook 主链采集；这里仅暂存一个观察项，宽限期后检查 Hook 是否确实落盘。
           checkpoint.pendingCompletedTurns.push({
             turnId,
             sessionId: checkpoint.latestSessionId ?? sessionIdFromTranscriptPath(filePath),
             completedAtMs: timestampMs(line.record) ?? Date.now(),
           });
+          // checkpoint 有固定上限，防止 Hook 长期不可用时状态文件无限增长。
           checkpoint.pendingCompletedTurns = checkpoint.pendingCompletedTurns
             .slice(-MAX_PENDING_COMPLETED_TURNS);
+          // task_complete 关闭当前 turn；之后的记录必须等待新的起点才能参与恢复。
           checkpoint.activeTurn = null;
         }
         continue;
       }
+      // 旧链路只为中断恢复服务，普通 event_msg 在此无需处理。
       if (payload.type !== 'turn_aborted') continue;
       const turnId = stringValue(payload.turn_id);
+      // 终态必须与正在跟踪的 turn 一致，避免把相邻 turn 的记录拼接到一起。
       if (!turnId || checkpoint.activeTurn?.turnId !== turnId) continue;
       if (!checkpoint.emittedAbortedTurnIds.includes(turnId)) {
+        // 回读范围在 abort 行末结束，保证 extractor 能看到中断原因和精确时间。
         const recovered = await this.recoverTurn(filePath, checkpoint, line.endOffset);
         if (recovered.length > 0) {
           entries.push(...recovered);
+          // 只有构建成功才加入去重集合；失败保留诊断，但当前扫描游标仍会前进。
           checkpoint.emittedAbortedTurnIds = [turnId, ...checkpoint.emittedAbortedTurnIds]
             .slice(0, MAX_EMITTED_ABORTED_TURNS);
         } else {
           await this.emitRecoveryFailureDiagnostic(filePath, turnId, line.record);
         }
       }
+      // 无论已输出、恢复失败还是命中去重，中断终态都结束 active turn。
       checkpoint.activeTurn = null;
     }
 
+    // nextOffset 只指向最后一个完整换行之后；半行会原样留给下一轮。
     checkpoint.scanOffset = lines.nextOffset;
+    // 终态处理完成后顺带检查历史 pending，随后一次性保存本文件所有状态变化。
     await this.emitDueHookGapWarnings(checkpoint);
     this.saveCheckpoint(key, checkpoint);
     return entries;
@@ -262,11 +286,15 @@ export class CodexAbortedTurnInput extends BaseInput {
   ): Promise<AgentActivityEntry[]> {
     const activeTurn = checkpoint.activeTurn;
     if (!activeTurn) return [];
+    // 只回读当前 turn 的闭区间，而不是重新解析整个可能很大的 rollout 文件。
     const range = await readJsonLines(filePath, activeTurn.startOffset, abortEndOffset);
+    // meta 不一定紧邻 turn，因此使用扫描时保存的绝对字节位置单独读取。
     const metaRecord = checkpoint.latestSessionMetaOffset === null
       ? null
       : await readJsonLineAt(filePath, checkpoint.latestSessionMetaOffset);
+    // meta 缺失不会阻止恢复；extractor 会使用文件名推导的 session ID 和默认 provider。
     const meta = metaRecord ? extractCodexTranscriptMeta(metaRecord) : null;
+    // extractor 负责识别 rollout 协议，builder 再把中间模型转换成统一 AgentActivityEntry。
     const turn = extractAbortedTurn(
       range.items.map(line => line.record),
       meta,
@@ -373,16 +401,22 @@ export class CodexAbortedTurnInput extends BaseInput {
    * 该方法会原地更新传入 checkpoint 的 pending/去重数组。
    */
   private async emitDueHookGapWarnings(checkpoint: CodexAbortedCheckpoint): Promise<void> {
+    // 同一轮检查共用 now，保证多个 pending 项目的宽限期判断基准一致。
     const now = Date.now();
+    // 使用新数组重建待观察集合：已确认有 Hook 状态或已成功写诊断的项不会再次进入。
     const pending: typeof checkpoint.pendingCompletedTurns = [];
     for (const completed of checkpoint.pendingCompletedTurns) {
       if (now - completed.completedAtMs < this.hookGapGraceMs) {
+        // 宽限期内允许 Hook 异步落盘，暂不产生误报警。
         pending.push(completed);
         continue;
       }
+      // Hook 状态存在说明主链已接管该正常 turn，无需旧恢复链路输出或报警。
       if (await this.hasHookState(completed.sessionId)) continue;
       try {
+        // recursive 使首次运行时可以同时创建多级诊断目录，并且目录已存在也不报错。
         await fs.mkdir(this.diagnosticDir, { recursive: true });
+        // 按完成日期分片，便于保留策略处理；appendFile 保留同日其他 turn 的诊断。
         const day = new Date(completed.completedAtMs).toISOString().slice(0, 10);
         await fs.appendFile(path.join(this.diagnosticDir, `codex-hook-gap-${day}.jsonl`), JSON.stringify({
           type: 'codex_hook_missing',
@@ -395,9 +429,11 @@ export class CodexAbortedTurnInput extends BaseInput {
           sessionId: completed.sessionId,
           transcriptTurnId: completed.turnId,
         });
+        // 诊断成功后记录 turn ID；数组截断限制 checkpoint 体积。
         checkpoint.emittedHookGapTurnIds = [completed.turnId, ...checkpoint.emittedHookGapTurnIds]
           .slice(0, MAX_PENDING_COMPLETED_TURNS);
       } catch (error) {
+        // 写盘失败不能丢失观察项：保留到 pending，下一轮仍可重试。
         this.logger.warn('failed to write Codex Hook gap diagnostic', {
           sessionId: completed.sessionId,
           transcriptTurnId: completed.turnId,
@@ -406,6 +442,7 @@ export class CodexAbortedTurnInput extends BaseInput {
         pending.push(completed);
       }
     }
+    // 原地替换使调用者随后 saveCheckpoint 时持久化本轮筛选结果。
     checkpoint.pendingCompletedTurns = pending;
   }
 

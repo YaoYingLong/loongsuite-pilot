@@ -25,7 +25,12 @@ const HIGH_WATERMARK = 32_000;
 const FLUSH_CONCURRENCY = 8;
 const SHUTDOWN_WAIT_TIMEOUT_MS = 30_000;
 
-/** 按源文件分桶并发送原始行。 */
+/**
+ * 按源文件分桶并发送原始行。
+ *
+ * Map 的 key 是源路径，保证同一请求波次能写入正确的 `__path__` tag；每个 bucket 保留原始
+ * 行顺序。Sender 不拥有 checkpoint，是否在拒收时继续推进由 FilePipeline 决定。
+ */
 export class FileSlsSender {
   private readonly transportConfig: SlsTransportConfig;
   private readonly failedLogDir: string;
@@ -38,6 +43,8 @@ export class FileSlsSender {
   private readonly userAgent: string;
 
   /**
+   * 标准化 SLS 目标并保存运行参数；构造阶段不启动 timer 或网络请求。
+   *
    * @param flusherConfig 目标 SLS 配置。
    * @param configName Pipeline 名，同时作为 topic/失败日志 endpoint 名。
    * @param failedLogDir 有界失败诊断目录。
@@ -66,7 +73,12 @@ export class FileSlsSender {
     this.userAgent = buildUserAgent(dataDir);
   }
 
-  /** 幂等启动两秒周期 flush。 */
+  /**
+   * 幂等启动两秒周期 flush。
+   *
+   * timer 未调用 `unref()`，所以它是服务保活资源；FilePipeline.stop() 必须调用 shutdown 清理。
+   * 回调不 await Promise，重叠触发由 `flushing` 标志直接拒绝。
+   */
   start(): void {
     if (this.flushTimer) return;
     this.flushTimer = setInterval(
@@ -77,7 +89,11 @@ export class FileSlsSender {
 
   /**
    * 将文本行包装为 `{content}` 后加入对应 filePath bucket。
-   * @returns 达到 64k 硬上限时 false；调用方不得推进丢失的 pending 数据。
+   *
+   * 当前硬上限判断发生在加入本批之前；如果 buffer 尚未到 64k，一次很大的 `lines` 仍可能让
+   * 它短暂超过阈值。方法保存的是新 `{content}` 对象，不直接持有调用方字符串数组。
+   *
+   * @returns 入队前已达到 64k 时为 false；调用方必须缓存本批并停止继续读该文件。
    */
   enqueue(lines: string[], filePath: string): boolean {
     if (this.bufferSize() >= MAX_BUFFER_SIZE) {
@@ -104,7 +120,13 @@ export class FileSlsSender {
     return this.bufferSize() >= HIGH_WATERMARK;
   }
 
-  /** 按 bucket 顺序处理，每波并行最多 8 个 batch；重入调用直接返回。 */
+  /**
+   * 按 bucket 顺序处理，每波并行最多八个 batch；重入调用直接返回。
+   *
+   * 不同 filePath bucket 串行，单 bucket 内用 `Promise.allSettled` 并发。这样 `__path__` 不会
+   * 混批，同时某个请求 reject 不会掩盖同波其他请求的结果。不论成功失败，本波记录都会从
+   * 内存删除；失败仅持久化有界诊断元数据，不提供 payload 重放。finally 保证解除 flush 门。
+   */
   async flush(): Promise<void> {
     if (this.flushing) return;
     this.flushing = true;
@@ -181,7 +203,12 @@ export class FileSlsSender {
     }
   }
 
-  /** 清定时器、等待正在发送的波次、重试排空，最终余量只写失败元数据。 */
+  /**
+   * 清 timer、限时等待正在发送的波次、重试排空，最终余量只写失败元数据。
+   *
+   * 100ms 等待是异步定时 Promise，不阻塞事件循环；30 秒后即使在途请求仍未返回也继续关闭，
+   * 这是“进程可停止”优先于无限等待。最多三轮 drain 后，残余 payload 从内存清除。
+   */
   async shutdown(): Promise<void> {
     if (this.flushTimer) {
       clearInterval(this.flushTimer);

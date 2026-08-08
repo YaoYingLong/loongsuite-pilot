@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 
-// 本文件同时承担两个角色：既是 loongsuite-pilot 命令的可执行入口，也是供其他模块
-// 按需导入核心组件的包入口。Collector 服务由 scripts/collector-daemon.js 动态加载本文件。
+// Shebang 告诉 Unix 类系统：直接执行构建后的脚本时使用 PATH 中的 node 解释器；Windows
+// 由 npm 生成的命令包装器处理这一行。本文件同时承担两个角色：既是 loongsuite-pilot
+// 命令的可执行入口，也是供其他模块按需导入核心组件的包入口。Collector 服务由
+// scripts/collector-daemon.js 动态加载本文件。
 import * as path from 'path';
 import { Orchestrator } from './core/orchestrator.js';
 import { loadConfig } from './core/config-loader.js';
@@ -35,22 +37,26 @@ async function main(): Promise<void> {
   }
 
   const [command, ...args] = argv;
+  // 数组解构把第一个业务参数作为子命令，其余参数原样交给该子命令自己的解析器。
   if (command === 'token-usage' || command === 'tokens') {
-    // 仅在执行token用量命令时加载相关模块，避免增加 Collector 常规启动阶段的依赖。
+    // 动态 import() 返回 Promise；仅在执行 token 用量命令时加载模块，避免增加 Collector
+    // 常规启动阶段的依赖和初始化副作用。
     const { runTokenUsageCommand } = await import('./cli/token-usage.js');
+    // 设置 exitCode 让 Node 在标准输出排空后自然退出；这里不调用 process.exit() 强制截断。
     process.exitCode = await runTokenUsageCommand(args);
     return;
   }
 
-  // 配置加载遵循“环境变量 > 配置文件 > 默认值”的优先级。 加载并整理 Collector 的完整运行配置
+  // 配置加载遵循“环境变量 > 配置文件 > 默认值”的优先级，并把多种历史写法归一化为
+  // Orchestrator 可直接消费的完整 AnalyticsConfig。
   const config = await loadConfig();
 
   // 文件日志依赖最终解析出的 dataDir，因此必须在配置加载完成后初始化。
-  // 将~/.loongsuite-pilot转换成绝对路径
+  // resolveHome 只展开路径开头的 `~`，把默认目录转换成当前用户下的绝对路径。
   const dataDir = resolveHome(config.dataDir);
-  // ~/.loongsuite-pilot/logs
+  // path.join 使用当前平台分隔符，避免手工拼接在 Windows 上生成混合路径。
   const logDir = path.join(dataDir, 'logs');
-  // ~/.loongsuite-pilot/logs/loongsuite-pilot-service.log，其实就是初始化日志文件
+  // initFileLogging 会创建父目录并安装滚动文件输出；它完成前的日志仍只写控制台。
   await initFileLogging(path.join(logDir, 'loongsuite-pilot-service.log'));
 
   if (!config.enabled) {
@@ -63,18 +69,22 @@ async function main(): Promise<void> {
   // Orchestrator 是顶层编排器，负责串联部署、发现、输入采集、归一化和数据输出。
   const orchestrator = new Orchestrator(config);
 
-  // 系统服务停止或前台收到 Ctrl+C 时，先有序释放各子模块资源，再退出进程。
+  // 系统服务停止或前台收到 Ctrl+C 时，先有序释放各子模块资源，再退出进程。该命名闭包
+  // 捕获当前 orchestrator 实例，交给两个信号监听器复用；异常会成为监听器 Promise 的
+  // rejection（当前实现没有额外 catch，待确认是否需要统一记录关闭失败）。
   const shutdown = async () => {
     logger.info('shutdown signal received');
     await orchestrator.stop();
+    // stop() 已等待输出队列和 checkpoint；此处显式退出，避免第三方依赖遗留句柄拖住进程。
     process.exit(0);
   };
-  // 监听操作系统发送的进程终止信号，收到信号后执行优雅关闭函数 shutdown()
-  // 人工在控制台中断程序发出的信号即终端按下 Ctrl + C
+  // EventEmitter 风格的信号监听器不能 await Promise，因此用 void 明确丢弃返回值；SIGINT
+  // 通常来自 Ctrl+C，SIGTERM 通常来自 kill、容器或服务管理器。当前闭包没有重入锁，短时间
+  // 收到多个信号时可能并行调用 stop()，但最终 process.exit() 会结束进程（待确认）。
   process.on('SIGINT', () => void shutdown());
-  // kill <pid>、Docker/K8s 容器停止、systemd 关闭服务
   process.on('SIGTERM', () => void shutdown());
 
+  // start() 的 rejected Promise 由文件末尾 main().catch 统一记录为启动致命错误。
   await orchestrator.start();
 
   // start() 完成表示所有关键子系统已进入健康运行状态，此时清除上次启动失败记录。
@@ -94,6 +104,8 @@ async function main(): Promise<void> {
 // 捕获配置加载、日志初始化及 Orchestrator 启动阶段未处理的致命异常。
 // 更早发生的 ESM 模块加载异常由 collector-daemon.js 记录为 module_load；这里记录为 startup。
 main().catch((err) => {
+  // Promise 顶层 catch 是 async/await 错误传播的最终边界；正常运行后的异步后台异常应由
+  // 各子模块自行隔离，不会自动到达这里。
   logger.error('fatal startup error', { error: String(err) });
   const breadcrumbDir = resolveBreadcrumbDataDir();
   writeStartupCrash({
@@ -102,6 +114,8 @@ main().catch((err) => {
     version: readInstalledVersion(breadcrumbDir),
     error: err,
   });
+  // 启动链尚未建立可靠的资源关闭顺序，写完 breadcrumb 后立即以非零码退出，交给 daemon
+  // 或系统服务决定是否重启。
   process.exit(1);
 });
 

@@ -30,9 +30,13 @@ const SUPPORTED_MASK_TYPES = new Set<MaskType>([
 /** 进程级编译结果；空数组也表示已尝试加载，避免每条事件重复读盘。 */
 let cachedRules: CompiledMaskRule[] | undefined;
 
-/**
- * 加载并缓存全部内置敏感规则。
- *
+  /**
+   * 加载并缓存全部内置敏感规则。
+   *
+   * 首次调用同步 read/JSON.parse/compile；Node.js 同一线程内该过程不会被另一个事件循环回调插入。
+   * 成功数组和失败空数组都会缓存到进程退出，运行时修改 JSON 不会热更新。返回的是缓存数组
+   * 本身，调用方应只读，避免破坏后续事件使用的规则和共享 RegExp 状态。
+   *
  * @returns 可复用的编译规则数组；资源读取或格式错误时为空数组。
  */
 export function loadSensitiveRules(): CompiledMaskRule[] {
@@ -48,7 +52,10 @@ export function loadSensitiveRules(): CompiledMaskRule[] {
   return cachedRules;
 }
 
-/** 按 MaskConfig 返回当前启用类型的内置规则。 */
+/**
+ * 按 MaskConfig 返回当前启用类型的内置规则新数组。
+ * 规则对象和其中 RegExp/Set 仍与进程缓存共享，StringMasker 会负责重置正则 lastIndex。
+ */
 export function loadEnabledRules(config: MaskConfig): CompiledMaskRule[] {
   const enabledTypes = resolveEnabledMaskTypes(config);
   if (enabledTypes.size === 0) return [];
@@ -65,16 +72,22 @@ export function filterRulesByConfig(
   return rules.filter(rule => enabledTypes.has(rule.type));
 }
 
-/** 将 none/all/custom 模式解析为受支持类型集合，未知 custom 类型自动丢弃。 */
+/**
+ * 将 none/all/custom 模式解析为受支持类型 Set。
+ * Set 同时去重；custom 中未知类型被静默丢弃，避免错误配置启用未实现 matcher。
+ */
 export function resolveEnabledMaskTypes(config: MaskConfig): Set<MaskType> {
   if (config.mode === 'none') return new Set();
   if (config.mode === 'all') return new Set(SUPPORTED_MASK_TYPES);
   return new Set(config.types.filter(type => SUPPORTED_MASK_TYPES.has(type)));
 }
 
-/**
- * 校验版本 1 manifest 并预编译每条规则。
- *
+  /**
+   * 校验版本 1 manifest 并预编译每条规则。
+   *
+   * `map(compileRule)` 是全有或全无：任何一条非法都会中止并抛出，不返回部分规则。生产加载器
+   * 捕获后禁用全部脱敏，以免产生“看似启用但只保护部分密钥”的不确定状态。
+   *
  * @throws manifest 结构或任一规则非法时抛出；生产加载器会捕获并禁用脱敏。
  */
 export function compileSensitiveRules(manifest: SensitiveRulesManifest): CompiledMaskRule[] {
@@ -85,7 +98,10 @@ export function compileSensitiveRules(manifest: SensitiveRulesManifest): Compile
   return manifest.rules.map(compileRule);
 }
 
-/** 根据 kind 构建 RegExp 或 scheme Set，并把预筛关键词统一转小写。 */
+/**
+ * 根据 kind 构建 RegExp、跨行 block RegExp 或 scheme Set，并把预筛关键词统一转小写。
+ * block 使用非贪婪 `*?` 在最近 end marker 停止；urlWithPassword 不编译 regex，而由 URL API 验证。
+ */
 function compileRule(rule: SensitiveRuleDefinition): CompiledMaskRule {
   validateBaseRule(rule);
 

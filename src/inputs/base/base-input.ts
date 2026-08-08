@@ -14,13 +14,18 @@ import type { StateStore } from '../../checkpoints/state-store.js';
 
 /** Input 共用依赖：全局 StateStore 和可覆盖轮询周期。 */
 export interface InputOptions {
+  /** Orchestrator 创建并在多个 Input 间共享的 checkpoint 仓库。 */
   stateStore: StateStore;
+  /** 周期毫秒数；缺省 30 秒。0 等特殊值会原样传给 setInterval，调用方应先校验。 */
   pollIntervalMs?: number;
 }
 
 /**
  * 所有 Input 的抽象基类。
- * 除完全自定义数据源外，应优先继承 IDE/SQLite/Hook/Session 等专用基类。
+ *
+ * 它把不同来源统一成 EventEmitter 协议：子类在 `collect()` 中返回标准事件，本类发布
+ * `entries`；采集/状态保存异常转为 `collect-error`。除完全自定义数据源外，应优先继承
+ * IDE/SQLite/Hook/Session 等专用基类，以复用其游标和资源生命周期。
  */
 export abstract class BaseInput extends EventEmitter {
   /** InputManager、StateStore 与 listener config 使用的唯一 ID。 */
@@ -38,7 +43,14 @@ export abstract class BaseInput extends EventEmitter {
   private cyclePromise: Promise<void> | null = null;
   private _running = false;
 
-  /** 保存依赖、默认 30 秒轮询，并以运行时子类名创建 logger。 */
+  /**
+   * 保存共享 StateStore、解析默认周期，并以运行时子类名创建 logger。
+   *
+   * JavaScript 在 `super()` 执行期间已经能通过 `this.constructor.name` 看到具体子类名，因此日志
+   * tag 会是 `Codex...Input` 等真实类型。构造阶段不创建 timer，也不调用可覆写 Hook。
+   *
+   * @param opts checkpoint 仓库和可选轮询周期。
+   */
   constructor(opts: InputOptions) {
     super();
     this.stateStore = opts.stateStore;
@@ -51,7 +63,17 @@ export abstract class BaseInput extends EventEmitter {
     return this._running;
   }
 
-  /** 幂等启动：onStart -> 立即首轮 -> interval。启动异常由发现/Orchestrator 上层处理。 */
+  /**
+   * 幂等启动，严格按 `onStart -> 立即首轮 -> setInterval` 顺序执行。
+   *
+   * `await onStart()` 让子类先恢复状态、建目录或打开资源；首轮完成后才创建 timer，避免启动与
+   * 定时触发重叠。timer 回调使用 `void`，因为周期错误会在 `runCycleOnce()` 内转为事件。
+   *
+   * 注意 `_running` 在 `onStart()` 前设为 true；若 onStart 抛错，当前实现不会自动回滚该标志，
+   * 后续重试启动的行为需由 AgentDiscoveryService 的实例重建策略保证。
+   *
+   * @throws `onStart()` 异常会向发现服务传播；普通 collect 异常不会从本方法抛出。
+   */
   async start(): Promise<void> {
     if (this._running) return;
     this._running = true;
@@ -63,7 +85,12 @@ export abstract class BaseInput extends EventEmitter {
     this.timer = setInterval(() => void this.runCycle(), this.pollIntervalMs);
   }
 
-  /** 幂等停止：禁止新周期、等待在途周期，再执行子类资源清理。 */
+  /**
+   * 幂等停止：先禁止新周期并清 timer，再等待在途周期，最后执行子类资源清理。
+   *
+   * `await null` 会立即完成，所以没有在途 collect 时同样安全。等待 `cyclePromise` 可确保文件
+   * offset/rowid 保存完成后才关闭数据库或 watcher；`onStop()` 异常原样传播给上层关闭流程。
+   */
   async stop(): Promise<void> {
     if (!this._running) return;
     this._running = false;
@@ -76,7 +103,11 @@ export abstract class BaseInput extends EventEmitter {
     this.logger.info('stopped');
   }
 
-  /** 子类实现单轮采集，Promise 兑现为已经归一化的事件数组。 */
+  /**
+   * 子类实现单轮采集。
+   * @returns Promise 兑现为已经归一化的事件数组；空数组表示本轮没有新数据。
+   * @throws 可抛 I/O/解析异常，`runCycleOnce()` 会记录并发布 `collect-error`。
+   */
   protected abstract collect(): Promise<AgentActivityEntry[]>;
 
   /** 可选版本探测，由具体 Input 实现。 */
@@ -87,12 +118,22 @@ export abstract class BaseInput extends EventEmitter {
   /** 一次性停止 Hook，例如关闭 watcher/数据库。 */
   protected async onStop(): Promise<void> {}
 
-  /** Input 自有 watcher 请求立即采集；仍复用串行 cyclePromise。 */
+  /**
+   * 供子类 watcher 请求立即采集。
+   *
+   * 方法不返回 Promise，也不等待完成；停止状态直接忽略，运行状态则复用 `runCycle()` 的在途
+   * Promise。连续多个 watch 事件会合并到当前周期，而不是排队执行同样次数。
+   */
   protected requestCollection(): void {
     if (this._running) void this.runCycle();
   }
 
-  /** 返回现有周期或创建新周期，并在 settle 后释放门闩。 */
+  /**
+   * 返回现有周期或创建唯一新周期，实现 timer/watcher/首轮之间的防重入。
+   *
+   * `.finally()` 在 fulfilled/rejected 两种结果上都清空成员；返回的新 Promise 保持原结果，
+   * 因而若 `runCycleOnce()` 自身意外 reject，等待它的 start/stop 仍能观察到异常。
+   */
   private runCycle(): Promise<void> {
     if (this.cyclePromise) return this.cyclePromise;
     this.cyclePromise = this.runCycleOnce().finally(() => {
@@ -101,7 +142,16 @@ export abstract class BaseInput extends EventEmitter {
     return this.cyclePromise;
   }
 
-  /** 执行 collect、发布 entries、保存全局 state；异常转成 collect-error 事件。 */
+  /**
+   * 执行 collect、同步发布 entries，再保存共享 StateStore。
+   *
+   * `EventEmitter.emit()` 会在当前调用栈同步执行 listener，但 InputManager 的 listener 只把后续
+   * 异步处理链接到自己的 Promise 队列，因此这里不会等待脱敏和 Flusher 网络发送。checkpoint
+   * 保存发生在 emit 之后，表示“已采集并交给上层队列”，不是“所有远端输出已成功”。
+   *
+   * try/catch 同时覆盖 collect、listener 同步异常和 StateStore.save；捕获后记录并发布
+   * `collect-error`，使 timer 后续周期继续运行。
+   */
   private async runCycleOnce(): Promise<void> {
     try {
       const entries = await this.collect();

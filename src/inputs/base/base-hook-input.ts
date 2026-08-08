@@ -20,6 +20,7 @@ const RECENT_LOG_FILE_LIMIT = 3;
 
 type OffsetMap = Record<string, number>;
 
+/** Hook JSONL 路径和通用轮询依赖。 */
 export interface HookInputOptions extends InputOptions {
   /** Hook JSONL 所在目录。 */
   logDir: string;
@@ -49,7 +50,10 @@ export abstract class BaseHookInput extends BaseInput {
    */
   protected coldStartKeepLastTurnOnly = false;
 
-  /** 保存日志目录和前缀；目录创建延迟到 onStart。 */
+  /**
+   * 保存日志目录和前缀；目录创建延迟到 `onStart()`。
+   * @param opts StateStore、轮询周期、Hook 日志目录和日文件前缀。
+   */
   constructor(opts: HookInputOptions) {
     super(opts);
     this.logDir = opts.logDir;
@@ -64,6 +68,10 @@ export abstract class BaseHookInput extends BaseInput {
   /**
    * 选择候选日文件、按各自 offset 增量转换、裁剪失效 offset 并更新状态。
    * coldStartKeepLastTurnOnly 开启时最后再执行批次级 turn 过滤。
+   *
+   * 多文件串行处理可保持日期顺序，也避免同时分配多个完整文件尾 Buffer。offset Map 在局部副本
+   * 上修改，最后一次性通过 `setState()` 合并；真正磁盘写入由 BaseInput.runCycleOnce 完成。
+   * 每个文件返回的 offset 无论其中是否存在坏行都会推进到本轮 stat 边界。
    */
   protected async collect(): Promise<AgentActivityEntry[]> {
     const today = getTodayDateString();
@@ -128,7 +136,15 @@ export abstract class BaseHookInput extends BaseInput {
     return entries;
   }
 
-  /** 从一个日文件的 startOffset 读到本轮 stat.size，并逐行转换。 */
+  /**
+   * 从一个日文件的 `startOffset` 读到本轮 `stat.size`，并逐行解析、转换。
+   *
+   * 文件不存在/短暂不可访问时返回原 offset，留待下一轮；truncate 时从 0 开始。句柄在 finally
+   * 中关闭。这里按整个新增区一次分配 Buffer，没有读取大小上限；同时也没有缓存末尾半行，
+   * 因而依赖 Hook writer 以完整 JSONL 行原子追加。
+   *
+   * @returns 成功转换事件和应保存的新 byte offset。
+   */
   private async collectFile(
     logFile: string,
     startOffset: number,
@@ -179,7 +195,10 @@ export abstract class BaseHookInput extends BaseInput {
     return { entries, offset: stat.size };
   }
 
-  /** 列出符合 `<prefix>-YYYY-MM-DD.jsonl` 的文件并按名称（日期）排序。 */
+  /**
+   * 列出符合 `<prefix>-YYYY-MM-DD.jsonl` 的文件并按名称排序。
+   * 固定宽度 ISO 日期使字典序等于日历顺序；readdir 失败按“本轮无文件”降级。
+   */
   private async listHookLogFiles(): Promise<string[]> {
     let fileNames: string[];
     try {
@@ -201,7 +220,12 @@ export abstract class BaseHookInput extends BaseInput {
     return /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(suffix);
   }
 
-  /** 合并最近三文件、legacy lastFile 和今天文件，去重后排序。 */
+  /**
+   * 合并最近三文件、legacy lastFile 和今天文件，利用 Set 去重后排序。
+   *
+   * legacy 文件即使不在最近三个中也要保留，才能完成旧 checkpoint 迁移；today 只有真实存在于
+   * readdir 结果时才加入，避免为尚未创建的路径做无意义 I/O。
+   */
   private getCandidateFileNames(
     fileNames: string[],
     lastFile: string | undefined,
@@ -222,7 +246,10 @@ export abstract class BaseHookInput extends BaseInput {
     return Array.from(candidates).sort();
   }
 
-  /** 从 state.extra 解析非负有限数 offset Map；无有效项返回 null。 */
+  /**
+   * 从 `state.extra` 解析非负有限数 offset Map；无有效项返回 null。
+   * 对象中坏字段逐项丢弃，而不是让一个损坏 offset 使全部日文件状态失效。
+   */
   private getPersistedOffsetMap(state: InputState): OffsetMap | null {
     const raw = state.extra?.[OFFSET_MAP_EXTRA_KEY];
     if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
@@ -248,6 +275,10 @@ export abstract class BaseHookInput extends BaseInput {
   /**
    * 从旧 lastFile/lastOffset 或真实冷启动建立逐文件 offset。
    * 默认先把全部现有文件 baseline 到末尾，再只开放明确需要消费的文件。
+   *
+   * 这是 no-history 策略：状态完全缺失时不回灌前几日文件，但今天文件从头读取。若 Hook 在当天
+   * 已运行很久而 StateStore 丢失，今天已有历史仍会被重放；是否开启子类 turn 过滤取决于 writer
+   * 是独立 Hook 还是 Collector 自有 daemon。
    */
   private async seedOffsetMap(
     fileNames: string[],

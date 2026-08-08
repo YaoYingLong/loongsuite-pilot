@@ -25,19 +25,35 @@ const MAX_CACHE_BYTES = 1024 * 1024;
 
 /** 单次读取结果；hasMore 也表示队列中还有旧 reader 待处理。 */
 export interface ReadResult {
+  /** 本轮读到且以换行符结束的完整非空文本行。 */
   lines: string[];
+  /** 当前逻辑路径最新 reader 的可持久化位置，用于进程重启后恢复。 */
   checkpoint: FileCheckpoint;
+  /** 当前物理文件仍有未读字节，或 rotation 队列中还有 reader 等待处理。 */
   hasMore: boolean;
 }
 
-/** 按路径管理一个或多个 inode reader 的增量 tailer。 */
+/**
+ * 按逻辑路径管理一个或多个物理 inode reader 的增量 tailer。
+ *
+ * `readerQueues` 的 key 是配置中发现的当前路径，value 按“旧文件到新文件”排序。例如应用把
+ * `app.log` rename 为 `app.log.1` 并立即创建新 `app.log` 后，旧 inode reader 位于队首，
+ * 新 inode reader 位于队尾。读取时必须先排空旧文件，否则 rotation 边界附近的数据会丢失。
+ *
+ * 本类没有后台 timer。FilePipeline 在正常轮询、背压暂停、系统唤醒和定期清理时分别调用其
+ * 方法；所有文件句柄都在单次方法调用的 `finally` 中关闭。
+ */
 export class FileTailer {
   private readonly filePaths: string[];
   private readonly encoding: BufferEncoding;
   private readonly maxDirSearchDepth: number;
   private readerQueues: Map<string, FileReaderState[]> = new Map();
 
-  /** @param opts glob 路径、文本编码和最大递归深度。 */
+  /**
+   * 保存 glob 路径和读取限制；构造时不扫描磁盘。
+   *
+   * @param opts `filePaths` 可包含 `*`；`encoding` 默认 UTF-8；`maxDirSearchDepth` 为递归层数。
+   */
   constructor(opts: {
     filePaths: string[];
     encoding?: string;
@@ -48,7 +64,14 @@ export class FileTailer {
     this.maxDirSearchDepth = opts.maxDirSearchDepth ?? 0;
   }
 
-  /** 按所有 glob 同步发现文件，整个周期最多返回 100 个稳定排序结果。 */
+  /**
+   * 按所有 glob 同步发现普通文件，整个周期最多返回 100 个稳定排序结果。
+   *
+   * 这是同步文件系统操作，调用方应在低频轮询周期中使用。达到上限立即停止后续 pattern，
+   * 防止一个过宽 glob 长时间占用 Node.js 主线程。
+   *
+   * @returns 按 pattern 顺序拼接、且各 pattern 内排序的路径；重叠 pattern 可能返回重复路径。
+   */
   discoverFiles(): string[] {
     const result: string[] = [];
     for (const pattern of this.filePaths) {
@@ -61,6 +84,13 @@ export class FileTailer {
 
   /**
    * 校验 checkpoint 的文件存在、dev/inode 和可选头签名后恢复 reader。
+   *
+   * `dev + inode` 是 Unix 文件身份；文件路径相同不代表仍是同一物理文件。操作系统也可能在
+   * 删除后复用 inode，所以保存的前 1 KiB MD5 签名提供第二重校验。任何校验失败都选择从
+   * 当前文件重新建 reader，而不是冒险从旧 offset 跳过新内容。
+   *
+   * @param filePath checkpoint 所属的逻辑文件路径。
+   * @param checkpoint StateStore 恢复出的字节位置、文件身份和半行缓存。
    * @returns 校验成功为 true；无效 checkpoint 不修改队列并返回 false。
    */
   async initReaderFromCheckpoint(filePath: string, checkpoint: FileCheckpoint): Promise<boolean> {
@@ -122,7 +152,12 @@ export class FileTailer {
     return [...this.readerQueues.keys()];
   }
 
-  /** 只返回每路径最新 reader checkpoint；保留接口供兼容调用。 */
+  /**
+   * 只返回每个逻辑路径最新 reader 的 checkpoint。
+   *
+   * 旧接口无法表达 rotation 后并存的多个 inode，因而仅为兼容调用保留；需要完整恢复能力的
+   * 调用方应使用 `getAllReaderCheckpoints()`。
+   */
   getCheckpoints(): Map<string, FileCheckpoint> {
     const result = new Map<string, FileCheckpoint>();
     for (const [filePath, queue] of this.readerQueues) {
@@ -134,7 +169,11 @@ export class FileTailer {
     return result;
   }
 
-  /** 返回所有旧/新 reader checkpoint，key 追加 dev/inode 以区分 rotation 队列。 */
+  /**
+   * 返回所有旧/新 reader checkpoint，key 追加 dev/inode 以区分 rotation 队列。
+   *
+   * 返回的是新 Map 和新 checkpoint 对象，调用方持久化或修改结果不会直接改变 reader 状态。
+   */
   getAllReaderCheckpoints(): Map<string, FileCheckpoint> {
     const result = new Map<string, FileCheckpoint>();
     for (const [filePath, queue] of this.readerQueues) {
@@ -149,6 +188,13 @@ export class FileTailer {
   /**
    * 确保 reader 存在、检测 rotation，再从队首 reader 读取完整行。
    * 可选 checkpoint 只在该路径尚无队列时尝试恢复。
+   *
+   * 调用顺序很重要：先恢复/新建 reader，再检测路径当前 inode，最后消费队列。若在恢复前
+   * 检测 rotation，就无法把 checkpoint 指向的旧 inode 与刚创建的新文件正确排进同一队列。
+   *
+   * @param filePath watcher/discovery 发现的当前逻辑路径。
+   * @param checkpoint 可选的磁盘恢复状态；已有内存队列时忽略它，避免重复 reader。
+   * @returns 一批完整行、最新 checkpoint 和是否应立即继续读取的标志。
    */
   async readNewLines(filePath: string, checkpoint?: FileCheckpoint | null): Promise<ReadResult> {
     if (checkpoint && !this.readerQueues.has(filePath)) {
@@ -185,7 +231,12 @@ export class FileTailer {
     return this.processQueue(filePath, queue);
   }
 
-  /** backpressure 暂停读取期间仍可单独检测 rotation，避免错过旧 inode。 */
+  /**
+   * 背压暂停读取期间仍检测 rotation，避免错过旧 inode。
+   *
+   * Sender 队列满时 FilePipeline 不应继续产生行，但日志文件仍可能 rotate。此方法只更新
+   * reader 队列，不读正文，因此既保住旧 inode，又不会绕过背压产生更多待发送数据。
+   */
   async checkRotation(filePath: string): Promise<void> {
     const queue = this.readerQueues.get(filePath);
     if (!queue || queue.length === 0) return;
@@ -205,7 +256,12 @@ export class FileTailer {
     }
   }
 
-  /** 删除超过一小时未活动的 reader；已删除 reader 还要求 deletedTime 同样超时。 */
+  /**
+   * 删除超过一小时未活动的 reader，限制长时间运行进程的内存占用。
+   *
+   * 已标记删除的 reader 同时检查 `deletedTime` 和 `lastUpdateTime`，给 rename 后暂时找不到的
+   * 文件留出恢复窗口；清空的队列连同 Map key 一起移除。
+   */
   cleanupStaleReaders(): void {
     const now = Date.now();
     for (const [filePath, queue] of this.readerQueues) {
@@ -226,7 +282,13 @@ export class FileTailer {
     }
   }
 
-  /** 识别路径消失、dev/inode 变化和 size 回退三类 rotation。 */
+  /**
+   * 识别路径消失、dev/inode 变化和 size 回退三类 rotation。
+   *
+   * 路径消失可能只是 rename 与新建之间的短窗口，所以只标记旧 reader；inode 改变时把旧
+   * reader 标记 deleted 并把新 reader 入队；inode 不变但 size 回退是 copytruncate，只能
+   * 清空半行缓存并把当前 reader offset 归零。
+   */
   private async detectRotation(filePath: string, queue: FileReaderState[]): Promise<void> {
     let stat: fsSync.Stats;
     try {
@@ -291,7 +353,13 @@ export class FileTailer {
     }
   }
 
-  /** 从队首 reader 开始，必要时定位 rename 文件；读完旧 reader 后切换下一项。 */
+  /**
+   * 从队首 reader 开始，必要时按 inode 定位 rename 后的物理文件。
+   *
+   * 一次调用最多从一个 reader 返回一批行，让 FilePipeline 有机会在批次之间检查 Sender
+   * 背压。只有旧 reader 已到 EOF 且标记 deleted 才出队；暂时找不到 rename 文件时保留队列，
+   * 等后续周期重试。
+   */
   private async processQueue(filePath: string, queue: FileReaderState[]): Promise<ReadResult> {
     while (queue.length > 0) {
       const reader = queue[0];
@@ -343,7 +411,15 @@ export class FileTailer {
     return this.emptyResult();
   }
 
-  /** 从单个物理文件按 offset 最多读取 4 MiB，仅返回换行结束的完整非空行。 */
+  /**
+   * 从单个物理文件按 byte offset 最多读取 4 MiB，仅返回换行结束的完整非空行。
+   *
+   * `offset` 按读取字节数推进，而不是按解码后字符串长度推进；最后一个换行后的文本保存在
+   * `reader.cache`，下轮与新字节前缀拼接。文件句柄由 `finally` 关闭，读取或解码异常会原样
+   * reject 给 FilePipeline，避免调用方误把失败当作已消费。
+   *
+   * @returns 当前 reader 的完整行，以及本物理文件在本轮 stat 边界后是否仍有字节。
+   */
   private async readFromReader(
     filePath: string,
     reader: FileReaderState,

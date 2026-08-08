@@ -21,13 +21,17 @@ export const LEGACY_SLS_CLEANUP_RETRY_DELAYS_MS = [250, 1_000, 4_000] as const;
 
 /** 可替换的文件系统接口，便于在单元测试中模拟权限、竞争和瞬时错误。 */
 export interface CleanupFileSystem {
+  /** lstat 不跟随符号链接，用于拒绝通过链接删除目录外文件。 */
   lstat(filePath: string): Promise<Stats>;
+  /** 同一文件系统内原子移动旧目录到待删除名称。 */
   rename(oldPath: string, newPath: string): Promise<void>;
+  /** 返回带类型提示的目录项；删除前仍会再次 lstat 防止竞态。 */
   readdir(directory: string): Promise<Dirent[]>;
   unlink(filePath: string): Promise<void>;
   rmdir(directory: string): Promise<void>;
 }
 
+/** 生产文件系统适配器；测试可逐个方法替换为故障注入实现。 */
 const defaultFileSystem: CleanupFileSystem = {
   lstat: filePath => fs.lstat(filePath),
   rename: (oldPath, newPath) => fs.rename(oldPath, newPath),
@@ -37,19 +41,29 @@ const defaultFileSystem: CleanupFileSystem = {
 };
 
 export interface LegacySlsFailedLogCleanupOptions {
+  /** Collector started 后等待多久再迁移，避免与启动磁盘 I/O 竞争。 */
   startupDelayMs?: number;
+  /** 两个候选文件之间的节流等待，降低大量 unlink 的瞬时磁盘压力。 */
   fileDelayMs?: number;
+  /** 第 1、2、3... 次瞬时失败后的等待序列；总尝试次数比数组长度多一次。 */
   retryDelaysMs?: readonly number[];
+  /** 测试替身；生产使用 node:fs/promises。 */
   fileSystem?: CleanupFileSystem;
+  /** 可替换异步等待；默认 timer 调用 unref。 */
   delay?: (milliseconds: number) => Promise<void>;
 }
 
 /** 清理阶段计数；errors 不会使启动失败，只用于日志和指标。 */
 export interface LegacySlsFailedLogCleanupResult {
+  /** 本轮是否把旧目录成功改名为 pending。已有 pending 时保持 false。 */
   renamed: boolean;
+  /** 成功 unlink 的旧 JSONL 文件数。 */
   deleted: number;
+  /** 未知名称、目录、符号链接等被保守保留的条目数。 */
   skipped: number;
+  /** 无法读取、移动、删除或移除目录的操作数。 */
   errors: number;
+  /** 成功删除文件在删除前 stat 的大小总和，不是物理释放块数。 */
   logicalBytes: number;
 }
 
@@ -60,7 +74,9 @@ export interface LegacySlsFailedLogCleanupResult {
  * timer。正在执行的清理不会被 stop 强行中断，以免留下一半重命名状态。
  */
 export class LegacySlsFailedLogCleanupService {
+  /** 早期版本直接写在 dataDir 根下的旧失败 payload 目录。 */
   private readonly legacyDir: string;
+  /** 重命名后的隔离目录；进程崩溃后下一次启动会优先续删这里。 */
   private readonly pendingDir: string;
   private readonly startupDelayMs: number;
   private readonly fileDelayMs: number;
@@ -84,7 +100,10 @@ export class LegacySlsFailedLogCleanupService {
     this.delay = options.delay ?? unrefDelay;
   }
 
-  /** 安排一次延迟清理；重复 start 会先取消旧 timer。timer 已 unref。 */
+  /**
+   * 安排一次延迟清理；已有 timer 或清理 Promise 时重复 start 直接返回，不会重新计时。
+   * timer 已 unref，因此清理本身不会为了完成迁移而阻止 Collector 退出。
+   */
   start(): void {
     if (this.startupTimer || this.running) return;
     this.startupTimer = setTimeout(() => {
@@ -94,7 +113,7 @@ export class LegacySlsFailedLogCleanupService {
     this.startupTimer.unref();
   }
 
-  /** 仅取消尚未触发的启动 timer，不删除文件。 */
+  /** 仅取消尚未触发的启动 timer，不删除文件；正在运行的 Promise有意继续完成当前文件。 */
   stop(): void {
     if (!this.startupTimer) return;
     clearTimeout(this.startupTimer);
@@ -103,9 +122,10 @@ export class LegacySlsFailedLogCleanupService {
 
   /**
    * 执行或复用正在运行的同一清理 Promise，避免两轮同时 rename/unlink。
- * @returns 完成、跳过及错误计数。
+   * @returns 完成、跳过及错误计数；内部异常转换成 errors=1 的已兑现结果。
    */
   async runCleanup(): Promise<LegacySlsFailedLogCleanupResult> {
+    // 共享同一个 Promise 比布尔锁更有用：并发调用者还能等待并拿到完全相同的最终统计。
     if (this.running) return this.running;
     this.running = this.runOnce()
       .catch(err => {
@@ -124,6 +144,8 @@ export class LegacySlsFailedLogCleanupService {
    */
   private async runOnce(): Promise<LegacySlsFailedLogCleanupResult> {
     const result = emptyResult();
+    // 上次崩溃留下的 pending 优先级最高；本轮清完后直接返回，若 legacy 也同时存在则留给
+    // 下次进程启动处理，避免把两个目录合并时产生同名覆盖（待确认的一次性迁移节奏）。
     const pendingErrors = result.errors;
     const pendingStat = await this.safeLstat(this.pendingDir, result);
 
@@ -182,6 +204,8 @@ export class LegacySlsFailedLogCleanupService {
       return;
     }
 
+    // 先按名字筛选，再对每个候选 lstat；不能只相信 readdir 时的 Dirent，因为两次 await
+    // 之间目录内容可能被其他进程替换。
     const candidates = entries.filter(entry => isLegacyJsonlName(entry.name));
     for (const entry of entries) {
       if (isLegacyJsonlName(entry.name)) continue;
@@ -227,6 +251,7 @@ export class LegacySlsFailedLogCleanupService {
       }
 
       if (index < candidates.length - 1 && this.fileDelayMs > 0) {
+        // 最后一个文件后不再等待，让汇总和空目录删除尽快完成。
         await this.delay(this.fileDelayMs);
       }
     }
@@ -259,6 +284,7 @@ export class LegacySlsFailedLogCleanupService {
         return true;
       } catch (err) {
         const code = errorCode(err);
+        // attempt=0 对应第一次失败后的首个延迟；延迟数组耗尽时停止重试。
         const retryDelay = this.retryDelaysMs[attempt];
         if (!isTransientFileError(code) || retryDelay === undefined) {
           logger.warn('legacy SLS failure cleanup operation failed', {
@@ -322,6 +348,7 @@ function errorCode(error: unknown): string {
 
 /** 判断 rename/unlink 是否值得退避重试。 */
 function isTransientFileError(code: string): boolean {
+  // Windows 杀毒软件、日志查看器或短暂权限竞争常见这三类错误；ENOENT 由各调用点单独处理。
   return code === 'EPERM' || code === 'EBUSY' || code === 'EACCES';
 }
 
@@ -329,6 +356,7 @@ function isTransientFileError(code: string): boolean {
 function unrefDelay(milliseconds: number): Promise<void> {
   return new Promise(resolve => {
     const timer = setTimeout(resolve, milliseconds);
+    // 若 Collector 只剩该退避 timer，允许进程直接结束；清理会在下一次启动从 pending 续作。
     timer.unref();
   });
 }

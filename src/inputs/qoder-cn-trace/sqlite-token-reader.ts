@@ -24,9 +24,11 @@ export interface SqliteTokenData {
  * 数据库不存在或查询失败时返回空数组，调用方可继续用其他 token 来源。
  */
 export async function readSqliteTokensForSession(sessionId: string): Promise<SqliteTokenData[]> {
+  // CN 版每个平台只有一个已知数据库位置；找不到文件时直接让上层保留无 token 的 Hook 事件。
   const dbPath = resolveQoderCnDbPath();
   if (!dbPath) return [];
 
+  // 只查询 assistant 行，因为一条 assistant chat_message 对应一次 LLM response 的 usage。
   const sql = `
     SELECT
       cm.id            AS message_id,
@@ -62,6 +64,7 @@ export async function readSqliteTokensForSession(sessionId: string): Promise<Sql
     return [];
   }
 
+  // ORDER BY 已保证时间顺序，结果数组保持该顺序交给共享 enrichIdeTurn 做跨 turn 对齐。
   const results: SqliteTokenData[] = [];
   for (const row of rows) {
     const info = parseTokenInfo(row.token_info);
@@ -74,6 +77,7 @@ export async function readSqliteTokensForSession(sessionId: string): Promise<Sql
       inputTokens: info.promptTokens,
       outputTokens: info.completionTokens,
       cacheReadTokens: info.cachedTokens,
+      // 新旧 CN 版本保存模型的位置不同，优先 message.model_info，再回退关联 record.extra。
       model: parseModelKey(row.model_info) ?? parseRecordModelKey(row.record_extra),
     });
   }
@@ -91,6 +95,7 @@ function resolveQoderCnDbPath(): string | null {
 
   for (const candidate of candidates) {
     try {
+      // 候选数很小，使用同步 access 让函数直接返回确定路径或 null。
       fs.accessSync(candidate);
       return candidate;
     } catch {
@@ -142,8 +147,10 @@ function parseRecordModelKey(raw: string | null | undefined): string | undefined
 /** 把 sqlite3 只读查询包装为 Promise；查询错误拒绝，关闭错误只写 debug 日志。 */
 function queryReadonly<T>(dbPath: string, sql: string, params: unknown[]): Promise<T[]> {
   return new Promise((resolve, reject) => {
+    // 只读模式确保采集不会对 Qoder CN 自有数据库产生写锁或数据修改。
     const db = new sqlite3.Database(dbPath, sqlite3.OPEN_READONLY, (openErr) => {
       if (openErr) { reject(openErr); return; }
+      // sqlite3 是回调 API；包装成 Promise 后，上层可用 await 保持“查询完成再 enrich”的顺序。
       db.all(sql, params, (queryErr: Error | null, rows: T[]) => {
         db.close((closeErr) => {
           if (closeErr) logger.debug('sqlite close warning', { error: String(closeErr) });

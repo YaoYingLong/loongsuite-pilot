@@ -25,8 +25,11 @@ const REPAIR_TIMEOUT_MS = 30_000;
 const MAX_INTERCEPT_REPAIRS_PER_DAY = 3;
 
 export interface PluginCheckTarget {
+  /** 稳定 Agent ID，同时作为冷却时间 Map 的键。 */
   agentId: string;
+  /** Agent 自己的 JSON 配置文件；目录不存在表示 Agent 尚不可用。 */
   settingsPath: string;
+  /** 必须包含本项目命令 marker 的 Hook 事件名。 */
   expectedHooks: string[];
   /** settings.json 中用于识别本项目 Hook 命令的子串。 */
   markers: string[];
@@ -40,9 +43,13 @@ export interface PluginCheckTarget {
 }
 
 export interface InterceptCheckTarget {
+  /** 冷却与每日计数使用的唯一键。 */
   id: string;
+  /** 返回 true 表示当前注入健康，不需要 repair。 */
   check: () => Promise<boolean>;
+  /** 写 shell rc、launchctl 或插件配置；异常由本类按目标隔离。 */
   repair: () => Promise<void>;
+  /** 检查 Agent/资产是否存在；false 时跳过且不消耗修复额度。 */
   precondition: () => Promise<boolean>;
   /**
    * 所属 Agent 是否被用户配置启用。返回 false 时不注入，而调用可选 cleanup 删除旧
@@ -62,6 +69,8 @@ export interface InterceptCheckTarget {
  */
 export function stripMarkerBlock(content: string, begin: string, end: string): string {
   const out: string[] = [];
+  // inBlock 是逐行状态机；若只出现 begin 而没有 end，余下内容都会被视为区块并移除。
+  // 因此 marker 必须足够具体，只能作用于本项目生成的受控区块。
   let inBlock = false;
   for (const line of content.split('\n')) {
     if (!inBlock && line.includes(begin)) { inBlock = true; continue; }
@@ -72,8 +81,11 @@ export function stripMarkerBlock(content: string, begin: string, end: string): s
 }
 
 export interface CheckResult {
+  /** Hook 健康、处于冷却或修复失败时都会计入；不是纯“健康数”。 */
   checked: number;
+  /** 本轮成功完成 repair 的 Hook 与 intercept 数量。 */
   repaired: number;
+  /** Agent/资产不可用或产品门禁关闭的目标数。 */
   skipped: number;
 }
 
@@ -94,11 +106,17 @@ export interface TargetResult {
  * 共享 settings 被其他工具覆盖时检测并恢复；每目标失败相互隔离。
  */
 export class HookWatchdog {
+  /** ConfigLoader 补齐的总开关、周期与修复冷却。 */
   private readonly config: HookWatchdogConfig;
+  /** 标准 Agent settings.hooks marker 目标。 */
   private readonly targets: PluginCheckTarget[];
+  /** shell rc、launchctl、plugin-inject 等任意 check/repair 目标。 */
   private readonly interceptTargets: InterceptCheckTarget[];
+  /** 成功和失败修复都会写入，避免坏配置持续触发写盘或 spawn。 */
   private readonly lastRepairAt: Map<string, number> = new Map();
+  /** 仅 intercept 使用的 UTC 日修复次数；标准 Hook 只有冷却限制。 */
   private readonly dailyRepairCount: Map<string, number> = new Map();
+  /** 与 dailyRepairCount 对应的 UTC YYYY-MM-DD。 */
   private dailyRepairResetDate = '';
   private startupTimer: ReturnType<typeof setTimeout> | null = null;
   private intervalTimer: ReturnType<typeof setInterval> | null = null;
@@ -117,7 +135,11 @@ export class HookWatchdog {
     this.interceptTargets = interceptTargets ?? [];
   }
 
-  /** 配置开启时延迟 30 秒首检，再按 intervalMs 周期执行。 */
+  /**
+   * 配置开启时延迟 30 秒首检，再按 intervalMs 周期执行。timer 当前未 unref，会维持
+   * Node 进程；Orchestrator.stop() 必须调用 stop()。重复 start 目前也不会清旧 timer，
+   * 生命周期约定是每个实例只启动一次。
+   */
   start(): void {
     if (!this.config.enabled) {
       logger.info('hook-watchdog disabled');
@@ -131,12 +153,14 @@ export class HookWatchdog {
 
     this.startupTimer = setTimeout(() => {
       this.startupTimer = null;
+      // timer 不等待 Promise；runCheck 在目标边界捕获错误。若一轮超过 interval，后续轮次
+      // 可能重叠，lastRepairAt 可限制重复修复，但不构成完整的运行中互斥锁（待确认）。
       void this.runCheck();
       this.intervalTimer = setInterval(() => void this.runCheck(), this.config.intervalMs);
     }, STARTUP_DELAY_MS);
   }
 
-  /** 清除尚未执行的启动与周期 timer。 */
+  /** 清除尚未执行的启动与周期 timer；已开始的检查、文件写入或子进程继续完成。 */
   stop(): void {
     if (this.startupTimer) {
       clearTimeout(this.startupTimer);
@@ -156,6 +180,7 @@ export class HookWatchdog {
     const summary: CheckResult = { checked: 0, repaired: 0, skipped: 0 };
 
     for (const target of this.targets) {
+      // 顺序 await 避免多个安装命令同时改共享 Agent 配置，也让日志顺序稳定。
       try {
         const result = await this.checkTarget(target);
         if (result.status === 'unavailable') {
@@ -163,6 +188,7 @@ export class HookWatchdog {
         } else if (result.status === 'repaired') {
           summary.repaired++;
         } else {
+          // cooldown 与 repair-failed 也归入 checked，表示目标已完成检查但本轮未成功修复。
           summary.checked++;
         }
       } catch (err) {
@@ -180,6 +206,7 @@ export class HookWatchdog {
 
   /** 检查单 Agent settings、marker 和冷却时间，必要时执行修复并返回结构化状态。 */
   private async checkTarget(target: PluginCheckTarget): Promise<TargetResult> {
+    // 先检查父目录，不为未安装 Agent 创建配置目录，也避免 readJsonFile 产生无意义告警。
     const settingsDirOk = await directoryExists(path.dirname(target.settingsPath));
     if (!settingsDirOk) {
       logger.debug('hook-watchdog.skipped', {
@@ -190,6 +217,7 @@ export class HookWatchdog {
     }
 
     if (!target.repairFn && target.binPath) {
+      // 直接 repairFn 不依赖外部 bin；命令型目标必须先确认安装器存在。
       const binOk = await fileExists(target.binPath);
       if (!binOk) {
         logger.debug('hook-watchdog.skipped', {
@@ -200,6 +228,7 @@ export class HookWatchdog {
       }
     }
 
+    // 文件缺失、坏 JSON 都会得到 null，findMissingHooks 会把所有期望事件视为缺失并修复。
     const settings = await readJsonFile<Record<string, unknown>>(target.settingsPath);
     const missing = this.findMissingHooks(settings, target);
     const found = target.expectedHooks.length - missing.length;
@@ -242,6 +271,7 @@ export class HookWatchdog {
     });
 
     const ok = await this.repairTarget(target);
+    // 失败尝试也进入冷却，避免权限错误或坏安装器在每次巡检中重复执行。
     this.lastRepairAt.set(target.agentId, Date.now());
 
     if (!ok) {
@@ -271,7 +301,10 @@ export class HookWatchdog {
     return missing;
   }
 
-  /** 同时兼容 flat `{command}` 与 nested `{hooks:[{command}]}` 条目。 */
+  /**
+   * 同时兼容 flat `{command}` 与 nested `{hooks:[{command}]}` 条目。
+   * markers 采用子串匹配，只识别“至少有一个本项目命令”，不会要求数组中仅包含本项目 Hook。
+   */
   private entryContainsMarker(entry: unknown, markers: string[]): boolean {
     if (!entry || typeof entry !== 'object') return false;
     const e = entry as Record<string, unknown>;
@@ -307,12 +340,16 @@ export class HookWatchdog {
   }
 
   /**
-   * 启动外部安装子进程，清空 NODE_OPTIONS 防止继承旧 preload；收集有限 stderr。
+   * 启动外部安装子进程，清空 NODE_OPTIONS 防止继承旧 preload；stderr 在进程结束前累积，
+   * 记录日志时最多截取 500 字符（内存缓冲本身当前没有上限，待确认）。
    * 30 秒未退出则 SIGKILL，并以 false 兑现而非 reject。
    */
   private repairViaCommand(target: PluginCheckTarget): Promise<boolean> {
     return new Promise(resolve => {
+      // settled 保证 timeout、spawn error 和 exit 三个异步终点只有第一个能兑现 Promise。
       let settled = false;
+      // 使用当前 Node 可执行文件启动 JavaScript bin；非空断言依赖目标契约保证 binPath 与
+      // installArgs 在没有 repairFn 时提供，TypeScript 不会在运行时校验该约束。
       const child = spawn(process.execPath, [target.binPath!, ...target.installArgs!], {
         stdio: ['ignore', 'pipe', 'pipe'],
         env: { ...process.env, NODE_OPTIONS: '' },
@@ -321,6 +358,7 @@ export class HookWatchdog {
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
+        // kill 只是发出终止请求；Promise 立即按失败兑现，之后 exit 事件由 settled 忽略。
         child.kill('SIGKILL');
         logger.error('hook-watchdog.repair-timeout', {
           agent: target.agentId,
@@ -331,6 +369,7 @@ export class HookWatchdog {
 
       let stderr = '';
       child.stderr?.on('data', (chunk: Buffer) => {
+        // stdout 只为防止管道无人读取导致子进程阻塞，不参与错误诊断；stderr 保存到退出。
         stderr += chunk.toString();
       });
 
@@ -388,6 +427,7 @@ export class HookWatchdog {
           continue;
         }
 
+        // precondition 通常只检查 Agent 与本地资产，不读取/修改目标配置。
         const preOk = await target.precondition();
         if (!preOk) {
           logger.debug('intercept-watchdog.skipped', { id: target.id, reason: 'precondition' });
@@ -416,6 +456,7 @@ export class HookWatchdog {
         }
 
         logger.warn('intercept-watchdog.repairing', { id: target.id });
+        // intercept 的计数只在 repair 成功后增加；抛错由外层 catch 隔离，下轮仍可重试。
         await target.repair();
         this.lastRepairAt.set(target.id, Date.now());
         this.dailyRepairCount.set(dayKey, count + 1);
@@ -541,6 +582,7 @@ export class HookWatchdog {
     // 测试可注入 rcPaths 使用临时目录；生产省略并使用 ~/.zshrc、~/.bashrc。
     rcPathsOverride?: string[],
   ): InterceptCheckTarget[] {
+    // 静态工厂返回带闭包的新对象数组，每次调用都有独立 dataDir/home/测试路径捕获值。
     const targets: InterceptCheckTarget[] = [];
     const home = os.homedir();
 
@@ -571,6 +613,7 @@ export class HookWatchdog {
         },
         repair: async () => {
           await execFileAsync('launchctl', ['setenv', 'QODER_WORKER_RUNTIME_PATH', wrapperPath]);
+          // 用固定行数组生成 XML，避免模板缩进把空白意外写入 launchctl 参数值。
           const plistContent = [
             '<?xml version="1.0" encoding="UTF-8"?>',
             '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
@@ -638,6 +681,7 @@ export class HookWatchdog {
           for (const rcPath of rcPaths) {
             if (!await fileExists(rcPath)) continue;
             anyRcExists = true;
+            // 顺序读取两个 rc，防止同时修改时覆盖用户在另一文件中的独立变更。
             const content = await fs.readFile(rcPath, 'utf-8');
             if (content.includes(rc.marker)) {
               if (content.includes(rc.signature)) anyCurrent = true;
@@ -655,6 +699,7 @@ export class HookWatchdog {
             if (content.includes(rc.marker)) {
               if (content.includes(rc.signature)) continue; // 当前结构已生效，无需修复。
               // 删除旧 marker 区域，再追加当前形状。
+              // 先把旧完整区块删除，再统一为一个结尾换行并追加新版本，避免重复 marker。
               const stripped = stripMarkerBlock(content, rc.marker, rc.endMarker).replace(/\n+$/, '\n');
               await fs.writeFile(rcPath, stripped + rc.blockFn(scriptPath) + '\n');
             } else {

@@ -27,9 +27,13 @@ const SHUTDOWN_WAIT_TIMEOUT_MS = 30_000;
 
 /** 构造 sender 所需的目标、命名和运行目录。 */
 export interface QoderApiSlsSenderOptions {
+  /** 目标 SLS endpoint/project/logstore；该 Sender 固定使用 WebTracking。 */
   flusherConfig: PipelineSlsFlusherConfig;
+  /** 作为 topic 和日志标签的 pipeline 配置名。 */
   configName: string;
+  /** 失败摘要目录；出于数据安全不会在这里保存原始 payload。 */
   failedLogDir: string;
+  /** 用于生成带安装版本的 User-Agent。 */
   dataDir: string;
 }
 
@@ -46,7 +50,12 @@ export class QoderApiSlsSender {
   private flushTimer: ReturnType<typeof setInterval> | null = null;
   private flushing = false;
 
-  /** 标准化 endpoint，缓存 User-Agent/hostname，不在构造时创建网络连接。 */
+  /**
+   * 标准化 endpoint，并缓存请求所需的 User-Agent 与 hostname。
+   *
+   * @param opts SLS 目标、pipeline 名称和运行目录。
+   * 构造阶段不创建 socket，也不启动 timer；`start()` 才接管周期 flush 生命周期。
+   */
   constructor(opts: QoderApiSlsSenderOptions) {
     const endpoint = /^https?:\/\//.test(opts.flusherConfig.Endpoint)
       ? opts.flusherConfig.Endpoint
@@ -63,7 +72,12 @@ export class QoderApiSlsSender {
     this.hostname = os.hostname();
   }
 
-  /** 幂等启动非保活两秒定时器。 */
+  /**
+   * 幂等启动两秒一次的非保活 flush 定时器。
+   *
+   * 回调中的 `void` 明确丢弃 Promise；`flush()` 自己用 `flushing` 防重入，但网络失败仍会在其
+   * 内部处理。`unref()` 使该定时器不会成为进程无法退出的唯一原因。
+   */
   start(): void {
     if (this.flushTimer) return;
     this.flushTimer = setInterval(
@@ -73,7 +87,14 @@ export class QoderApiSlsSender {
     this.flushTimer.unref();
   }
 
-  /** 批量入队；已达到 64k 硬上限时拒绝整个新批次。 */
+  /**
+   * 把整批宽表记录追加到有序内存 buffer。
+   *
+   * 当前实现只在“入队前已有数量达到 64k”时拒绝，未预先计算本批加入后的大小，因此一次大批
+   * 可能暂时超过该阈值。返回 true 只表示 Sender 接管了对象引用，不代表远端已经成功写入。
+   *
+   * @returns true 表示已接管，false 表示调用方必须保留窗口并在下轮重采。
+   */
   enqueue(rows: Record<string, string>[]): boolean {
     if (this.bufferSize() >= MAX_BUFFER_SIZE) {
       logger.warn('buffer full, rejecting enqueue', {
@@ -93,7 +114,14 @@ export class QoderApiSlsSender {
     return this.bufferSize() >= HIGH_WATERMARK;
   }
 
-  /** 防重入 flush；每波切成最多 8 个 batch 并行发送。 */
+  /**
+   * 防重入地排空 buffer，每波最多并发发送八个 4000 行 batch。
+   *
+   * `Promise.allSettled` 等待同一波所有请求结束，使一个 reject 不会让其他请求结果丢失。无论
+   * 成功或失败，本波对应的 buffer 前缀随后都会删除；失败只保存有界元数据，不在磁盘保留
+   * 可能包含源码/提示词的原始行。任一 batch 失败后停止继续排空，给下一周期留下恢复机会。
+   * `finally` 在任何异常路径都清除 `flushing`，避免 Sender 永久锁死。
+   */
   async flush(): Promise<void> {
     if (this.flushing || this.buffer.length === 0) return;
     this.flushing = true;
@@ -167,7 +195,13 @@ export class QoderApiSlsSender {
     }
   }
 
-  /** 清理定时器、限时等待在途 flush、重试排空并记录最终余量摘要。 */
+  /**
+   * 清理 timer、限时等待在途 flush，并尝试排空剩余记录。
+   *
+   * 等待采用 100ms 异步轮询，不阻塞事件循环；30 秒上限防止服务停止永久挂住。之后最多调用
+   * `flush()` 三轮。仍未发送的数据从内存删除，只落数量、字节数和错误原因，随后 Promise 才
+   * 完成，因此 Pipeline 可以把它作为资源关闭屏障。
+   */
   async shutdown(): Promise<void> {
     if (this.flushTimer) {
       clearInterval(this.flushTimer);

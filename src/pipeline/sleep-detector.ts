@@ -18,12 +18,21 @@ export interface WakeEvent {
   sleepDurationMs: number;
 }
 
-/** 通过 EventEmitter 发布系统唤醒事件。 */
+/**
+ * 通过 EventEmitter 发布系统唤醒事件。
+ *
+ * Node.js 没有跨平台统一的系统唤醒事件，本类用定时器实际触发间隔近似判断。`emit()` 会同步
+ * 调用所有 listener；PipelineManager 的 listener 用 `void` 启动异步恢复，因此 tick 本身不会
+ * 等待文件扫描结束。该估算也可能把事件循环长时间阻塞误判为睡眠，调用方的恢复操作需幂等。
+ */
 export class SleepDetector extends EventEmitter {
   private lastTickTime = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
 
-  /** 幂等启动非保活 tick 定时器。 */
+  /**
+   * 幂等启动非保活 tick 定时器。
+   * `unref()` 表示只有该 timer 存在时 Node.js 可以自然退出；重复 start 不会注册第二个 timer。
+   */
   start(): void {
     if (this.timer) return;
     this.lastTickTime = Date.now();
@@ -41,7 +50,11 @@ export class SleepDetector extends EventEmitter {
     this.removeAllListeners('wake');
   }
 
-  /** 比较实际/预期间隔，并在超过阈值时同步 emit。 */
+  /**
+   * 比较实际/预期间隔，并在超过阈值时同步发布 `wake`。
+   *
+   * 无论是否达到阈值都先更新 `lastTickTime`，避免一次长延迟在后续 tick 被重复报告。
+   */
   private tick(): void {
     const now = Date.now();
     const elapsed = now - this.lastTickTime;

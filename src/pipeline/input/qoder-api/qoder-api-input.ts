@@ -29,16 +29,23 @@ const MAX_OFFSET_PAGES = 50;
 
 /** 创建 Input 所需 client、组织身份、状态目录和首轮回溯参数。 */
 export interface QoderApiInputOptions {
+  /** 已配置 Bearer token、超时和 API 根地址的 HTTP Client；Input 不直接接触密钥。 */
   client: QoderApiClient;
+  /** Qoder 组织 ID，同时参与请求路径和确定性 event_id 的计算。 */
   orgId: string;
+  /** 本地配置实例名，用于区分同一进程中的多套组织配置和状态文件。 */
   configName: string;
+  /** checkpoint 文件目录；最终文件名为 `<configName>.json`。 */
   stateDir: string;
+  /** 外层 Pipeline 的轮询间隔。此字段由创建链统一传入，本类本身不创建 timer。 */
   interval: number;
+  /** 首次没有 checkpoint 时向前回溯的天数；后续周期从已确认窗口末尾继续。 */
   backfillDays: number;
 }
 
 /** StateStore 中只持久化最近已确认窗口终点。 */
 interface WindowState {
+  /** 已被 Sender 接管的最后一个窗口终点；没有该值表示尚未成功确认过任何周期。 */
   lastWindowEnd?: string;
 }
 
@@ -61,7 +68,14 @@ export class QoderApiInput {
   private inFlight: Promise<Record<string, string>[]> | null = null;
   private pendingWindowEnd: string | null = null;
 
-  /** 保存依赖并为每份 configName 使用独立状态文件。interval 由 Pipeline 管理，此处不建定时器。 */
+  /**
+   * 保存依赖并为每份 `configName` 创建独立状态文件。
+   *
+   * 构造阶段只组装对象，不访问网络或磁盘；StateStore 在第一次 `collect()` 时才加载。这样
+   * Orchestrator 可以先完成所有组件构造，再由 Pipeline 统一决定何时真正启动 I/O。
+   *
+   * @param opts HTTP Client、组织身份、状态目录和首次回溯范围。
+   */
   constructor(opts: QoderApiInputOptions) {
     this.client = opts.client;
     this.orgId = opts.orgId;
@@ -72,14 +86,25 @@ export class QoderApiInput {
     this.stateStore = new StateStore(this.stateFilePath);
   }
 
-  /** 是否已观察到 401/403；为 true 后后续 collect 直接返回空数组。 */
+  /**
+   * 判断本实例是否已经遇到永久鉴权错误。
+   *
+   * 401/403 通常需要修改配置而不是重试。Pipeline 读取该标志后可以停止无意义轮询；本方法
+   * 只读取内存状态，不发请求、不修改 checkpoint。
+   */
   hasFatalAuthError(): boolean {
     return this.fatalAuthError;
   }
 
   /**
    * 运行完整多阶段采集并返回所有宽表行。
-   * 上一轮仍在执行或已发生永久鉴权错误时返回空数组。
+   *
+   * `inFlight` 是一个进程内互斥门：上一轮仍在等待网络时，新触发不会加入同一个 Promise，
+   * 而是返回空数组。这样可以防止慢请求让定时器周期重叠并重复拉取相同窗口。`finally` 在成功
+   * 和异常两条路径上都会清门，异常仍按原样传播给 QoderApiPipeline。
+   *
+   * @returns 本轮转换后的 SLS 宽表记录；鉴权已失效或发生重入时返回空数组。
+   * @throws `runCycle()` 未隔离的初始化/时间转换错误会向上抛出，由 Pipeline 记录周期失败。
    */
   async collect(): Promise<Record<string, string>[]> {
     if (this.fatalAuthError) return [];
@@ -98,6 +123,13 @@ export class QoderApiInput {
   /**
    * sender 接受本轮行后由 Pipeline 调用，原子持久化 pending 窗口终点。
    * 发送接管失败时不调用，因此保持至少一次采集语义并在下轮重采。
+   *
+   * 注意“接受”表示记录已经进入 Sender 的受控缓冲区，不等同于远端 SLS 已成功响应。状态先
+   * 写入 StateStore 内存，再 `await save()` 落盘；只有保存成功才清除 pending 值，保存失败会
+   * reject 给 Pipeline，使调用者知道确认没有完成。
+   *
+   * @returns checkpoint 已持久化后兑现的 Promise；没有待确认窗口时立即完成。
+   * @throws 文件系统写入失败时保留 `pendingWindowEnd` 并向上抛出。
    */
   async confirmCycle(): Promise<void> {
     if (this.pendingWindowEnd) {
@@ -107,7 +139,16 @@ export class QoderApiInput {
     }
   }
 
-  /** 初始化状态、计算窗口、执行所有 API 阶段并记录待确认终点。 */
+  /**
+   * 初始化状态、计算半开采集窗口、执行全部 API 阶段并记录待确认终点。
+   *
+   * 方法内部允许单个 endpoint 失败后继续收集其他 endpoint，但会把 `advanceWindow` 置为
+   * false。这样已成功的数据仍可发送，同时不会跨过失败窗口；下一轮会用相同起点重新拉取，
+   * 下游依靠确定性 `event_id` 去重。只有所有要求推进的阶段都成功，才设置
+   * `pendingWindowEnd`。
+   *
+   * @returns 按各 API 返回顺序拼接的宽表记录数组。
+   */
   private async runCycle(): Promise<Record<string, string>[]> {
     // StateStore 首轮惰性加载，后续周期复用内存状态。
     if (!this.stateLoaded) {
@@ -116,6 +157,7 @@ export class QoderApiInput {
       this.stateLoaded = true;
     }
 
+    // 固定本轮 windowEnd，避免十多个 API 依次执行时各自读取“现在”而产生窗口缝隙。
     const startedAt = Date.now();
     const windowEnd = new Date();
     const state = this.getWindowState();
@@ -136,9 +178,14 @@ export class QoderApiInput {
     const endIso = windowEnd.toISOString();
     const reportTs = endIso;
 
+    // 任一关键阶段失败后该标志永久保持 false；后续成功不能把失败覆盖掉。
     let advanceWindow = true;
     const logs: Record<string, string>[] = [];
     const counts: Record<string, number> = {};
+    /**
+     * 所有转换结果通过同一闭包入队，同时按 kind 计数，避免每个阶段重复维护诊断统计。
+     * 闭包只修改当前 `runCycle` 的局部数组和对象，不会跨周期共享状态。
+     */
     const pushLog = (log: Record<string, string>): void => {
       logs.push(log);
       const kind = log.kind ?? 'unknown';
@@ -167,6 +214,7 @@ export class QoderApiInput {
     if (members.length > 0) {
       for (let i = 0; i < members.length; i += MEMBER_CONCURRENCY) {
         const batch = members.slice(i, i + MEMBER_CONCURRENCY);
+        // allSettled 会等待本批五个成员全部结束；某一成员 reject 不会提前取消其余请求。
         const results = await Promise.allSettled(
           batch.map((m) =>
             this.fetchMemberData(m, startIso, endIso, reportTs).then(
@@ -358,6 +406,7 @@ export class QoderApiInput {
     // 15. 发送由外层 Pipeline/Sender 完成，本类不访问 SLS。
 
     // 16. 仅记录候选窗口终点；外层确认 sender 接管后才由 confirmCycle 真正推进。
+    // 这里只写内存候选值；真正 checkpoint 提交必须等 Pipeline 调用 confirmCycle()。
     this.pendingWindowEnd = advanceWindow ? endIso : null;
 
     this.logger.info('qoder-api cycle done', {

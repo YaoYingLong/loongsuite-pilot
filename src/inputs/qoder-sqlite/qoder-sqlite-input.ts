@@ -80,9 +80,11 @@ export class QoderSqliteInput extends BaseSqliteInput {
    * 仅在尚无 lastRowId 时读取当前最大可用 rowid 作为起点；查询失败只告警，后续轮询仍可重试。
    */
   protected override async onStart(): Promise<void> {
+    // 已有游标说明之前成功启动过，必须从保存位置继续，不能重新 baseline 丢掉停机期间新增行。
     if (this.stateStore.get(this.id).lastRowId !== undefined) return;
 
     try {
+      // 首次安装只关心之后新增的消息，因此把当前最大 eligible rowid 作为起始高水位。
       const maxRowId = await readMaxEligibleRowId(this.dbPath);
       this.stateStore.setRowId(this.id, maxRowId);
     } catch (err) {
@@ -92,6 +94,7 @@ export class QoderSqliteInput extends BaseSqliteInput {
 
   /** 查询游标之后 token_info 为合法非空 JSON 的消息，并按 rowid 升序返回。 */
   protected async readNewRows(lastRowId: number): Promise<SqliteRow[]> {
+    // SQL 在数据库侧过滤空值和非法 JSON，减少 Node.js 需要解析与丢弃的行数。
     const sql = `
       SELECT
         rowid,
@@ -109,6 +112,7 @@ export class QoderSqliteInput extends BaseSqliteInput {
       ORDER BY rowid ASC
     `;
 
+    // 参数绑定而非字符串拼接，既处理数值类型，也避免改变 SQL 结构。
     return queryReadonly<QoderTokenRow>(this.dbPath, sql, [lastRowId]);
   }
 
@@ -120,11 +124,13 @@ export class QoderSqliteInput extends BaseSqliteInput {
     const tokenInfo = parseTokenInfo(qoderRow.tokenInfo);
     if (!tokenInfo) return null;
 
+    // 各字段独立校验；某个分项缺失不会使整条 response 丢失。
     const inputTokens = finiteNumber(tokenInfo.prompt_tokens);
     const outputTokens = finiteNumber(tokenInfo.completion_tokens);
     const cacheReadTokens = finiteNumber(tokenInfo.cached_tokens);
     const maxInputTokens = finiteNumber(tokenInfo.max_input_tokens);
 
+    // rowid/message_id 留在 attributes 供排障和回溯，不占用统一 GenAI 顶层命名空间。
     const attributes: Record<string, JsonValue> = {
       source: SOURCE,
       rowid: qoderRow.rowid,
@@ -144,6 +150,7 @@ export class QoderSqliteInput extends BaseSqliteInput {
       'gen_ai.usage.input_tokens': inputTokens,
       'gen_ai.usage.output_tokens': outputTokens,
       'gen_ai.usage.cache_read.input_tokens': cacheReadTokens,
+      // 只有输入和输出都可靠时才计算 total，避免用 0 伪装缺失分项。
       'gen_ai.usage.total_tokens': sumIfPresent(inputTokens, outputTokens),
       attributes,
     });
@@ -192,12 +199,14 @@ function queryReadonly<T>(
 ): Promise<T[]> {
   return new Promise((resolve, reject) => {
     let db: sqlite3.Database;
+    // OPEN_READONLY 保证采集器不会锁表写入或改变 Agent 自己的数据库。
     db = new sqlite3.Database(dbPath, sqlite3.OPEN_READONLY, (openErr) => {
       if (openErr) {
         reject(openErr);
         return;
       }
 
+      // 无论查询成功失败都先关闭连接；只有连接关闭完成后才兑现或拒绝 Promise。
       db.all(sql, params, (queryErr: Error | null, rows: T[]) => {
         db.close((closeErr) => {
           if (queryErr) {

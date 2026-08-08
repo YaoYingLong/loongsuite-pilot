@@ -10,11 +10,22 @@
 import { createLogger, type BoundLogger } from '../utils/logger.js';
 import { readJsonFile, writeJsonFile } from '../utils/fs-utils.js';
 
+/**
+ * 一个业务对象的去重记录。
+ *
+ * `timestamp` 是源数据时间，用于扫描高水位；`seenAt` 是 Collector 本地观察时间，用于保留期
+ * 清理，两者不能混用。pending/processed 表示已登记和已成功产出两个阶段。
+ */
 export interface SnapshotEntry {
+  /** 调用方构造的稳定业务去重键。 */
   key: string;
+  /** 源事件时间戳，单位为毫秒。 */
   timestamp: number;
+  /** Collector 首次登记时间，单位为毫秒。 */
   seenAt: number;
+  /** pending 会参与去重但不会推进 highWatermark。 */
   status: 'pending' | 'processed';
+  /** 可选处理说明，供诊断而非状态机判断。 */
   reason?: string;
 }
 
@@ -64,10 +75,14 @@ export class SnapshotStore {
     this.logger = createLogger('SnapshotStore');
   }
 
-/**
- * 从磁盘恢复条目并重新计算高水位。非法 status 按 pending 处理，避免误判为已消费。
- * @returns 恢复完成后兑现的 Promise；首次运行缺少文件时得到空仓库。
- */
+  /**
+   * 从磁盘恢复条目并重新计算高水位。非法 status 按 pending 处理，避免误判为已消费。
+   *
+   * 磁盘中的 `highWatermark` 不直接信任，而是从合法 processed 条目重新推导，避免文件被手工
+   * 修改或旧版本写入不一致值。数值字段用 `Number(...) || 0` 兼容字符串数字和缺失值。
+   *
+   * @returns 恢复完成后兑现的 Promise；首次运行缺少文件时得到空仓库。
+   */
   async load(): Promise<void> {
     const data = await readJsonFile<SnapshotStoreData | null>(this.filePath);
     this.entries.clear();
@@ -96,10 +111,14 @@ export class SnapshotStore {
     this.dirty = false;
   }
 
-/**
- * 先清理过期条目、重算高水位，再在 dirty 时原子写盘。
- * @throws 写入失败时透传文件系统异常，dirty 保持为 true 供下次重试。
- */
+  /**
+   * 先清理过期条目、重算高水位，再在 dirty 时原子写盘。
+   *
+   * prune 可能自行把 dirty 置为 true；重算必须发生在 prune 后，否则被删除的最大 processed
+   * 时间会继续错误抬高建议查询起点。写盘成功才清 dirty。
+   *
+   * @throws 写入失败时透传文件系统异常，dirty 保持为 true 供下次重试。
+   */
   async flush(): Promise<void> {
     this.prune();
     this.highWatermark = rebuildHighWatermark(this.entries);
@@ -114,12 +133,20 @@ export class SnapshotStore {
     this.dirty = false;
   }
 
-/** key 从未出现过时才返回 true；pending 也可阻止进程内重复并发处理。 */
+  /**
+   * key 从未出现过时才允许处理。
+   *
+   * pending 也会被持久化并阻止后续处理，直到条目超过 retention 被 prune；因此它不只是进程内
+   * 并发锁。构建失败后是否应主动清 pending 当前没有接口，恢复策略需要结合具体 Input 确认。
+   */
   shouldProcess(key: string): boolean {
     return !this.entries.has(key);
   }
 
-/** 登记待处理对象并记录本地 seenAt；只改内存。 */
+  /**
+   * 登记待处理对象并记录本地 seenAt；只修改内存并设置 dirty。
+   * 调用方应在耗时转换前调用，以阻止同一轮扫描中重复业务 key 被并发/重复处理。
+   */
   markPending(key: string, timestamp: number): void {
     const now = Date.now();
     this.entries.set(key, {
@@ -131,10 +158,11 @@ export class SnapshotStore {
     this.dirty = true;
   }
 
-/**
- * 把已登记对象标为 processed 并推进高水位；未知 key 只记录警告，不自动创建。
- * @param reason 可选诊断原因；未传时保留旧值。
- */
+  /**
+   * 把已登记对象标为 processed 并推进高水位；未知 key 只记录警告，不自动创建。
+   * @param reason 可选诊断原因；未传时保留旧值。
+   * 未知 key 不创建，是为了强制调用顺序保持 `shouldProcess -> markPending -> markProcessed`。
+   */
   markProcessed(key: string, reason?: string): void {
     const entry = this.entries.get(key);
     if (!entry) {
@@ -151,9 +179,12 @@ export class SnapshotStore {
     this.dirty = true;
   }
 
-/**
- * 返回查询 since：取“成功高水位”和“当前时间减保留期”中较新者。
- */
+  /**
+   * 返回查询 since：取“成功高水位”和“当前时间减保留期”中较新者。
+   *
+   * 这会限制每轮扫描范围：既不早于最近成功处理事件，也不早于保留窗口。数据源若可能迟到到
+   * 已有高水位之前，则只能依靠其自身查询语义或更长 retention，当前策略不会主动回看。
+   */
   getSuggestedSinceTimestamp(): number {
     const floor = Date.now() - this.retentionMs;
     return Math.max(this.highWatermark, floor);
@@ -164,7 +195,10 @@ export class SnapshotStore {
     return this.entries.size;
   }
 
-/** 按 seenAt 删除保留期外条目；实际删除才设置 dirty。 */
+  /**
+   * 按本地 `seenAt` 删除保留期外条目；实际删除才设置 dirty。
+   * 遍历 Map 时删除当前 key 是 JavaScript Map 支持的行为，不会跳过后续条目。
+   */
   private prune(): void {
     const now = Date.now();
     for (const [key, entry] of this.entries) {

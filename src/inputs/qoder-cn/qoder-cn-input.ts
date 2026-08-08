@@ -77,6 +77,7 @@ export class QoderCnInput extends BaseIdeInput {
 
   /** 扫描 History 子目录并筛出 source 名称可确认由 AI 产生的编辑记录。 */
   private async scanFileHistory(events: CodeGenerationEvent[], sinceTs: number): Promise<void> {
+    // Qoder CN 与国际版使用相同的 VS Code History 结构，但数据根目录和状态完全隔离。
     const historyRoot = path.join(this.dataRoot, 'User', 'History');
 
     let dirs: string[];
@@ -86,6 +87,7 @@ export class QoderCnInput extends BaseIdeInput {
       return;
     }
 
+    // 每个 History 子目录独立解析，单目录损坏不会终止整个采集周期。
     for (const dir of dirs) {
       const entriesFile = path.join(historyRoot, dir, 'entries.json');
       try {
@@ -94,13 +96,16 @@ export class QoderCnInput extends BaseIdeInput {
           resource?: string;
           entries?: Array<{ id?: string; timestamp?: number; source?: string }>;
         };
+        // 缺少目标资源或版本列表时无法判断编辑对象，直接跳过。
         if (!data.entries || !data.resource) continue;
 
         for (const entry of data.entries) {
           const ts = entry.timestamp ?? 0;
+          // 只保留 BaseIdeInput 查询窗口内的版本，减少 SnapshotStore 后续去重成本。
           if (ts < sinceTs) continue;
 
           const source = entry.source?.toLowerCase() ?? '';
+          // 排除人工编辑历史，只接受来源名称明确包含 AI/Agent 语义的版本。
           const isAI = /qoder|ai|agent|copilot|assistant|completion/.test(source);
           if (!isAI) continue;
 
@@ -123,6 +128,7 @@ export class QoderCnInput extends BaseIdeInput {
 
   /** 按 StateStore offset 增量读取 CN ai_tracker JSONL，坏行跳过且句柄始终关闭。 */
   private async scanAiTracker(events: CodeGenerationEvent[], sinceTs: number): Promise<void> {
+    // ai_tracker 是追加式 JSONL，使用 StateStore offset 而不是按时间遍历全部历史。
     const trackerDir = path.join(this.dataRoot, 'SharedClientCache', 'cache', 'ai_tracker');
 
     let files: string[];
@@ -134,19 +140,23 @@ export class QoderCnInput extends BaseIdeInput {
 
     for (const file of files.filter(f => f.endsWith('.jsonl'))) {
       const filePath = path.join(trackerDir, file);
+      // CN 使用独立前缀，避免与国际版同名 tracker 文件共享状态。
       const stateKey = `qoder-cn-tracker:${file}`;
       let offset: number;
       try {
         const stat = await fs.stat(filePath);
         const prev = this.stateStore.get(stateKey);
         offset = prev.lastOffset ?? 0;
+        // 未增长时跳过；同名文件截断不会在此重置，当前依赖轮转使用新文件名建立新状态。
         if (stat.size <= offset) continue;
 
         const handle = await fs.open(filePath, 'r');
         try {
+          // 从上次文件尾读取到本次 stat.size，finally 确保异常时也关闭句柄。
           const buf = Buffer.alloc(stat.size - offset);
           await handle.read(buf, 0, buf.length, offset);
           const text = buf.toString('utf-8');
+          // 完整读取后推进 offset；坏 JSON 行随后被单独跳过，不在下周期反复重试。
           this.stateStore.update(stateKey, { lastOffset: stat.size });
 
           for (const line of text.split('\n')) {
@@ -158,8 +168,10 @@ export class QoderCnInput extends BaseIdeInput {
               const aiDeletedLines = record.aiDeletedLines as string[] ?? [];
               const modifiedContent = record.aiModifiedContent as string ?? '';
 
+              // CN tracker 有时提供源时间；类型不可靠时才回退到当前采集时间。
               const recordTs = typeof record.timestamp === 'number' ? record.timestamp : Date.now();
 
+              // 正文截断为 2000 字符，added/deleted 行列表仍放在 rawData 供诊断。
               events.push({
                 agentType: ClientType.QoderCn,
                 filePath: fp,
@@ -186,6 +198,7 @@ export class QoderCnInput extends BaseIdeInput {
 
   /** 使用统一 EntryBuilder 把 CN 中间事件转换为 AgentActivityEntry。 */
   protected async buildEntry(event: CodeGenerationEvent): Promise<AgentActivityEntry | null> {
+    // 优先使用来源显式 sessionId，再退回 History entryId；空值不在这里猜测生成。
     return buildAgentActivityEntry({
       sessionId: (event.rawData.sessionId as string)
         ?? (event.rawData.entryId as string)

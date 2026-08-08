@@ -58,11 +58,13 @@ export class QoderCliSessionInput extends BaseSessionInput {
    * 枚举启动时已有 segment，并把每个文件 offset 设置到当前大小，同时记录 inode 供轮转检测。
    */
   protected override async onStart(): Promise<void> {
+    // BaseSessionInput 默认会从 0 读取新文件；这里显式 baseline 现有文件，避免重复采集安装前 usage。
     const files = await this.discoverSessionFiles();
     for (const filePath of files) {
       try {
         const stat = await fs.stat(filePath);
         const stateKey = this.stateKey(filePath);
+        // offset 与 inode 分开保存：offset 用于增量读取，inode 用于识别同名文件是否已被替换。
         this.stateStore.setOffset(stateKey, stat.size);
         this.stateStore.update(stateKey, { extra: { inode: (stat as any).ino } });
       } catch {
@@ -74,6 +76,7 @@ export class QoderCliSessionInput extends BaseSessionInput {
   /** 按 cwd/session/segments 三层结构发现 JSONL，并排序以获得稳定处理顺序。 */
   protected async discoverSessionFiles(): Promise<string[]> {
     const files: string[] = [];
+    // 辅助函数会把结果原地追加到同一数组，避免每层递归创建和合并临时数组。
     await collectSegmentFiles(this.sessionDir, files);
     return files.sort();
   }
@@ -86,8 +89,10 @@ export class QoderCliSessionInput extends BaseSessionInput {
     record: Record<string, unknown>,
     filePath: string,
   ): Promise<AgentActivityEntry | null> {
+    // segment 还包含 request/tool/日志事件；本 Input 的职责仅是补齐 response token usage。
     if (record.type !== SUPPORTED_EVENT_TYPE) return null;
 
+    // data 来自不可信 JSON，先收窄为普通对象，后续每个标量再分别校验类型。
     const data = asRecord(record.data);
     const sessionInfo = extractSessionInfo(filePath);
     const timestamp = parseTimestamp(record.ts);
@@ -98,6 +103,7 @@ export class QoderCliSessionInput extends BaseSessionInput {
     const model = stringValue(data.model) ?? UNKNOWN_MODEL;
     const responseId = stringValue(record.request_id);
 
+    // segment 文件和原始序号放入 attributes，便于 token 对不上时定位源数据。
     const attributes: Record<string, JsonValue> = {
       source: SOURCE,
       'qoder.type': SUPPORTED_EVENT_TYPE,
@@ -114,6 +120,7 @@ export class QoderCliSessionInput extends BaseSessionInput {
     addIfPresent(attributes, 'stop_reason', stringValue(data.stop_reason));
     addIfPresent(attributes, 'content_block_count', finiteNumber(data.content_block_count));
 
+    // requestId 不一定存在，因此 event.id 还包含路径、seq、turn 和时间等稳定字段。
     return buildAgentActivityEntry({
       timestamp,
       time_unix_nano: timestampToUnixNanos(timestamp),
@@ -127,6 +134,7 @@ export class QoderCliSessionInput extends BaseSessionInput {
       'gen_ai.usage.output_tokens': outputTokens,
       'gen_ai.usage.cache_read.input_tokens': cacheReadTokens,
       'gen_ai.usage.cache_creation.input_tokens': cacheWriteTokens,
+      // 输入/输出任一缺失时省略 total，避免把缺失字段按 0 计算。
       'gen_ai.usage.total_tokens': sumIfPresent(inputTokens, outputTokens),
       attributes,
     });
@@ -148,6 +156,7 @@ async function collectSegmentFiles(dir: string, files: string[]): Promise<void> 
   }
 
   for (const cwdDir of cwdDirs) {
+    // 根目录第一层是编码后的工作目录 key，普通文件与其他辅助项都不进入 session 扫描。
     if (!cwdDir.isDirectory()) continue;
 
     const cwdPath = path.join(dir, cwdDir.name);
@@ -158,6 +167,7 @@ async function collectSegmentFiles(dir: string, files: string[]): Promise<void> 
       continue;
     }
 
+    // 第二层目录名就是 sessionId；每个 session 的数据只从固定 segments 子目录读取。
     for (const sessionDir of sessionDirs) {
       if (!sessionDir.isDirectory()) continue;
       await collectJsonlFilesInSegments(

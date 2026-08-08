@@ -20,7 +20,7 @@ export function normalizeOutputMessages(raw: JsonValue | undefined): JsonValue |
   if (raw === undefined || raw === null) return undefined;
   if (!Array.isArray(raw) || raw.length === 0) return raw;
 
-  // 用首项判断数组整体形状；混合或未知结构保守保留原数据。
+  // 用首项判断数组整体形状；这是兼容性启发式，混合或未知结构保守保留原数据。
   const first = raw[0];
   if (!first || typeof first !== 'object' || Array.isArray(first)) return raw;
   const firstObj = first as Record<string, JsonValue>;
@@ -41,7 +41,10 @@ export function normalizeOutputMessages(raw: JsonValue | undefined): JsonValue |
   return raw;
 }
 
-/** 将单条 output message 的 finishReason 改成 canonical snake_case。 */
+/**
+ * 将单条 output message 的 `finishReason` 改成 canonical `finish_reason`。
+ * 若两者同时存在，以 canonical 字段为准并删除旧字段；返回新对象，不修改原消息。
+ */
 function normalizeOutputMessageKeys(msg: JsonValue): JsonValue {
   if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return msg;
   const obj = msg as Record<string, JsonValue>;
@@ -70,7 +73,12 @@ export function normalizeInputMessages(raw: JsonValue | undefined): JsonValue | 
   return normalizeInputMessagesArray(raw);
 }
 
-/** 输入消息数组的共享实现；未知项逐项保留，避免静默丢源数据。 */
+/**
+ * 输入消息数组的共享实现；未知项逐项保留，避免静默丢源数据。
+ *
+ * 已有 `parts` 数组的消息被视为 canonical，直接复用；扁平 `{role, content}` 则创建新对象并把
+ * content 包装为 text part。数组不是消息数组或为空时原样返回，调用方可继续输出源结构。
+ */
 function normalizeInputMessagesArray(raw: JsonValue | undefined): JsonValue | undefined {
   if (raw === undefined || raw === null) return undefined;
   if (!Array.isArray(raw) || raw.length === 0) return raw;

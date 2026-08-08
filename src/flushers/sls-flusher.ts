@@ -41,9 +41,13 @@ const FLUSH_INTERVAL_MS = 2000;
 
 /** 队列中的单条日志同时保留目标、Agent 类型和估算字节数。 */
 interface QueuedLog {
+  /** 已过滤并字符串化的 SLS 宽表。 */
   content: Record<string, string>;
+  /** 该副本的目标配置；send 会为每个 endpoint 各入队一次。 */
   endpoint: SlsEndpoint;
+  /** 规范化 Agent 类型，用于可选 service name 分桶。 */
   agentType?: string;
+  /** content JSON 的 UTF-8 估算字节数，供指标和失败摘要使用。 */
   byteSize: number;
 }
 
@@ -51,9 +55,12 @@ const logger = createLogger('SlsFlusher');
 
 /** MetricsWriter 读取的每 endpoint 累计统计。 */
 export interface EndpointCounter {
+  /** 进入该 endpoint 队列的累计条数/估算字节数。 */
   inEntries: number;
   inBytes: number;
+  /** flush Promise 正常完成后累计的条数；当前不严格等同远端成功 ACK，见 flush 注释。 */
   outEntries: number;
+  /** flush Promise reject 时累计条数。 */
   outFailed: number;
   totalDelayMs: number;
   lastFlushTime: string;
@@ -64,7 +71,13 @@ export interface EndpointCounter {
   logstore: string;
 }
 
-/** 同时支持多个 SLS endpoint 和两种传输模式的 Flusher。 */
+/**
+ * 同时支持多个 SLS endpoint 和 AK/WebTracking 两种传输模式的 Flusher。
+ *
+ * send 只做同步序列化和内存入队；flush 把当前 Map 快照与新数据隔离，再按 bucket 并发。不同
+ * endpoint 的失败互不阻断。最终失败不回队、不保存 payload，只写经清洗的有界元数据并触发
+ * AlarmManager，因此输出语义是 best-effort 而非持久可靠队列。
+ */
 export class SlsFlusher extends BaseFlusher {
   readonly name = 'sls';
   private readonly config: SlsFlusherConfig;
@@ -81,6 +94,9 @@ export class SlsFlusher extends BaseFlusher {
   private readonly userAgent: string;
 
   /**
+   * 保存配置、创建失败诊断 writer，并为每个 endpoint 初始化累计计数器。
+   * 构造阶段不创建 SDK Client、目录、timer 或网络连接；AK Client 在第一次发送时惰性创建。
+   *
    * @param config ConfigLoader 合并后的全部 SLS endpoints 和批量参数。
    * @param dataDir 失败诊断目录及安装版本 User-Agent 的数据根。
    */
@@ -112,7 +128,11 @@ export class SlsFlusher extends BaseFlusher {
     this.alarmManager = alarmManager;
   }
 
-  /** 按 endpoint 名惰性创建并复用 SLS AK SDK Client。 */
+  /**
+   * 按 endpoint 名惰性创建并复用 SLS AK SDK Client。
+   * accessKey 只传给 SDK，不进入本类日志；若两个配置误用同名 endpoint，后创建配置会复用第一
+   * 个 Client，因此 endpoint name 在配置中必须唯一。
+   */
   private getAkClient(endpoint: SlsEndpoint): any {
     let client = this.akClients.get(endpoint.name);
     if (!client) {
@@ -127,7 +147,10 @@ export class SlsFlusher extends BaseFlusher {
     return client;
   }
 
-  /** 初始化失败日志目录并启动周期 flush 定时器。 */
+  /**
+   * 尽力初始化失败日志目录并启动周期 flush timer。
+   * 当前方法没有重复 start 防护，生命周期层必须只调用一次；timer 未 unref，shutdown 必须清理。
+   */
   async start(): Promise<void> {
     await this.failedLogWriter.start();
     this.flushTimer = setInterval(
@@ -136,7 +159,12 @@ export class SlsFlusher extends BaseFlusher {
     );
   }
 
-  /** 序列化单条事件，并为每个配置 endpoint 各入队一份。 */
+  /**
+   * 序列化单条事件，并为每个配置 endpoint 各入队一份。
+   *
+   * Agent 私有命名空间在宽表序列化时统一丢弃。未启用 legacy redact 的 endpoint 共享同一个
+   * serialized 对象引用，但后续发送路径只读取它；启用 redact 时获得独立裁剪副本。
+   */
   async send(entry: AgentActivityEntry): Promise<void> {
     const serialized = serialiseLogEntry(entry, { dropAgentScopedFields: true });
     const agentType = normalizeAgentType(String(entry['gen_ai.agent.type'] ?? 'unknown'));
@@ -160,6 +188,14 @@ export class SlsFlusher extends BaseFlusher {
   /**
    * 原子取走当前所有 bucket，并行发送各 bucket。
    * 发送期间新事件进入新的 queue；单 bucket 失败被 catch 并计数，不 reject 整体 flush。
+   *
+   * 这里的“原子”指同一 JavaScript 事件循环 turn 内先复制 Map entries 再 clear，中间没有 await；
+   * 新 send 随后会进入空 Map。类没有全局 `flushing` 门，多个 flush 可以并发，但各自持有互不
+   * 重叠的快照。
+   *
+   * 注意 `flushViaAk/postWebtracking` 在最终发送失败后会自行记录告警/失败摘要并正常返回，所以
+   * 外层 then 当前仍增加 `outEntries`；`outFailed` 只统计真正 reject 的意外异常，并不严格代表
+   * SLS 远端失败数。该指标口径是否符合监控预期待确认。
    */
   async flush(): Promise<void> {
     const batches = Array.from(this.queue.entries());
@@ -237,7 +273,12 @@ export class SlsFlusher extends BaseFlusher {
     }
   }
 
-  /** 通过官方 AK SDK 发送一个 bucket，执行有限指数退避和告警。 */
+  /**
+   * 通过官方 AK SDK 发送一个 bucket，执行有限指数退避和告警。
+   *
+   * 同一 bucket 共用调用时刻的秒级 timestamp。SDK reject 后按错误分类重试；最终失败会记录
+   * Alarm 和有界元数据，但不重新 throw，因此该方法的 Promise 随后正常兑现。
+   */
   private async flushViaAk(endpoint: SlsEndpoint, logs: QueuedLog[]): Promise<void> {
     this.warnIfMixedAgentTypes(logs);
     const now = Math.floor(Date.now() / 1000);
@@ -308,7 +349,10 @@ export class SlsFlusher extends BaseFlusher {
     );
   }
 
-  /** 先按 WebTracking 服务限制拆 chunk，再顺序发送。 */
+  /**
+   * 先按 WebTracking 服务限制拆 chunk，再按原顺序逐个发送。
+   * `postWebtracking()` 最终失败会完成本地诊断后正常返回，所以后续 chunk 仍会继续尝试。
+   */
   private async flushViaWebtracking(endpoint: SlsEndpoint, logs: QueuedLog[]): Promise<void> {
     const chunks = this.splitForWebtracking(logs);
     for (const chunk of chunks) {
@@ -343,7 +387,12 @@ export class SlsFlusher extends BaseFlusher {
     return chunks;
   }
 
-  /** 构造 WebTracking body，通过 fetch 发送并执行有限重试。 */
+  /**
+   * 构造 WebTracking body，通过 fetch 发送并执行有限重试。
+   *
+   * body 在循环前序列化一次；每次 attempt 创建新的 AbortSignal。不可重试 4xx 立即退出，
+   * 408/429/5xx 和网络异常执行指数退避。最终失败触发告警并写失败摘要，但不向 flush 重新抛出。
+   */
   private async postWebtracking(endpoint: SlsEndpoint, logs: QueuedLog[]): Promise<void> {
     this.warnIfMixedAgentTypes(logs);
     const agentType = logs[0]?.agentType;
@@ -445,7 +494,12 @@ export class SlsFlusher extends BaseFlusher {
     });
   }
 
-  /** 清理定时器、提交当前队列并等待串行失败日志写入完成。 */
+  /**
+   * 清理 timer，并提交调用时仍在 queue 中的记录。
+   *
+   * 当前没有保存此前已启动 flush 的 Promise；若 shutdown 与一个旧的阈值/timer flush 重叠，
+   * 本方法只等待自己取得的快照，旧 flush 仍独立在途。SDK Client 无显式 close API。
+   */
   async shutdown(): Promise<void> {
     if (this.flushTimer) {
       clearInterval(this.flushTimer);
@@ -454,7 +508,12 @@ export class SlsFlusher extends BaseFlusher {
     await this.flush();
   }
 
-  /** 把非标准 payload 作为单条 WebTracking 日志直接发送。 */
+  /**
+   * 把非标准 payload 作为单条日志直接发送到 kind 为 mcp/trace 的 endpoint。
+   *
+   * 对象值 JSON.stringify 后写入；undefined 等不可序列化值的具体结果由 JSON.stringify 决定。
+   * endpoint 串行发送，单个失败被 catch 且不保存失败摘要，也不阻断后续 endpoint。
+   */
   override async sendRaw(topic: string, payload: Record<string, unknown>): Promise<void> {
     const content: Record<string, string> = { topic };
     for (const [k, v] of Object.entries(payload)) {
@@ -494,7 +553,12 @@ export class SlsFlusher extends BaseFlusher {
     }
   }
 
-  /** 根据 endpoint 和可选 agentType 选择 bucket，更新指标并按阈值异步触发 flush。 */
+  /**
+   * 根据 endpoint 和可选 agentType 选择 bucket，更新入口指标，并在条数阈值时异步触发 flush。
+   *
+   * service name 启用时 agentType 加入 key，保证每批 tag 单一；未启用时不同 Agent 可共享 bucket。
+   * `void flush()` 保持 send 低延迟，flush 内部负责吞掉 endpoint 级失败。
+   */
   private enqueue(endpoint: SlsEndpoint, content: Record<string, string>, agentType?: string): void {
     const base = `${endpoint.name}/${endpoint.project}/${endpoint.logstore}`;
     const key = (this.effectiveServiceName(endpoint) && agentType)

@@ -14,12 +14,17 @@ import { createLogger } from '../utils/logger.js';
 
 const logger = createLogger('JsonlFlusher');
 
-/** 按 Agent 和日期分文件的 JSONL Flusher。 */
+/**
+ * 按 Agent 和日期分文件的 JSONL Flusher。
+ *
+ * 本类不保持打开的文件句柄；每次 send 通过 `appendLine()` 打开/追加/关闭，简单但吞吐取决于
+ * 文件系统。appendLine/ensureDir 是 best-effort，Promise 正常兑现不代表该行一定落盘。
+ */
 export class JsonlFlusher extends BaseFlusher {
   readonly name = 'jsonl';
   private readonly config: JsonlFlusherConfig;
 
-  /** @param config 输出目录与是否按日轮转。 */
+  /** @param config 输出目录与是否按本地日历日期轮转；构造阶段不访问文件系统。 */
   constructor(config: JsonlFlusherConfig) {
     super();
     this.config = config;
@@ -31,7 +36,10 @@ export class JsonlFlusher extends BaseFlusher {
     await ensureDir(this.config.outputDir);
   }
 
-  /** 序列化单条事件并追加一行，默认过滤 Agent 私有命名空间字段。 */
+  /**
+   * 序列化单条事件并追加一行，默认过滤 Agent 私有命名空间字段。
+   * Agent 类型直接进入文件名，依赖上游类型值已规范化；当前方法不再额外清理路径字符。
+   */
   async send(entry: AgentActivityEntry): Promise<void> {
     const agentType = entry['gen_ai.agent.type'] ?? entry['agent.type'] ?? 'unknown';
     const filePath = this.resolveFilePath(agentType);
@@ -49,10 +57,12 @@ export class JsonlFlusher extends BaseFlusher {
     }
   }
 
+  /** 该实现没有内存缓冲，所有 send 已立即尝试 append，因此 flush 立即完成。 */
   async flush(): Promise<void> {
     // 每条 send 已立即 append，没有需要提交的内存缓冲。
   }
 
+  /** 本类不持有 timer、连接或长生命周期文件句柄，shutdown 立即完成。 */
   async shutdown(): Promise<void> {
     // 本类不持有长连接、文件句柄或定时器，无需额外释放。
   }

@@ -24,13 +24,17 @@ export const SLS_FAILURE_ERROR_SUMMARY_MAX_BYTES = 2 * 1024;
 
 /** 调用方提供的失败上下文；error 会在本模块内清洗和截断。 */
 export interface SlsFailureLogInput {
+  /** 逻辑 endpoint 名；文件名会清洗并附 hash，不直接使用原文。 */
   endpoint: string;
+  /** ak 或 webtracking。 */
   mode: string;
   project: string;
   logstore: string;
   kind: string;
+  /** 原批次条数和估算字节数，不包含 payload。 */
   batchCount: number;
   batchBytes: number;
+  /** 任意异常对象；只提取类型/code/status/清洗摘要。 */
   error: unknown;
 }
 
@@ -79,7 +83,12 @@ interface LogFileInfo {
 /** 解析 `<prefix>-<segment>-YYYY-MM-DD.jsonl` 的文件名。 */
 const ROTATED_FILE_REGEX = /^(.*)-(\d+)-(\d{4}-\d{2}-\d{2})\.jsonl$/;
 
-/** 串行写入、轮转和回收失败诊断文件。 */
+/**
+ * 串行写入、轮转和回收失败诊断文件。
+ *
+ * `writeChain` 把同一实例的并发 write 排成单队列，使“选择 segment -> 检查总容量 -> append”不会
+ * 在本进程内互相踩踏。磁盘上没有跨进程锁，因此同一目录仍应只有一个 Collector writer。
+ */
 export class SlsFailureLogWriter {
   private readonly directory: string;
   private readonly maxFileBytes: number;
@@ -90,6 +99,8 @@ export class SlsFailureLogWriter {
   private writeChain: Promise<void> = Promise.resolve();
 
   /**
+   * 解析绝对目录、容量上限和可注入时钟；构造阶段不访问磁盘。
+   *
    * @param directory 失败日志专用目录，构造时转为绝对路径。
    * @param options 容量上限和可注入时钟。
    */
@@ -100,13 +111,19 @@ export class SlsFailureLogWriter {
     this.now = options.now ?? (() => new Date());
   }
 
-  /** 确保目标目录存在；Orchestrator 启动 SLS Flusher 时调用。 */
+  /**
+   * 尽力确保目标目录存在；Orchestrator 启动 SLS Flusher 时调用。
+   * `ensureDir` 吞掉文件系统错误，所以 start 通常正常兑现；真正 append 失败会在 write 中返回 false。
+   */
   async start(): Promise<void> {
     await ensureDir(this.directory);
   }
 
   /**
    * 将一次失败追加到串行写链。
+   *
+   * 当前调用会 await 自己对应的 operation，但前一个失败已被链尾 catch 转为 fulfilled，不会让
+   * 后续记录永久无法执行。任何异常都在这里降级为 false，主采集输出链不会因诊断日志失败而失败。
    *
    * @returns 成功落盘为 true；容量不足、路径保护或 I/O 异常为 false，均不向主输出链抛错。
    */
@@ -129,7 +146,10 @@ export class SlsFailureLogWriter {
     }
   }
 
-  /** 执行单次记录构建、路径校验、容量回收和 append。 */
+  /**
+   * 执行“构建安全记录 -> 解析轮转文件 -> 路径校验 -> 容量回收 -> append”的单次事务。
+   * appendFile 成功才返回 true；路径逃逸和总容量不足主动返回 false。
+   */
   private async writeOnce(input: SlsFailureLogInput): Promise<boolean> {
     await ensureDir(this.directory);
 
@@ -161,7 +181,10 @@ export class SlsFailureLogWriter {
     return true;
   }
 
-  /** 复用当天分段；当前文件加新行超限时切到下一个 segment。 */
+  /**
+   * 复用当天 endpoint 分段；现有非空文件加新行将超限时切到下一 segment。
+   * 单条记录本身大于 maxFileBytes 时仍会写入空 segment，因此该上限是轮转阈值而非严格文件硬限。
+   */
   private async resolveFileState(
     safeEndpoint: string,
     date: string,
@@ -217,6 +240,9 @@ export class SlsFailureLogWriter {
   /**
    * 确保加入 incomingBytes 后不超过目录总量。
    * 保留今天每组最新活跃分段和当前目标，从最旧的密封分段开始删除。
+   *
+   * 候选先按日期、mtime、文件名排序，形成确定的“最旧优先”。删除失败只告警并尝试下一个；
+   * 所有可删文件处理后仍超限则拒绝新记录，绝不删除当前活跃文件来腾空间。
    */
   private async ensureCapacity(incomingBytes: number, targetPath: string): Promise<boolean> {
     const files = await this.collectLogFiles();
@@ -247,7 +273,10 @@ export class SlsFailureLogWriter {
     return totalBytes + incomingBytes <= this.maxTotalBytes;
   }
 
-  /** 收集目录内普通 `.jsonl` 文件；符号链接和非文件条目不会计入。 */
+  /**
+   * 收集目录内普通 `.jsonl` 文件；使用 lstat 排除符号链接和非文件条目。
+   * 不符合本模块轮转命名的 JSONL 仍计入总容量，但 group/date 为 null，可作为密封候选被回收。
+   */
   private async collectLogFiles(): Promise<LogFileInfo[]> {
     const result: LogFileInfo[] = [];
     const entries = await safeReaddir(this.directory);

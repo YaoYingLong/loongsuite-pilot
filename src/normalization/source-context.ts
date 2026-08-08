@@ -9,11 +9,17 @@ import type { JsonValue } from '../types/index.js';
 
 /** 不同数据源可提供的松散上下文，字段在运行时都视为 unknown。 */
 export interface SourceContextInput {
+  /** Git remote 或已归一化仓库路径。 */
   repo?: unknown;
+  /** 源端报告的分支。 */
   branch?: unknown;
+  /** 源端报告的 Git host/domain。 */
   domain?: unknown;
+  /** Agent 当前工作目录。 */
   cwd?: unknown;
+  /** 一个或多个工作区根目录。 */
   workspaceRoots?: unknown;
+  /** 工具参数、文件事件等位置提取出的候选绝对路径。 */
   absolutePaths?: unknown[];
 }
 
@@ -25,9 +31,13 @@ export interface NormalizedSourceContext {
   domain?: string;
 }
 
-/**
- * 规范 repo/branch/domain 并从 cwd、roots、绝对路径中选择当前 workspace root。
- */
+  /**
+   * 规范 repo/branch/domain 并从 cwd、roots、绝对路径中选择当前 workspace root。
+   *
+   * workspace 选择优先看 cwd，再按调用方提供的 absolutePaths 顺序；每个候选都选择包含它的
+   * 最长 root，使 monorepo 子工作区优于父目录。没有候选命中时，只有唯一 root 才可安全兜底。
+   * 当前绝对路径判定只支持 `/` 开头形式，Windows 原生盘符路径会被忽略。
+   */
 export function normalizeSourceContext(input: SourceContextInput): NormalizedSourceContext {
   const cwd = normalizeString(input.cwd);
   const roots = normalizeStringArray(input.workspaceRoots);
@@ -44,7 +54,10 @@ export function normalizeSourceContext(input: SourceContextInput): NormalizedSou
   };
 }
 
-/** 将存在的上下文字段投影为 canonical dotted key；缺失值不写入。 */
+/**
+ * 将存在的上下文字段投影为 canonical dotted key；缺失值不写入。
+ * 返回新对象，可直接展开进 AgentActivityEntry 而不会携带 undefined 列。
+ */
 export function sourceFieldsFromContext(context: NormalizedSourceContext): Record<string, JsonValue> {
   const fields: Record<string, JsonValue> = {};
   if (context.repo) {
@@ -56,7 +69,10 @@ export function sourceFieldsFromContext(context: NormalizedSourceContext): Recor
   return fields;
 }
 
-/** 返回首个非 null/undefined/空串值，供 Input 处理多版本字段别名。 */
+/**
+ * 返回首个非 null/undefined/空串值，供 Input 处理多版本字段别名。
+ * 数字 0、布尔 false 和只含空格的字符串仍被视为有效值，这是有意区别于普通真假判断。
+ */
 export function pickFirstValue(...values: unknown[]): unknown {
   for (const value of values) {
     if (value !== undefined && value !== null && value !== '') return value;
@@ -64,9 +80,10 @@ export function pickFirstValue(...values: unknown[]): unknown {
   return undefined;
 }
 
-/**
- * 按点分路径安全读取普通对象；中途遇到空值、数组或标量时返回 undefined。
- */
+  /**
+   * 按点分路径安全读取普通对象；中途遇到空值、数组或标量时返回 undefined。
+   * 该函数不解释数组索引，也不防范包含点号的真实 key；它只适合固定 schema 路径。
+   */
 export function readRecordPath(value: unknown, path: string): unknown {
   let current = value;
   for (const part of path.split('.')) {
@@ -76,7 +93,10 @@ export function readRecordPath(value: unknown, path: string): unknown {
   return current;
 }
 
-/** 递归收集值中出现的 Unix 绝对路径，去重后排序以保证确定性。 */
+/**
+ * 递归收集值中出现的 Unix 绝对路径，使用 Set 去重后排序以保证确定性。
+ * 深度上限为 6，防止不受信任的巨大嵌套参数造成过深遍历；循环对象仍可能在上限内重复访问。
+ */
 export function collectAbsolutePathValues(value: unknown): string[] {
   const out = new Set<string>();
   collectAbsolutePathValuesInto(value, out);
@@ -103,7 +123,10 @@ function collectAbsolutePathValuesInto(value: unknown, out: Set<string>, depth =
   }
 }
 
-/** 从 HTTPS 或 scp 风格 Git remote 中提取 host。 */
+/**
+ * 从 HTTP(S) 或 `user@host:path` 风格 Git remote 中提取 host。
+ * `ssh://host/path` 等其他形式当前返回 undefined，调用方应保留源端显式 domain 作为优先值。
+ */
 export function normalizeDomain(raw: string | undefined): string | undefined {
   if (!raw) return undefined;
   const httpsMatch = raw.match(/^https?:\/\/([^/]+)/);

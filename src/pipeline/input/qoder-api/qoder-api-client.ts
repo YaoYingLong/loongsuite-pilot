@@ -17,6 +17,11 @@ const RETRYABLE_STATUS_CODES = new Set([408, 425, 429, 500, 502, 503, 504]);
 
 /** 包含 status 与 URL 的 API 错误；响应正文只保留前 256 字符。 */
 export class QoderApiHttpError extends Error {
+  /**
+   * @param status HTTP 状态码，供上层区分 401/403、限流和服务端错误。
+   * @param url 不含 Authorization header 的请求 URL。
+   * @param body 服务端错误正文；进入 message 前最多保留 256 字符，限制日志体积。
+   */
   constructor(readonly status: number, readonly url: string, body: string) {
     super(`Qoder API ${status} ${url}: ${body.slice(0, 256)}`);
   }
@@ -34,12 +39,14 @@ export interface QoderMember {
   [key: string]: unknown;
 }
 
+/** 成员列表的一页；`nextToken` 非空表示调用方还应请求下一页。 */
 export interface ListMembersResponse {
   members: QoderMember[];
   maxResults?: number;
   nextToken?: string;
 }
 
+/** 一次额度消费、退款或冲正事件；服务端时间戳单位由 API 契约定义为毫秒。 */
 export interface QoderUsageEvent {
   timestamp: number;
   userId?: string;
@@ -52,6 +59,7 @@ export interface QoderUsageEvent {
   [key: string]: unknown;
 }
 
+/** usage event 的一页；成员接口使用 `nextCredits`，组织接口可能使用 `nextToken`。 */
 export interface ListUsageEventsResponse {
   usages: QoderUsageEvent[];
   maxResults?: number;
@@ -59,17 +67,20 @@ export interface ListUsageEventsResponse {
   nextToken?: string;
 }
 
+/** 一个额度池的已用量、上限和计量单位。 */
 export interface QoderQuotaSummary {
   usedValue?: number;
   limitValue?: number;
   unit?: string;
 }
 
+/** API 在 plan/资源包/共享额度等位置复用的 quota 包装层。 */
 export interface QoderQuotaBlock {
   quotaSummary?: QoderQuotaSummary;
   [key: string]: unknown;
 }
 
+/** 单成员当前额度快照；部分组织没有资源包或共享额度，因此相应字段允许 null。 */
 export interface QoderQuotaResponse {
   userId?: string;
   quotaKey?: string;
@@ -83,6 +94,7 @@ export interface QoderQuotaResponse {
   [key: string]: unknown;
 }
 
+/** 单次 AI change 涉及的一个文件及其增删行数。 */
 export interface QoderChangeMetadata {
   fileName?: string;
   fileExtension?: string;
@@ -90,6 +102,7 @@ export interface QoderChangeMetadata {
   linesDeleted?: number;
 }
 
+/** AI 代码 change 记录；Input 会把 metadata 数组序列化到宽表字段。 */
 export interface QoderChangeItem {
   changeId?: string;
   userId?: string;
@@ -103,6 +116,7 @@ export interface QoderChangeItem {
   [key: string]: unknown;
 }
 
+/** page/per-page 风格接口共用的分页描述。 */
 export interface QoderPagination {
   currentPage?: number;
   pageSize?: number;
@@ -110,6 +124,7 @@ export interface QoderPagination {
   totalPages?: number;
 }
 
+/** AI change 分页响应；字段均可选以兼容服务端旧版本或部分响应。 */
 export interface ListChangesResponse {
   success?: boolean;
   data?: {
@@ -118,6 +133,12 @@ export interface ListChangesResponse {
   };
 }
 
+/**
+ * 一次代码提交的总行数和各 Qoder 功能来源行数。
+ *
+ * `nonAi*`、`ideNext*`、`pluginAgent*` 等字段不能在 Client 层相加或互相替代；Input 会原样
+ * 展开，便于下游按服务端口径聚合。
+ */
 export interface QoderCommitItem {
   commitHash?: string;
   userId?: string;
@@ -151,6 +172,7 @@ export interface QoderCommitItem {
   [key: string]: unknown;
 }
 
+/** AI commit 分页响应。 */
 export interface ListCommitsResponse {
   success?: boolean;
   data?: {
@@ -159,10 +181,15 @@ export interface ListCommitsResponse {
   };
 }
 
+/** 构造 Client 所需的固定连接参数。 */
 export interface QoderApiClientOptions {
+  /** OpenAPI 根 URL；构造函数会去掉末尾 `/`，避免与请求路径拼出双斜杠。 */
   apiBase: string;
+  /** Bearer token，仅保存在 private 成员并写入请求 header。 */
   apiKey: string;
+  /** 默认组织 ID；具体方法仍显式接收 orgId，方便调用路径清晰可见。 */
   orgId: string;
+  /** 单次 fetch 超时，默认 30 秒；超时错误按网络错误参与有限重试。 */
   timeoutMs?: number;
 }
 
@@ -180,6 +207,9 @@ export class QoderApiClient {
 
   /**
    * 验证必填配置，去掉 apiBase 尾斜杠并固定超时。
+   * 构造过程不发起网络连接，真正的 I/O 发生在各公开 API 方法调用 `request()` 时。
+   *
+   * @param opts API 根地址、密钥、组织 ID 和可选超时。
    * @throws apiKey/apiBase/orgId 任一为空时同步抛错。
    */
   constructor(opts: QoderApiClientOptions) {
@@ -493,7 +523,12 @@ export class QoderApiClient {
     );
   }
 
-  /** 对非空 query 参数执行 URI 编码并拼成 `?k=v&...`。 */
+  /**
+   * 对非空 query 参数执行 URI 编码并拼成 `?k=v&...`。
+   *
+   * `undefined`、`null` 和空字符串表示“不发送该参数”；数字 0 与布尔 false 是有效值，不能
+   * 用普通真假判断过滤。键和值都编码，避免邮箱、token 或日期中的特殊字符破坏 URL。
+   */
   private toQuery(params: Record<string, string | number | boolean | undefined>): string {
     const parts: string[] = [];
     for (const [k, v] of Object.entries(params)) {
@@ -506,6 +541,14 @@ export class QoderApiClient {
   /**
    * 执行一个 JSON 请求，按状态/网络错误分类重试。
    *
+   * 每次 attempt 都创建新的 `AbortSignal.timeout()`，前一次超时不会污染下一次请求。成功时
+   * `await resp.json()` 完成后才兑现 Promise；JSON 非法也进入 catch 并按网络/未知错误重试。
+   * 401/403 等不可重试状态保留为 `QoderApiHttpError` 立即向上抛，QoderApiInput 据此停止窗口
+   * 推进并设置 fatal auth。
+   *
+   * @param method 当前调用均为 GET，参数保留是为了让底层请求函数表达完整 HTTP 语义。
+   * @param pathAndQuery 已编码的路径和 query，不含 `apiBase`。
+   * @returns 解析后的泛型 JSON；TypeScript 类型只在编译期生效，不做运行时 schema 校验。
    * @throws 不可重试 4xx 立即抛 QoderApiHttpError；三次仍失败抛最后异常。
    */
   private async request<T>(method: string, pathAndQuery: string): Promise<T> {
@@ -526,6 +569,7 @@ export class QoderApiClient {
         });
 
         if (!resp.ok) {
+          // 非 2xx 也要读取正文，便于诊断；错误类负责限制长度，且正文不应包含本地 token。
           const text = await resp.text().catch(() => '');
           const err = new QoderApiHttpError(resp.status, url, text);
           if (
@@ -536,6 +580,7 @@ export class QoderApiClient {
           }
           lastErr = err;
         } else {
+          // await JSON 解析后再 return，调用方不会拿到仍需消费的 Response 流。
           const json = (await resp.json()) as T;
           logger.debug('qoder api ok', {
             method,
@@ -545,6 +590,7 @@ export class QoderApiClient {
           return json;
         }
       } catch (err) {
+        // catch 同时覆盖 fetch 拒绝、AbortError、JSON 解析失败和上面主动抛出的 HTTP 错误。
         if (err instanceof QoderApiHttpError && !RETRYABLE_STATUS_CODES.has(err.status)) {
           throw err;
         }

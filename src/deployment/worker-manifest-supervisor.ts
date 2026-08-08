@@ -20,11 +20,17 @@ const logger = createLogger('WorkerManifestSupervisor');
 
 /** Runtime 包内 worker.manifest.json 的进程启动契约。 */
 export interface WorkerManifest {
+  /** 写入状态和日志的人类可读 Worker 名称。 */
   name: string;
+  /** 声明包所属的 Runtime 类型；Supervisor 当前只保留，不用它分派命令。 */
   runtime?: string;
+  /** Worker 包版本；当前不参与重启判定。 */
   version?: string;
+  /** 命令数组：第一项是可执行文件，余下项是原样传给 `spawn` 的参数。 */
   command: string[];
+  /** Worker 工作目录；相对路径以解压后的 bundle 根为基准。 */
   cwd?: string;
+  /** 附加/覆盖的子进程环境变量，值支持实例占位符。 */
   env?: Record<string, string>;
   paths?: {
     pid?: string;
@@ -32,8 +38,11 @@ export interface WorkerManifest {
     log?: string;
   };
   restartPolicy?: {
+    /** `never` 不重启；`on-failure` 仅对非零退出或信号退出重启。 */
     type?: 'never' | 'on-failure';
+    /** 同一个 Collector 进程生命周期内允许的最大重启次数。 */
     maxRestarts?: number;
+    /** 每次失败到下次启动之间的固定秒数，负值会被收敛为 0。 */
     backoffSeconds?: number;
   };
 }
@@ -60,6 +69,10 @@ export interface WorkerManifestOptions {
  *
  * 负责定位并校验 manifest、展开实例占位符、启动独立进程组、持久化 PID/状态、汇总日志，
  * 以及按 manifest 的失败重启策略拉起进程。Local Worker 与普通 plugin-probe 共用该实现。
+ *
+ * `runtimes` 只保存当前 Collector 启动的子进程的重启次数和主动停止标记；
+ * PID 与 status JSON 才是跨 Collector 重启的可观测状态。本类不持有 `ChildProcess`
+ * 强引用，停止时根据 PID 文件向 detached 进程组发信号。
  */
 export class WorkerManifestSupervisor {
   /** 仅保存当前进程启动的 Worker 运行态；跨 Collector 重启的信息通过 PID 文件恢复。 */
@@ -67,7 +80,16 @@ export class WorkerManifestSupervisor {
 
   /**
    * 存在 manifest 时停止旧 Worker 并启动新实例；不存在时返回 true，便于普通插件包复用。
-   * @param baseEnv PluginProbeStrategy 提供的基础环境。
+   *
+   * `PluginProbeStrategy.deploy()` 在包获取和 install.sh 完成后调用；
+   * `LocalWorkerActivationService` 另外传入实例路径和 Runtime 参数。启动前先走
+   * `stopIfPresent()`，保证同一 PID/status 槽位最多只有一个 Worker。
+   *
+   * @param agentId 用于日志和状态文件的部署/实例标识。
+   * @param installDir 插件包目录，manifest 可位于其根或唯一的一级包目录。
+   * @param env PluginProbeStrategy 提供的基础子进程环境。
+   * @param options 可选实例固定字段与用户 Runtime 参数，用于展开 manifest。
+   * @returns 无 manifest 或 Worker 已成功启动时为 `true`；manifest 无效/启动失败时为 `false`。
    */
   async startIfPresent(
     agentId: string,
@@ -87,7 +109,14 @@ export class WorkerManifestSupervisor {
     return this.start(agentId, location.bundleRoot, manifest, env, options);
   }
 
-  /** 查找 manifest 并停止对应 Worker；manifest 不存在视为已停止。 */
+  /**
+   * 查找 manifest 并停止对应 Worker；manifest 不存在视为已停止。
+   *
+   * 部署替换包、Collector 退出和 Local Worker 禁用都会调用。它根据 manifest 展开同一份
+   * PID 路径，因此不需要持有原 `ChildProcess` 对象。
+   *
+   * @returns 无需停止或正常退出时为 `true`；manifest 损坏或发信号失败时为 `false`。
+   */
   async stopIfPresent(
     agentId: string,
     installDir: string,
@@ -102,12 +131,23 @@ export class WorkerManifestSupervisor {
     return this.stop(agentId, location.bundleRoot, manifest, options);
   }
 
-  /** 只检查安装目录或一级包根是否包含合法 manifest 路径。 */
+  /**
+   * 只检查安装目录或一级包根是否存在 manifest 文件。
+   *
+   * @param installDir 包获取后的目标目录。
+   * @returns 能定位到 `worker.manifest.json` 时为 `true`。此方法不解析 JSON，所以“存在”不等于“可启动”。
+   */
   async hasManifest(installDir: string): Promise<boolean> {
     return !!await this.findManifest(installDir);
   }
 
-  /** 展开实例路径、读取 PID 并用 signal 0 判断进程是否活跃。 */
+  /**
+   * 展开实例路径、读取 PID 并用 signal 0 判断进程是否活跃。
+   *
+   * @param installDir 包根或包外层目录。
+   * @param options 必须与启动时的实例上下文一致，否则会查询错误的 PID 路径。
+   * @returns manifest/PID 合法且进程存活时为 `true`；不修改状态文件。
+   */
   async isWorkerRunning(installDir: string, options: WorkerManifestOptions = {}): Promise<boolean> {
     const location = await this.findManifest(installDir);
     if (!location) return false;
@@ -120,7 +160,14 @@ export class WorkerManifestSupervisor {
     return !!pid && this.isAlive(pid);
   }
 
-  /** 在 installDir 自身及一级子目录中定位 manifest，并返回真实 bundleRoot。 */
+  /**
+   * 在 `installDir` 自身及一级子目录中定位 manifest，并返回真实 `bundleRoot`。
+   *
+   * 一级搜索用来兼容 tarball 带顶层包名的结构；不无限递归，避免在不受信目录中
+   * 误选中更深层依赖的 manifest。
+   *
+   * @returns 首个命中位置；目录不可读或未找到时返回 `undefined`。
+   */
   private async findManifest(installDir: string): Promise<ManifestLocation | undefined> {
     // 同时兼容包内容直接落在 destDir，以及 tar 解压后额外包含一层顶级目录的结构。
     const direct = path.join(installDir, 'worker.manifest.json');
@@ -147,7 +194,13 @@ export class WorkerManifestSupervisor {
     return undefined;
   }
 
-  /** 解析 JSON 并验证 name/command 最小契约；坏文件记录警告后返回 undefined。 */
+  /**
+   * 解析 JSON 并验证 `name`/非空 `command` 的最小启动契约。
+   *
+   * @param manifestPath `findManifest()` 找到的绝对文件路径。
+   * @returns 可用 manifest；文件缺失、JSON 损坏或必填字段非法时警告并返回 `undefined`。
+   * @remarks 其他字段在实际使用处应用默认值，本层不执行完整 schema 校验。
+   */
   private async readManifest(manifestPath: string): Promise<WorkerManifest | undefined> {
     try {
       const raw = await fs.readFile(manifestPath, 'utf-8');
@@ -167,6 +220,10 @@ export class WorkerManifestSupervisor {
   /**
    * 展开路径/命令/env，创建日志流并 detached spawn Worker；随后写 PID 和 running 状态，
    * 注册 exit/error 回调进入重启状态机。
+   *
+   * @param runtime 重启路径传入的运行态；首次启动省略并从 0 计数。
+   * @returns PID 和 running 状态均落盘后为 `true`；spawn/路径/写状态失败时写 failed 并返回 `false`。
+   * @remarks 子进程退出后的状态更新和可选重启由事件回调异步继续，不在此 Promise 内等待。
    */
   private async start(
     agentId: string,
@@ -214,6 +271,10 @@ export class WorkerManifestSupervisor {
       // 子进程可能在 PID/状态落盘前退出，先暂存退出信息，待 running 状态写完后统一处理。
       let earlyExit: { code: number | null; signal: NodeJS.Signals | null } | undefined;
       // 启动阶段任一步骤失败时只执行一次：关日志、删 PID、写 failed 状态并释放运行态。
+      /**
+       * 收敛 spawn error、缺 PID 或启动期写盘失败。`settled` 保证 error/exit 竞态下只清理一次。
+       * @param err 子进程或启动持久化阶段的原始错误。
+       */
       const failStart = async (err: unknown): Promise<void> => {
         if (settled) return;
         settled = true;
@@ -233,9 +294,11 @@ export class WorkerManifestSupervisor {
       // stdout/stderr 汇入同一追加日志；任一流结束都不能提前关闭共享文件流。
       child.stdout?.pipe(log, { end: false });
       child.stderr?.pipe(log, { end: false });
+      // `error` 表示 spawn 自身失败，与已启动进程之后的 `exit` 是两条不同事件路径。
       child.once('error', err => {
         void failStart(err);
       });
+      // 子进程可能快于 PID/status 写盘而退出；先缓存，防止 `handleExit` 的 exited 状态被随后的 running 覆盖。
       child.once('exit', (code, signal) => {
         if (settled) return;
         if (!startPersisted) {
@@ -309,6 +372,9 @@ export class WorkerManifestSupervisor {
   /**
    * 标记主动停止，取消待重启 timer，向整个进程组发 SIGTERM；5 秒后仍活跃则 SIGKILL，
    * 最后删除 PID 并写 stopped 状态。
+   *
+   * @returns PID 不存在或停止流程完成时为 `true`；SIGTERM 因权限等原因失败时为 `false`。
+   * @remarks `runtime.stopping=true` 是与延迟重启回调的同步信号，避免用户刚停止就被 `on-failure` 再拉起。
    */
   private async stop(
     agentId: string,
@@ -321,6 +387,7 @@ export class WorkerManifestSupervisor {
     if (runtime) runtime.stopping = true;
 
     const pid = await this.readPid(paths.pid);
+    // 没有 PID 时按幂等停止处理；状态文件可能仍保留上次 exited/failed 供诊断。
     if (!pid) return true;
 
     await this.writeStatus(paths.status, {
@@ -361,6 +428,12 @@ export class WorkerManifestSupervisor {
   /**
    * 处理子进程退出并写状态。只有非零/信号退出、on-failure、非主动停止且次数未超限时，
    * 才按 backoffSeconds 安排下一次 start。
+   *
+   * @param runtimeKey `runtimes` Map 中以 PID 文件路径表示的键。
+   * @param runtime 需跨重启保留的次数与主动停止标记。
+   * @param code 子进程正常 exit 时的退出码；被信号终止时可为 `null`。
+   * @param signal 导致退出的信号；普通 exit 时为 `null`。
+   * @returns 退出状态已写且重启 timer 已安排（如需）后兑现。
    */
   private async handleExit(
     agentId: string,
@@ -401,13 +474,19 @@ export class WorkerManifestSupervisor {
 
     runtime.restarts += 1;
     const delayMs = Math.max(0, policy.backoffSeconds ?? 0) * 1000;
+    // timer `unref()` 使“只剩待重启 Worker”不会阻止 Collector 自身退出。
     setTimeout(() => {
       if (runtime.stopping) return;
       void this.start(agentId, bundleRoot, manifest, env, options, runtime);
     }, delayMs).unref();
   }
 
-  /** 解析 PID/status/log 的 manifest 路径，未配置时使用包内 `.agent-worker` 默认目录。 */
+  /**
+   * 解析 PID/status/log 的 manifest 路径，未配置时使用包内 `.agent-worker` 默认目录。
+   *
+   * @returns 全部收敛为绝对路径的三个文件位置。Local Worker 通常用 `${instance:stateDir}`
+   * 和 `${instance:logDir}` 把它们移到实例隔离目录。
+   */
   private resolvePaths(
     bundleRoot: string,
     manifest: WorkerManifest,
@@ -427,7 +506,13 @@ export class WorkerManifestSupervisor {
     };
   }
 
-  /** 合并基础环境与 manifest env，并对所有值执行占位符展开。 */
+  /**
+   * 遍历 manifest 声明的环境变量，并对每个值执行实例占位符展开。
+   *
+   * @param source manifest 中额外的 `env` 对象。
+   * @param env 调用方的基础环境；当前仅为展开接口保留，占位符不会任意读取其中的变量。
+   * @returns 仅包含 manifest 附加键的新对象；`start()` 再将它覆盖到基础环境上。
+   */
   private expandEnv(
     source: Record<string, string>,
     bundleRoot: string,
@@ -441,7 +526,14 @@ export class WorkerManifestSupervisor {
     return result;
   }
 
-  /** 展开 `${bundleRoot}`、`${destDir}` 与 `${instance:<name>}`。 */
+  /**
+   * 展开 manifest 中的 `${destDir}` 与 `${instance:<name>}`。
+   *
+   * @param value command/cwd/env/path 中的原始字符串。
+   * @param bundleRoot `${destDir}` 的替换值，即实际 manifest 所在的包根。
+   * @param env 为保持调用接口传入；当前实现不展开任意环境变量。
+   * @returns 已替换所有支持占位符的字符串；未找到的实例字段会变为空串。
+   */
   private expand(
     value: string,
     bundleRoot: string,
@@ -454,7 +546,11 @@ export class WorkerManifestSupervisor {
       .replace(/\$\{instance:([^}]+)\}/g, (_match, name: string) => this.expandInstanceValue(name, options));
   }
 
-  /** 固定实例字段优先，再按原名和 kebab-case 查询用户 Runtime 参数。 */
+  /**
+   * 展开单个实例字段：固定实例字段优先，再按原名和 kebab-case 查询用户 Runtime 参数。
+   *
+   * @returns 所有命中值都转成字符串；完全未配置时返回空串。固定字段优先级防止用户覆盖 token/状态路径。
+   */
   private expandInstanceValue(name: string, options: WorkerManifestOptions): string {
     // 固定实例字段优先，防止用户通过同名 Runtime 参数覆盖 token 路径、状态目录等关键值。
     const fixedValue = options.instance?.[name];
@@ -469,7 +565,11 @@ export class WorkerManifestSupervisor {
     return runtimeValue !== undefined ? String(runtimeValue) : '';
   }
 
-  /** 相对路径命令锚定 bundleRoot，裸命令保留给 PATH 解析。 */
+  /**
+   * 解析 `command[0]`：相对路径命令锚定 `bundleRoot`，裸命令保留给 PATH 查找。
+   *
+   * @returns 传给 `spawn` 的可执行文件字符串；不检查文件是否存在。
+   */
   private resolveCommand(bundleRoot: string, command: string): string {
     // 带路径语义的相对命令以包根目录为基准；裸命令名则交给操作系统 PATH 查找。
     if (path.isAbsolute(command)) return command;
@@ -479,12 +579,19 @@ export class WorkerManifestSupervisor {
     return command;
   }
 
-  /** 展开后的相对文件路径锚定 bundleRoot。 */
+  /**
+   * 将展开后的相对文件路径锚定到 `bundleRoot`。
+   * @returns 原绝对路径，或 `bundleRoot` 与相对值拼接后的路径。
+   */
   private resolvePath(bundleRoot: string, value: string): string {
     return path.isAbsolute(value) ? value : path.join(bundleRoot, value);
   }
 
-  /** 容错读取正整数 PID；文件缺失或非法返回 undefined。 */
+  /**
+   * 容错读取正整数 PID。
+   * @param pidPath manifest 展开后的 PID 文件。
+   * @returns 正整数 PID；文件缺失、不可读或内容非法时返回 `undefined`。
+   */
   private async readPid(pidPath: string): Promise<number | undefined> {
     try {
       const raw = await fs.readFile(pidPath, 'utf-8');
@@ -495,13 +602,21 @@ export class WorkerManifestSupervisor {
     }
   }
 
-  /** 确保父目录后直接覆盖写状态 JSON。 */
+  /**
+   * 确保父目录后覆盖写 Worker 状态 JSON，末尾保留换行便于命令行查阅。
+   * @param statusPath manifest 展开后的状态文件。
+   * @param payload starting/running/stopping/stopped/exited/failed/restarting 之一的快照。
+   * @throws 目录创建或文件写入异常由对应启停流程处理。
+   */
   private async writeStatus(statusPath: string, payload: Record<string, unknown>): Promise<void> {
     await ensureDir(path.dirname(statusPath));
     await fs.writeFile(statusPath, `${JSON.stringify(payload, null, 2)}\n`, 'utf-8');
   }
 
-  /** 使用 signal 0 探测 PID；EPERM 也由 Node 表现为异常，当前按不活跃处理。 */
+  /**
+   * 使用 signal 0 探测 PID，不会真正给目标进程发送终止信号。
+   * @returns 内核接受探测时为 `true`；包括 EPERM 在内的任何异常当前均按不活跃处理。
+   */
   private isAlive(pid: number): boolean {
     try {
       process.kill(pid, 0);
@@ -511,7 +626,12 @@ export class WorkerManifestSupervisor {
     }
   }
 
-  /** 向负 PGID 发信号覆盖 detached 子进程组；ESRCH 返回 false，其他错误抛出。 */
+  /**
+   * 向负 PGID 发信号，使 detached Worker 及它派生的子进程一起收到停止请求。
+   *
+   * @returns 信号已提交时为 `true`；ESRCH 表示进程组已消失，返回 `false`。
+   * @throws 权限或平台不支持等其他错误会交给 `stop()` 记录并返回失败。
+   */
   private signalProcessGroup(pgid: number, signal: NodeJS.Signals): boolean {
     try {
       // start() 使用 detached=true，子进程在 Linux/macOS 上会成为进程组组长。
@@ -523,7 +643,11 @@ export class WorkerManifestSupervisor {
     }
   }
 
-  /** 以 100ms 轮询等待退出，达到 timeout 后返回，不自行发送信号。 */
+  /**
+   * 以 100ms 轮询等待进程退出，供 SIGTERM 与 SIGKILL 两阶段之间使用。
+   * @param timeoutMs 最长等待毫秒数；到期只兑现，不自行发送信号。
+   * @returns 目标已退出或超时后兑现，不区分两种结果。
+   */
   private async waitForExit(pid: number, timeoutMs: number): Promise<void> {
     const started = Date.now();
     while (Date.now() - started < timeoutMs) {
@@ -533,7 +657,11 @@ export class WorkerManifestSupervisor {
   }
 }
 
-/** 将 manifest 中的 camelCase 占位符名称转换为 CLI 常用的 kebab-case 选项名。 */
+/**
+ * 将 manifest 中的 camelCase 占位符名称转换为 CLI 常用的 kebab-case 选项名。
+ * @param value 例如 `homeserverUrl`。
+ * @returns 例如 `homeserver-url`，用于回退查询 `runtimeOptions`。
+ */
 function camelToKebab(value: string): string {
   return value.replace(/([a-z0-9])([A-Z])/g, '$1-$2').toLowerCase();
 }

@@ -4,8 +4,9 @@
  * `Orchestrator` 传入声明式 `AgentDetectionEntry`：既包括 Input 条目，也包括运行期
  * 新安装 Agent 的 `deploy:<id>` 条目。本服务优先用非持久化 `fs.watch` 响应路径变化，
  * 不支持 watch 时退化为定时轮询，并另设全局刷新。每个条目按
- * idle -> starting -> running -> stopping -> idle 串行调用 start/stop；退出时关闭所有
- * watcher、timer 和仍在运行的条目。
+ * idle -> starting -> running -> stopping -> idle 驱动 start/stop；退出时关闭所有 watcher、
+ * timer 和仍在运行的条目。一次全量 refresh 内部按条目串行，但 watcher 与 timer 回调可能
+ * 交错触发，因此条目的 start/stop 回调仍应具备幂等性。
  */
 
 import * as fs from 'node:fs';
@@ -16,12 +17,17 @@ import { createLogger } from '../utils/logger.js';
 const logger = createLogger('AgentDiscoveryService');
 
 const DEFAULT_POLL_MS = 300_000; // 默认每 5 分钟轮询一次。
+// 测试、网络盘或 fs.watch 不可靠的部署可强制绕过 watcher，直接使用每条目轮询。
 const FORCE_POLLING = process.env.LOONGSUITE_PILOT_FORCE_POLLING === 'true';
 
 interface EntryRuntime {
+  /** Orchestrator/InputManager 提供的纯生命周期契约。 */
   entry: AgentDetectionEntry;
+  /** 最近一次状态转换结果；不是跨回调互斥锁。 */
   state: EntryState;
+  /** 成功建立的第一个目录 watcher；关闭后恢复为 null。 */
   watcher: fs.FSWatcher | null;
+  /** watcher 无法建立或运行期报错时使用的该条目兜底 timer。 */
   pollTimer: ReturnType<typeof setInterval> | null;
 }
 
@@ -33,12 +39,15 @@ interface EntryRuntime {
  * 或部署修复任务。
  */
 export class AgentDiscoveryService extends EventEmitter {
+  /** ID 到条目运行态映射，Map 保留构造参数顺序，决定 refresh/stop 的处理顺序。 */
   private readonly runtimes: Map<string, EntryRuntime> = new Map();
+  /** 即使 watcher 健康也会运行的全局兜底刷新，覆盖未产生文件事件的可用性变化。 */
   private globalPollTimer: ReturnType<typeof setInterval> | null = null;
 
   /** @param entries Orchestrator 构造的 Input 与 deploy 动态发现条目。 */
   constructor(entries: AgentDetectionEntry[]) {
     super();
+    // 构造阶段只登记状态，不访问文件系统，也不启动 Input；实际副作用全部留到 start()。
     for (const entry of entries) {
       this.runtimes.set(entry.id, {
         entry,
@@ -54,12 +63,17 @@ export class AgentDiscoveryService extends EventEmitter {
    * 首轮条目异常通常已在 processEntry 内隔离。
    */
   async start(): Promise<void> {
+    // 先尽力建立低延迟监听；路径不存在的条目会在 setupWatcher() 内自动改用轮询。
     for (const [id, rt] of this.runtimes) {
       this.setupWatcher(rt);
     }
+    // watcher 只响应未来变化，因此启动时必须主动评估一次当前磁盘状态。
     await this.refresh('startup');
 
+    // Number(...) 的 NaN/0 都回退默认值；负数虽会被 Node 截断为短间隔，调用方应传正数。
     const intervalMs = Number(process.env.LOONGSUITE_PILOT_DISCOVERY_INTERVAL_MS) || DEFAULT_POLL_MS;
+    // interval 回调不能声明 async 给 setInterval 等待，因此显式丢弃 Promise；processEntry
+    // 在内部捕获条目错误。timer 触发不保证上一轮 refresh 已完成。
     this.globalPollTimer = setInterval(() => void this.refresh('poll'), intervalMs);
   }
 
@@ -68,6 +82,7 @@ export class AgentDiscoveryService extends EventEmitter {
    * @returns 所有 stop 回调完成后兑现。
    */
   async stop(): Promise<void> {
+    // 先切断所有未来调度源，再停止条目，避免关闭过程中由 timer/watch 再次启动 Input。
     if (this.globalPollTimer) {
       clearInterval(this.globalPollTimer);
       this.globalPollTimer = null;
@@ -83,6 +98,8 @@ export class AgentDiscoveryService extends EventEmitter {
         rt.pollTimer = null;
       }
       if (rt.state === 'running' || rt.state === 'starting') {
+        // starting 可能正处在 entry.start() 的 await 中；当前实现没有等待该 Promise 的专门
+        // 句柄，条目的 stop() 必须自行处理“启动未完全结束”的生命周期场景（待确认）。
         await this.stopEntry(rt);
       }
     }
@@ -112,6 +129,7 @@ export class AgentDiscoveryService extends EventEmitter {
   private async processEntry(rt: EntryRuntime): Promise<void> {
     const { entry } = rt;
     try {
+      // enabled 是廉价同步门禁；关闭时不再访问磁盘执行 isAvailable()。
       const enabled = entry.enabled ? entry.enabled() : true;
       const available = enabled ? await entry.isAvailable() : false;
       const shouldRun = enabled && available;
@@ -125,6 +143,9 @@ export class AgentDiscoveryService extends EventEmitter {
       }
 
       if (shouldRun && rt.state !== 'running') {
+        // 在 await start() 前标记 starting，让 stop() 能识别半启动状态；但该条件只排除
+        // running，另一个重叠回调看到 starting 时仍可能再次调用 start()，所以条目回调必须
+        // 幂等（待确认是否需要为每个 runtime 增加 in-flight Promise）。
         rt.state = 'starting';
         logger.info('starting agent', { id: entry.id });
         await entry.start();
@@ -133,9 +154,11 @@ export class AgentDiscoveryService extends EventEmitter {
       } else if (!shouldRun && (rt.state === 'running' || rt.state === 'starting')) {
         await this.stopEntry(rt);
       } else if (shouldRun && rt.state === 'running' && entry.runOnActive) {
+        // deploy:<id> 使用此分支做“仍活跃时重新校验/修复部署”；普通 Input 不设置它。
         await entry.start();
       }
     } catch (err) {
+      // 发现与单 Agent 启停属于可选能力，异常被隔离在条目边界；下一轮会从 idle 重试。
       logger.error('processEntry failed', { id: entry.id, error: String(err) });
       rt.state = 'idle';
     }
@@ -166,9 +189,12 @@ export class AgentDiscoveryService extends EventEmitter {
     for (const watchPath of rt.entry.watchPaths) {
       try {
         const watcher = fs.watch(watchPath, { persistent: false }, () => {
+          // fs.watch 回调不能被文件系统等待；processEntry 自行捕获异常。多个文件事件可能
+          // 在前一次异步检查完成前到达，状态字段只提供生命周期门禁，不提供 Promise 锁。
           void this.processEntry(rt);
         });
         watcher.on('error', () => {
+          // 运行期 watcher 失效后立即关闭句柄，再建立且仅建立一个 interval 兜底。
           watcher.close();
           this.setupPolling(rt);
         });
@@ -186,6 +212,7 @@ export class AgentDiscoveryService extends EventEmitter {
   private setupPolling(rt: EntryRuntime): void {
     if (rt.pollTimer) return;
     const interval = rt.entry.pollIntervalMs || DEFAULT_POLL_MS;
+    // 与 watcher 回调相同，timer 只负责触发，不持有异步操作；错误在 processEntry 隔离。
     rt.pollTimer = setInterval(() => void this.processEntry(rt), interval);
   }
 }

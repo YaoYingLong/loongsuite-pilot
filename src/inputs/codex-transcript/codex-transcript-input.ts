@@ -313,23 +313,28 @@ export class CodexTranscriptInput extends BaseInput {
         });
       }
       if (scan.nextOffset === scanStartOffset) break;
+      // 只要消费过完整行，就需要保存 checkpoint，即使这些行最终没有生成业务事件。
       checkpointChanged = true;
 
+      // 遇到 terminal 时严格停在 terminal 行末；否则推进到本次扫描到的最后一个完整换行。
       const nextScanOffset = terminalEndOffset ?? scan.nextOffset;
       scannedBytes += nextScanOffset - scanStartOffset;
       let blocked = false;
 
       if (checkpoint.activeTurn && nextScanOffset > checkpoint.activeTurn.startOffset) {
+        // 单文件列表命中表示本 transcript 已处理过该 terminal，可直接清理活跃状态。
         if (terminalTurnId && checkpoint.emittedTerminalTurnIds.includes(terminalTurnId)) {
           checkpoint.activeTurn = null;
           checkpoint.pendingTerminal = null;
           processedTerminalCount++;
+        // 同一个 turn 可能因文件复制出现在另一 transcript；全局列表防止跨文件重复输出。
         } else if (terminalTurnId && this.isGloballyProcessedTerminalTurn(terminalTurnId)) {
           this.rememberProcessedTerminalTurnId(checkpoint, terminalTurnId);
           checkpoint.activeTurn = null;
           checkpoint.pendingTerminal = null;
           processedTerminalCount++;
         } else {
+          // 对 active turn 的可见字节做语义恢复；活跃 turn 只提交闭合 step，terminal 提交整个 turn。
           const recovered = await this.recoverTurnSegment(
             filePath,
             checkpoint,
@@ -337,6 +342,7 @@ export class CodexTranscriptInput extends BaseInput {
             terminalTurnId !== null,
           );
           emittedCount += this.emitEntryBatches(recovered.entries);
+          // 只有成功解析并实际消费了源范围才移动 turn 起点；失败时保留原范围供下次完整重试。
           if (
             recovered.kind !== 'unparseable'
             && recovered.consumedEndOffset > checkpoint.activeTurn.startOffset
@@ -344,6 +350,7 @@ export class CodexTranscriptInput extends BaseInput {
             checkpoint.activeTurn.startOffset = recovered.consumedEndOffset;
           }
 
+          // terminal 已读到后必须得到“成功处理”或“持久化 pending”之一，不能静默越过。
           if (terminalTurnId && checkpoint.activeTurn.turnId === terminalTurnId) {
             if (recovered.kind === 'unparseable') {
               checkpoint.pendingTerminal = newPendingTerminal(
@@ -360,6 +367,7 @@ export class CodexTranscriptInput extends BaseInput {
               });
               blocked = true;
             } else {
+              // 成功处理后同时更新文件级和全局去重表，再释放 active/pending 状态。
               this.rememberProcessedTerminalTurnId(checkpoint, terminalTurnId);
               this.rememberGlobalProcessedTerminalTurnId(terminalTurnId);
               checkpoint.activeTurn = null;
@@ -370,7 +378,9 @@ export class CodexTranscriptInput extends BaseInput {
         }
       }
 
+      // scanOffset 描述物理文件扫描位置；activeTurn.startOffset 描述语义恢复起点，两者不能混用。
       checkpoint.scanOffset = nextScanOffset;
+      // 没有 terminal 时通常说明文件尾仍在写当前 turn，留到下一周期；pending 失败也必须停止后续扫描。
       if (blocked || terminalTurnId === null) break;
     }
 
@@ -391,19 +401,23 @@ export class CodexTranscriptInput extends BaseInput {
   ): Promise<PendingRecoveryResult> {
     const pending = checkpoint.pendingTerminal;
     if (!pending) return { blocked: false, emittedCount: 0, processedTerminalCount: 0 };
+    // pending 与 activeTurn 不一致说明旧状态已损坏或完成过迁移；清掉孤立 pending，避免永久阻塞。
     if (checkpoint.activeTurn?.turnId !== pending.turnId) {
       checkpoint.pendingTerminal = null;
       return { blocked: false, emittedCount: 0, processedTerminalCount: 0 };
     }
+    // 若另一 transcript 已成功处理同 turn，无需重读源字节，只同步本文件去重状态。
     if (this.isGloballyProcessedTerminalTurn(pending.turnId)) {
       this.rememberProcessedTerminalTurnId(checkpoint, pending.turnId);
       checkpoint.activeTurn = null;
       checkpoint.pendingTerminal = null;
       return { blocked: false, emittedCount: 0, processedTerminalCount: 1 };
     }
+    // 使用持久化 terminalEndOffset 精确重建上次失败范围，而不是依赖当前文件扫描游标回退。
     const recovered = await this.recoverTurnSegment(filePath, checkpoint, pending.terminalEndOffset, true);
     if (recovered.kind === 'unparseable') {
       const now = Date.now();
+      // firstPendingAtMs 保留首次失败时间，lastAttempt/retryCount 则在每次重试更新，便于诊断卡住时长。
       checkpoint.pendingTerminal = {
         ...pending,
         retryCount: (pending.retryCount ?? 0) + 1,
@@ -422,6 +436,7 @@ export class CodexTranscriptInput extends BaseInput {
       return { blocked: true, emittedCount: 0, processedTerminalCount: 0 };
     }
 
+    // 只有构建成功后才发送并登记完成；这保证异常重试不会先标记完成再丢事件。
     const emittedCount = this.emitEntryBatches(recovered.entries);
     this.rememberProcessedTerminalTurnId(checkpoint, pending.turnId);
     this.rememberGlobalProcessedTerminalTurnId(pending.turnId);
@@ -444,6 +459,7 @@ export class CodexTranscriptInput extends BaseInput {
   ): Promise<SegmentRecoveryResult> {
     const activeTurn = checkpoint.activeTurn;
     if (!activeTurn) {
+      // 理论上调用前应有 activeTurn；返回统一 unparseable 结构比抛错更利于文件级恢复。
       return {
         kind: 'unparseable',
         entries: [],
@@ -457,6 +473,7 @@ export class CodexTranscriptInput extends BaseInput {
       ? null
       : await readJsonLineAt(filePath, checkpoint.latestSessionMetaOffset);
     const meta = metaRecord ? extractCodexTranscriptMeta(metaRecord) : null;
+    // Extractor 同时返回语义 step 和真实字节消费边界，二者必须一起用于增量 checkpoint。
     const extraction = extractCodexPartialTurnWithBoundaries(
       records.items,
       meta,
@@ -464,6 +481,7 @@ export class CodexTranscriptInput extends BaseInput {
       activeTurn.turnId,
       partialTurnOptions(activeTurn),
     );
+    // 记录进入本轮前已经发过多少 step，后续诊断可区分“没有数据”和“全部已增量发出”。
     const previouslyEmittedStepCount = activeTurn.emittedStepCount ?? 0;
     if (!extraction) {
       return {
@@ -474,6 +492,7 @@ export class CodexTranscriptInput extends BaseInput {
       };
     }
     const turn = extraction.turn;
+    // turn_context 可能出现在恢复片段里，解析到的真实 metadata 会回填 active checkpoint。
     updateActiveTurnFromExtractedTurn(activeTurn, turn);
     if (turn.unmatchedTokenUsages.length > 0) {
       this.logger.warn('Codex transcript token samples could not be assigned to a response wave', {
@@ -484,6 +503,7 @@ export class CodexTranscriptInput extends BaseInput {
       });
     }
 
+    // Builder 的 step 序号必须从已发数量之后继续，确保跨轮询 ID 稳定且不重复。
     const stepStart = (activeTurn.emittedStepCount ?? 0) + 1;
     // terminal 允许闭合全部 step；活跃 turn 只能采用 extractor 判定可增量提交的连续前缀。
     const closedStepCount = terminal
@@ -492,6 +512,7 @@ export class CodexTranscriptInput extends BaseInput {
     const committedTurn = closedStepCount === turn.steps.length
       ? turn
       : { ...turn, steps: turn.steps.slice(0, closedStepCount) };
+    // 超大上下文可能需要按 checkpoint 保存的源范围回读，因此这里是异步步骤。
     const inputContext = await this.resolveInputContext(filePath, activeTurn, meta);
     const built = buildCodexTranscriptSegment(committedTurn, {
       includePrompt: activeTurn.emittedPrompt !== true,
@@ -502,6 +523,7 @@ export class CodexTranscriptInput extends BaseInput {
     const readyEntries = built.entries;
     // Builder 使用确定性 ID 重建整个片段，随后依据 checkpoint 中的 ID 集合过滤已经发出的事件。
     const entries = this.filterNewSegmentEntries(readyEntries, activeTurn);
+    // 诊断计数不参与事件内容，仅帮助区分解析、构建、去重和发送各阶段的数据损失位置。
     const diagnostics: SegmentRecoveryDiagnostics = {
       sourceRecordCount: records.items.length,
       stepCount: turn.steps.length,
@@ -515,6 +537,7 @@ export class CodexTranscriptInput extends BaseInput {
       previouslyEmittedStepCount,
     };
 
+    // terminal 没有新事件可能是合法空控制 turn、已增量发送完毕，也可能是异常；分别记录不同级别。
     if (terminal && entries.length === 0) {
       if (built.entries.length === 0) {
         this.logger.debug('processed terminal Codex turn without observable entries', {
@@ -540,9 +563,11 @@ export class CodexTranscriptInput extends BaseInput {
       }
     }
 
+    // 事件 ID 集合在 filter 中更新；这里同步高层 prompt/step 进度，供下一片段决定起始位置。
     if (turn.prompt) activeTurn.emittedPrompt = true;
     activeTurn.emittedStepCount = (activeTurn.emittedStepCount ?? 0) + closedStepCount;
 
+    // 保存最后闭合 step 的源范围；若 delta 太大，persistedInputContext 会改存该范围而非正文。
     const lastClosedRange = closedStepCount > 0
       ? extraction.committedStepRanges[closedStepCount - 1]
       : undefined;
@@ -550,10 +575,12 @@ export class CodexTranscriptInput extends BaseInput {
       activeTurn.inputContext = persistedInputContext(built.nextInputContext, lastClosedRange);
     }
 
+    // terminal 可以消费到明确结束位置；活跃 turn 只能推进到 Extractor 判定闭合的 step 边界。
     const consumedEndOffset = terminal
       ? endOffset
       : extraction.consumedEndOffset;
 
+    // wakeup marker 的 AgentTeams 归属是可选 enrich，读取失败不会改变主事件和消费 offset。
     const resourceAttributes = await this.readWakeupResourceAttributes(turn.sessionId);
     const outputEntries = resourceAttributes ? attachWakeupResourceAttributes(entries, resourceAttributes) : entries;
     return {
@@ -779,9 +806,12 @@ export class CodexTranscriptInput extends BaseInput {
    * 旧版本缺失的新字段使用空值，非法必需字段则返回 null，让调用方重新 baseline。
    */
   private readCheckpoint(key: string): CodexTranscriptCheckpoint | null {
+    // 专用状态嵌在通用 InputState.extra 中，避免 StateStore 认识每一种 Input 的私有结构。
     const raw = this.stateStore.get(key).extra?.codexTranscript;
     const value = asRecord(raw);
+    // inode 和 scanOffset 是恢复增量读取所需的最小字段；任一无效都必须重新 baseline。
     if (!value || typeof value.inode !== 'number' || typeof value.scanOffset !== 'number') return null;
+    // activeTurn 来自磁盘 JSON，先逐个读取可选字符串，再验证三个必需字段。
     const active = asRecord(value.activeTurn);
     const model = stringValue(active?.model);
     const cwd = stringValue(active?.cwd);
@@ -791,28 +821,35 @@ export class CodexTranscriptInput extends BaseInput {
       && typeof active.startOffset === 'number'
       && typeof active.startedAtMs === 'number'
       ? {
+          // turnId + 起始字节 + 起始时间共同确定跨轮询恢复的范围和时间边界。
           turnId: active.turnId,
           startOffset: active.startOffset,
           startedAtMs: active.startedAtMs,
           ...(model ? { model } : {}),
           ...(cwd ? { cwd } : {}),
           ...(developerInstructions ? { developerInstructions } : {}),
+          // 布尔值只接受严格 true；旧 checkpoint 没有该字段时按“尚未输出 prompt”处理。
           emittedPrompt: active.emittedPrompt === true,
+          // 已输出计数和 ID 集合用于 pending terminal 重试时跳过已成功发送的事件，避免重复上报。
           emittedStepCount: typeof active.emittedStepCount === 'number' ? active.emittedStepCount : 0,
           emittedStepRequestIds: stringArray(active.emittedStepRequestIds),
           emittedStepResponseIds: stringArray(active.emittedStepResponseIds),
           emittedToolCallIds: stringArray(active.emittedToolCallIds),
           emittedToolResultIds: stringArray(active.emittedToolResultIds),
+          // inputContext 可能较大且结构嵌套，交给专用解析器逐字段收窄并应用兼容默认值。
           inputContext: parseInputContext(active.inputContext),
         }
       : null;
+    // pendingTerminal 表示已经看到终态，但该 turn 尚未完整构建或发送成功，需要下轮从固定边界重试。
     const pending = asRecord(value.pendingTerminal);
     const pendingTerminal = pending
       && typeof pending.turnId === 'string'
       && typeof pending.terminalEndOffset === 'number'
       ? {
           turnId: pending.turnId,
+          // terminalEndOffset 固定终态闭合边界，后续追加的新 turn 不会被误读进本次重试。
           terminalEndOffset: pending.terminalEndOffset,
+          // 下列诊断字段均为后来增加的可选字段；旧状态缺失时不影响恢复资格。
           ...(typeof pending.retryCount === 'number' ? { retryCount: pending.retryCount } : {}),
           ...(typeof pending.firstPendingAtMs === 'number' ? { firstPendingAtMs: pending.firstPendingAtMs } : {}),
           ...(typeof pending.lastAttemptAtMs === 'number' ? { lastAttemptAtMs: pending.lastAttemptAtMs } : {}),
@@ -820,13 +857,16 @@ export class CodexTranscriptInput extends BaseInput {
         }
       : null;
     return {
+      // 保留经验证的文件身份和扫描位置。
       inode: value.inode,
       scanOffset: value.scanOffset,
       activeTurn,
       pendingTerminal,
+      // meta 位置不是恢复所必需；缺失时 extractor 会从文件名和协议默认值补足基础身份。
       latestSessionMetaOffset: typeof value.latestSessionMetaOffset === 'number'
         ? value.latestSessionMetaOffset
         : null,
+      // 文件级终态 ID 是旧版/局部去重来源；截断可限制状态文件大小。
       emittedTerminalTurnIds: Array.isArray(value.emittedTerminalTurnIds)
         ? value.emittedTerminalTurnIds.filter((item): item is string => typeof item === 'string')
           .slice(0, MAX_EMITTED_TERMINAL_TURNS)

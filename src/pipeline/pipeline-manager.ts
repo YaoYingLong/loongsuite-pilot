@@ -22,7 +22,13 @@ const RESCAN_INTERVAL_MS = 60_000;
 /** configName 同时用于状态文件和 topic，只允许安全文件名字符。 */
 const VALID_CONFIG_NAME = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
 
-/** 管理运行中的 configName -> Pipeline 实例集合。 */
+/**
+ * 管理运行中的 `configName -> Pipeline` 实例集合。
+ *
+ * PipelineManager 是独立采集子系统的所有者：Orchestrator 只调用 start/stop，本类负责动态配置
+ * 热更新、实例构造和资源清理。`configHashes` 保存规范化配置指纹，`pipelines` 保存已经成功
+ * start 的实例，两者共同决定新增、重建和删除。
+ */
 export class PipelineManager {
   private readonly configDir: string;
   private readonly stateDir: string;
@@ -39,7 +45,11 @@ export class PipelineManager {
   private rescanInProgress = false;
   private rescanQueued = false;
 
-  /** @param opts 配置/状态/失败目录、数据根及 file/qoderApi 子开关。 */
+  /**
+   * 保存目录和功能开关；构造阶段不创建目录、watcher 或 Pipeline。
+   *
+   * @param opts 配置/状态/失败目录、数据根及 file/qoderApi 子开关。
+   */
   constructor(opts: PipelineManagerOptions) {
     this.configDir = opts.configDir;
     this.stateDir = opts.stateDir;
@@ -48,7 +58,13 @@ export class PipelineManager {
     this.pipelineConfig = opts.pipelineConfig;
   }
 
-  /** 创建/迁移目录，首轮扫描，建立 watcher/周期扫描，并在 macOS 启动睡眠探测。 */
+  /**
+   * 创建/迁移目录，完成首轮扫描，再建立 watcher 和周期兜底扫描。
+   *
+   * 首轮 `await fullRescan()` 保证 start 返回前当前合法配置已经尝试创建。`fs.watch` 回调只发起
+   * 重扫，配置文件内容始终由 `scanConfigDir()` 重新完整读取，避免依赖不可靠的事件类型。
+   * watcher 创建或运行失败不会让 start reject，而是保留 60 秒 timer 作为降级路径。
+   */
   async start(): Promise<void> {
     if (this.running) return;
     this.running = true;
@@ -98,7 +114,12 @@ export class PipelineManager {
     });
   }
 
-  /** 停止探测/watcher/timer，并行尽力关闭全部 Pipeline 后清内存状态。 */
+  /**
+   * 停止探测、watcher 和 timer，并行尽力关闭全部 Pipeline 后清理内存状态。
+   *
+   * 每个 `pipeline.stop()` 单独 catch，确保一个实例关闭失败不阻止其他实例释放资源；
+   * `Promise.all` 等所有关闭任务 settle 后才清 Map。方法不抛单实例停止错误，只通过日志暴露。
+   */
   async stop(): Promise<void> {
     if (!this.running) return;
     this.running = false;
@@ -182,7 +203,12 @@ export class PipelineManager {
     }
   }
 
-  /** 并行通知所有支持 handleWake 的 Pipeline 恢复，随后触发完整配置重扫。 */
+  /**
+   * 并行通知所有支持 `handleWake` 的 Pipeline 恢复，随后触发完整配置重扫。
+   *
+   * optional chaining 让未实现唤醒钩子的 Pipeline 立即完成。每个恢复任务隔离异常；全部结束后
+   * 用 fire-and-forget 发起 rescan，扫描串行门会处理它与 watcher/timer 请求的竞争。
+   */
   private async handleWake(event: WakeEvent): Promise<void> {
     if (!this.running) return;
     logger.info('handling system wake, recovering pipelines', {
@@ -207,7 +233,12 @@ export class PipelineManager {
     void this.fullRescan();
   }
 
-  /** 串行化完整重扫；扫描期间的新请求只设置 queued，结束后再补一轮。 */
+  /**
+   * 把 watcher、timer 和 wake 触发的完整重扫串行化。
+   *
+   * 扫描期间再收到任意数量的请求只设置一个布尔 `rescanQueued`，相当于合并通知；当前扫描的
+   * `finally` 释放门后最多补一轮。`finally` 同时保证 `doRescan()` 抛错时不会永久锁住热更新。
+   */
   private async fullRescan(): Promise<void> {
     if (this.rescanInProgress) {
       this.rescanQueued = true;
@@ -227,7 +258,12 @@ export class PipelineManager {
     }
   }
 
-  /** 对比磁盘配置与运行实例：删除缺失、创建新增、hash 变化时停止后重建。 */
+  /**
+   * 对比磁盘配置与运行实例：先删除磁盘已缺失项，再创建新增项，hash 变化时停止后重建。
+   *
+   * 顺序执行而非并行，避免两个配置同时迁移/写相同运行目录时扩大竞态。每处理一项都检查
+   * `running`，使 stop 可以阻止扫描继续创建新资源。稳定序列化忽略对象键顺序，但保留数组顺序。
+   */
   private async doRescan(): Promise<void> {
     if (!this.running) return;
 
@@ -261,7 +297,12 @@ export class PipelineManager {
     }
   }
 
-  /** 读取目录内所有 `.json`，逐个解析/校验；单文件损坏不影响其他配置。 */
+  /**
+   * 读取目录内所有 `.json`，逐个解析并做运行时最低限度校验。
+   *
+   * TypeScript 接口不会验证磁盘 JSON，所以必须在这里检查必填字段。目录不存在返回空数组；
+   * 单文件读取、JSON.parse 或校验失败只记录并跳过，不影响同目录其他 Pipeline。
+   */
   private async scanConfigDir(): Promise<PipelineConfig[]> {
     let entries: string[];
     try {
@@ -289,7 +330,13 @@ export class PipelineManager {
     return configs;
   }
 
-  /** 校验安全 configName、至少一个 input/flusher 和各类型必填字段。 */
+  /**
+   * 校验安全 `configName`、至少一个 input/flusher 和当前类型的必填字段。
+   *
+   * `configName` 会进入状态文件名和 SLS topic，所以只允许字母、数字、点、下划线和连字符，
+   * 且首字符必须是字母或数字；这样可排除路径分隔符和以点开头的隐藏/相对路径形式。
+   * 当前运行逻辑只读取数组第 0 项；校验额外条目不会让它们自动变成多路输出。
+   */
   private validateConfig(config: PipelineConfig, fileName: string): boolean {
     if (!config.configName) {
       logger.warn('config missing configName', { file: fileName });
@@ -340,7 +387,13 @@ export class PipelineManager {
     }
   }
 
-  /** 根据 input Type 和子开关构造、启动并登记 Pipeline；失败只影响该配置。 */
+  /**
+   * 根据 input Type 和子开关构造、启动并登记 Pipeline。
+   *
+   * 只有 `await pipeline.start()` 成功后才写入 Map，因此 Map 中实例都满足“已启动”不变量。
+   * 构造/启动异常在本方法内记录并吞掉，使一个错误配置不阻断其他配置；下次 rescan 因 Map 中
+   * 仍无该名称会再次尝试。
+   */
   private async createPipeline(config: PipelineConfig): Promise<void> {
     const inputType = config.inputs[0].Type;
 
@@ -389,7 +442,11 @@ export class PipelineManager {
     }
   }
 
-  /** 幂等停止并移除指定实例及其配置 hash。 */
+  /**
+   * 幂等停止并移除指定实例及其配置 hash。
+   *
+   * 即使 stop 抛错也会删除 Map 条目，防止管理器继续把已要求删除的配置视为健康运行实例。
+   */
   private async destroyPipeline(configName: string): Promise<void> {
     const pipeline = this.pipelines.get(configName);
     if (!pipeline) return;
@@ -407,7 +464,12 @@ export class PipelineManager {
   }
 }
 
-/** 对普通对象递归按 key 排序后 JSON.stringify，用作配置内容稳定指纹。 */
+/**
+ * 对普通对象递归按 key 排序后 `JSON.stringify`，用作配置内容稳定指纹。
+ *
+ * replacer 会在每个对象层级生成按键排序的新对象；数组不排序，因为 inputs/flushers 顺序具有
+ * 语义。该值不是密码学 hash，只用于同一进程内比较配置内容是否改变。
+ */
 function stableStringify(obj: unknown): string {
   return JSON.stringify(obj, (_key, value) => {
     if (value && typeof value === 'object' && !Array.isArray(value)) {

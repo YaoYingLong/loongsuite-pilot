@@ -33,7 +33,12 @@ export abstract class BaseCliForwarder extends BaseInput {
   protected readonly historyDir: string;
   protected readonly historyPrefix: string;
 
-  /** 保存路径并把 BaseInput 默认轮询覆盖为 forwarderPollMs/5 秒。 */
+  /**
+   * 保存路径并把 BaseInput 默认轮询覆盖为 `forwarderPollMs` 或 5 秒。
+   *
+   * `super(opts)` 会先采用通用 pollIntervalMs，但本类随后明确覆盖；构造阶段不 stat 原始文件，
+   * 也不创建 history 目录。
+   */
   constructor(opts: CliForwarderOptions) {
     super(opts);
     this.rawTelemetryPath = opts.rawTelemetryPath;
@@ -42,12 +47,20 @@ export abstract class BaseCliForwarder extends BaseInput {
     this.pollIntervalMs = opts.forwarderPollMs ?? 5_000;
   }
 
-  /** 启动前创建 history 目录。 */
+  /**
+   * 启动首轮采集前递归创建 history 目录。
+   * `ensureDir` 是 best-effort；失败被工具函数吞掉，后续 appendLine 仍可能静默写入失败。
+   */
   protected override async onStart(): Promise<void> {
     await ensureDir(this.historyDir);
   }
 
-  /** 转发新增原始记录，再逐条隔离转换错误。 */
+  /**
+   * 先把新增且相关的原始记录追加到 history，再逐条转换为标准事件。
+   *
+   * `transformPayload()` 串行执行，保证返回顺序与原文件一致；一条转换异常只记录告警，其他记录
+   * 继续。由于 offset 已在 forward 阶段推进，转换失败记录不会在下轮自动重试。
+   */
   protected async collect(): Promise<AgentActivityEntry[]> {
     const newRecords = await this.forwardNewTelemetry();
     const entries: AgentActivityEntry[] = [];
@@ -63,7 +76,16 @@ export abstract class BaseCliForwarder extends BaseInput {
     return entries;
   }
 
-  /** 按当前文件 size 读取 offset 之后的全部字节，筛选并追加 history。 */
+  /**
+   * 按本轮 `stat.size` 读取 offset 之后的全部字节，筛选并追加每日 history。
+   *
+   * 读取边界固定后，并发追加留到下一轮。句柄在 finally 中关闭。当前实现没有保存 inode，也
+   * 没有在 `stat.size < offset` 时显式重置；原始 telemetry 若会 truncate/rename，恢复行为待
+   * 对应 CLI writer 契约确认。
+   *
+   * offset 在解析和 history 写入前先更新内存；`appendLine` 采用 best-effort 且吞写入错误，
+   * 所以 history 是辅助副本，不是可靠队列。
+   */
   private async forwardNewTelemetry(): Promise<Record<string, unknown>[]> {
     let stat;
     try {
@@ -103,7 +125,12 @@ export abstract class BaseCliForwarder extends BaseInput {
     }
   }
 
-  /** 从逐行文本中提取以 `{` 开头的合法 JSON 对象。 */
+  /**
+   * 从逐行文本中提取以 `{` 开头的合法 JSON 对象。
+   *
+   * 空行、非对象前缀和 JSON.parse 失败都跳过。方法没有半行缓存：本轮末尾尚未写完的 JSON 会
+   * 因 offset 已推进而永久跳过，因此依赖上游以完整行方式追加。
+   */
   private extractJsonObjects(text: string): Record<string, unknown>[] {
     const results: Record<string, unknown>[] = [];
     for (const line of text.split('\n')) {
@@ -118,10 +145,17 @@ export abstract class BaseCliForwarder extends BaseInput {
     return results;
   }
 
-  /** 判断原始事件是否属于本 Input 关心的类型。 */
+  /**
+   * 判断原始事件是否属于本 Input 关心的类型。
+   * @returns false 时既不写 history，也不调用 transformPayload。
+   */
   protected abstract isRelevantEvent(event: Record<string, unknown>): boolean;
 
-  /** 把已写入 history 的事件转为标准 AgentActivityEntry。 */
+  /**
+   * 把已尝试写入 history 的事件转为标准 AgentActivityEntry。
+   * @returns 标准事件；null 表示主动忽略。
+   * @throws 单条异常由 collect 捕获，offset 不回退。
+   */
   protected abstract transformPayload(
     event: Record<string, unknown>,
   ): Promise<AgentActivityEntry | null>;

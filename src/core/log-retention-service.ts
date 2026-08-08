@@ -4,7 +4,8 @@
  * `Orchestrator.start()` 启动本类，延迟后按配置周期扫描各 Agent 的 history/errors/
  * debug、规范化 output 和 SLS 失败元数据。常规策略按文件名日期删除；output 另有
  * 大文件与 2 GiB 总量水位，且保护今天及容量清理时的昨天文件。删除失败逐文件隔离，
- * timer 使用 `unref()`，`stop()` 负责取消后续扫描。
+ * `stop()` 负责取消后续扫描。当前两个 timer 没有调用 `unref()`，因此服务关闭路径必须
+ * 正常调用 stop() 才不会由它们继续维持 Node 进程（待确认是否应与其他后台 timer 一致）。
  */
 
 
@@ -29,9 +30,13 @@ export const SLS_FAILURE_RETENTION_MAX_TOTAL_BYTES = SLS_FAILURE_LOG_MAX_TOTAL_B
 type Category = 'history' | 'errors' | 'debug' | 'output' | 'sls-failed-logs';
 
 interface DatedLogFile {
+  /** 目录内的原始文件名，用于稳定排序和 segment 解析。 */
   file: string;
+  /** 传给 stat/unlink 的完整路径。 */
   fullPath: string;
+  /** 从文件名提取的 YYYY-MM-DD；不是 mtime。 */
   dateStr: string;
+  /** 最近一次 stat 得到的字节数，删除后用于调整内存总量。 */
   size: number;
 }
 
@@ -50,9 +55,13 @@ const CATEGORY_DIR_MAP: Record<string, Category> = {
  * stat 和 unlink 都逐项隔离，返回计数供日志观察，不会因单文件失败拒绝整轮 Promise。
  */
 export class LogRetentionService {
+  /** `<dataDir>/logs`，既可能直接含分类，也可能先按 Agent 分子目录。 */
   private readonly logsDir: string;
+  /** ConfigLoader 已补齐的分类天数和扫描周期。 */
   private readonly config: LogRetentionConfig;
+  /** 延迟首次扫描，避免与 Collector 启动 I/O 竞争。 */
   private startupTimer: ReturnType<typeof setTimeout> | null = null;
+  /** 首轮扫描触发后创建的长期调度器。 */
   private intervalTimer: ReturnType<typeof setInterval> | null = null;
 
   /** @param dataDir 数据根目录；实际扫描固定在其 logs 子目录。 */
@@ -62,7 +71,8 @@ export class LogRetentionService {
   }
 
   /**
-   * 配置关闭时不创建资源；否则延迟首轮并建立周期 timer，二者均 unref。
+   * 配置关闭时不创建资源；否则延迟首轮并建立周期 timer。两个 timer 当前均保持进程引用，
+   * 所以 Orchestrator.stop() 必须调用本类 stop()。
    */
   start(): void {
     if (!this.config.enabled) {
@@ -84,7 +94,10 @@ export class LogRetentionService {
     });
 
     this.startupTimer = setTimeout(() => {
+      // 清空句柄表示 startup 阶段已经结束；stop() 随后只需处理 interval。
       this.startupTimer = null;
+      // timer 回调无法 await；runCleanup 内部按目录/文件隔离错误。若清理时间超过 interval，
+      // 后续 setInterval 仍可能启动另一轮，当前没有运行中互斥标记（待确认）。
       void this.runCleanup();
       this.intervalTimer = setInterval(() => void this.runCleanup(), this.config.intervalMs);
     }, STARTUP_DELAY_MS);
@@ -107,6 +120,7 @@ export class LogRetentionService {
    * @returns 本轮成功删除数和失败数。
    */
   async runCleanup(): Promise<{ deleted: number; errors: number }> {
+    // 文件名和 cutoff 都使用本地日期，避免 UTC 午夜与 JsonlFlusher 的本地轮转日期错位。
     const today = localDateString(new Date());
     let deleted = 0;
     let errors = 0;
@@ -121,10 +135,12 @@ export class LogRetentionService {
 
         const category = CATEGORY_DIR_MAP[entry];
         if (category) {
+          // logs/output 等顶层分类直接处理。
           const result = await this.cleanDirectory(entryPath, category, today);
           deleted += result.deleted;
           errors += result.errors;
         } else {
+          // logs/<agent>/history 等两级布局只向下一层查找已知分类，不递归任意深度。
           const subResult = await this.cleanSubdirectories(entryPath, today);
           deleted += subResult.deleted;
           errors += subResult.errors;
@@ -167,7 +183,10 @@ export class LogRetentionService {
     return { deleted, errors };
   }
 
-  /** 按文件名日期删除早于 cutoff 的普通分类日志；当天文件受日期比较自然保护。 */
+  /**
+   * 按文件名日期删除早于 cutoff 的普通分类日志；当天文件显式保护。无日期文件、目录和
+   * 非标准扩展名不会删除，防止误删用户放入 logs 的其他内容。
+   */
   private async cleanDirectory(
     dir: string,
     category: Category,
@@ -185,6 +204,7 @@ export class LogRetentionService {
     }
 
     const retentionDays = this.getRetentionDays(category);
+    // YYYY-MM-DD 固定宽度，可直接用字典序比较时间先后，无需为每个文件构造 Date。
     const cutoff = dateCutoff(retentionDays);
     for (const file of files) {
       const dateStr = extractDate(file);
@@ -214,6 +234,7 @@ export class LogRetentionService {
     let errors = 0;
     let remaining = await this.collectDatedOutputFiles(dir, files);
 
+    // 第一阶段按配置天数删除；今天的最新 segment 即使日期策略异常也不会动。
     const cutoff = dateCutoff(this.config.slsFailedDays);
     const expiredResult = await this.deleteDatedFiles(
       remaining,
@@ -222,12 +243,14 @@ export class LogRetentionService {
     deleted += expiredResult.deleted;
     errors += expiredResult.errors;
 
+    // 删除后重新读取目录而不是仅过滤内存数组，确保失败删除仍计入容量，并纳入并发新文件。
     remaining = await this.collectDatedOutputFiles(dir, await readdir(dir));
     let totalBytes = remaining.reduce((sum, file) => sum + file.size, 0);
     if (totalBytes <= SLS_FAILURE_RETENTION_MAX_TOTAL_BYTES) {
       return { deleted, errors };
     }
 
+    // Writer 可能仍持有当天每 endpoint 最大 segment 的文件句柄；容量压力也不能删除它们。
     const activePaths = findActiveSlsFailureSegments(remaining, today);
     const candidates = remaining
       .filter(file => !activePaths.has(file.fullPath))
@@ -259,6 +282,7 @@ export class LogRetentionService {
     let errors = 0;
     let remaining = await this.collectDatedOutputFiles(dir, files);
 
+    // 1. 常规天数策略：保护今天，删除早于用户配置 cutoff 的文件。
     const regularCutoff = dateCutoff(this.config.outputDays);
     const regularResult = await this.deleteDatedFiles(
       remaining,
@@ -268,6 +292,7 @@ export class LogRetentionService {
     errors += regularResult.errors;
     remaining = remaining.filter(file => !regularResult.attemptedPaths.has(file.fullPath));
 
+    // 2. 超大文件策略：即使仍在常规保留期，超过 512 MiB 且早于两天也提前删除。
     const largeFileCutoff = dateCutoff(OUTPUT_RETENTION_LARGE_FILE_DAYS);
     const largeFileResult = await this.deleteDatedFiles(
       remaining,
@@ -279,6 +304,7 @@ export class LogRetentionService {
     errors += largeFileResult.errors;
     remaining = remaining.filter(file => !largeFileResult.attemptedPaths.has(file.fullPath));
 
+    // 3. 总容量策略：在仍保留至少一天的前提下，从最旧文件开始降到 2 GiB 以下。
     const pressureResult = await this.enforceOutputSizeLimit(remaining, today);
     deleted += pressureResult.deleted;
     errors += pressureResult.errors;
@@ -307,7 +333,10 @@ export class LogRetentionService {
     return result;
   }
 
-  /** 按传入谓词批量删除 dated files，并累加共享结果对象。 */
+  /**
+   * 按调用方谓词批量删除 dated files。
+   * attemptedPaths 同时包含成功与失败路径，使同一轮后续策略不重复尝试一个已失败文件。
+   */
   private async deleteDatedFiles(
     files: DatedLogFile[],
     shouldDelete: (file: DatedLogFile) => boolean,
@@ -331,7 +360,8 @@ export class LogRetentionService {
   }
 
   /**
-   * 总量超过水位时按日期、文件名升序删除，直到达标；protectedFiles 永不删除。
+   * 总量超过水位时按日期升序、同日按大文件优先、最后按文件名排序删除，直到达标；
+   * 今天及最近保留窗口内的文件永不成为候选，因此容量可能仍高于水位。
    */
   private async enforceOutputSizeLimit(
     files: DatedLogFile[],
@@ -368,6 +398,7 @@ export class LogRetentionService {
   /** unlink 单文件；成功返回 true，失败记录警告并返回 false。 */
   private async deleteFile(file: string): Promise<boolean> {
     try {
+      // unlink 只删除普通目录项；上游 collectDatedOutputFiles 已用 stat 筛掉目录。
       await fs.unlink(file);
       return true;
     } catch (err) {
@@ -393,6 +424,8 @@ export function extractDate(filename: string): string | null {
   const match = DATE_REGEX.exec(filename);
   if (!match) return null;
   const d = match[1];
+  // 这里只做便宜的范围检查，不验证每月实际天数；文件名由受控 Writer 生成，范围足以防止
+  // 明显异常字符串进入保留排序。
   const parts = d.split('-').map(Number);
   if (parts.length !== 3) return null;
   const [y, m, day] = parts;
@@ -402,6 +435,7 @@ export function extractDate(filename: string): string | null {
 
 /** 按本地日期计算 retentionDays 天前的字符串截止点。 */
 function dateCutoff(retentionDays: number): string {
+  // setDate 自动处理跨月/跨年和本地时区夏令时边界。
   const d = new Date();
   d.setDate(d.getDate() - retentionDays);
   return localDateString(d);
@@ -420,6 +454,7 @@ async function readdir(dir: string): Promise<string[]> {
   try {
     return await fs.readdir(dir);
   } catch {
+    // 将不存在、权限和瞬时 I/O 错误都视为“本轮没有可处理文件”；单独错误数不会增加。
     return [];
   }
 }
@@ -442,6 +477,7 @@ function findActiveSlsFailureSegments(files: DatedLogFile[], today: string): Set
     if (file.dateStr !== today) continue;
     const match = /^(.*)-(\d+)-(\d{4}-\d{2}-\d{2})\.jsonl$/.exec(file.file);
     if (!match || match[3] !== today) continue;
+    // 文件格式为 `<endpoint>-<segment>-<date>.jsonl`；贪婪第一组允许 endpoint 名含连字符。
     const segment = Number(match[2]);
     const current = latestByEndpoint.get(match[1]);
     if (!current || segment > current.segment) {

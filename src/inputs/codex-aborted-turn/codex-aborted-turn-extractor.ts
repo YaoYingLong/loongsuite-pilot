@@ -67,24 +67,32 @@ export function extractAbortedTurn(
   fallbackSessionId: string,
   expectedTurnId: string,
 ): CodexExtractedAbortedTurn | null {
+  // currentTurnId 是状态机闸门：在看到目标 turn 的起点前，后续消息一律不进入聚合结果。
   let currentTurnId = '';
+  // startedAtMs 可由 task_started 或 turn_context 首次赋值；abort 时间必须来自真实中断记录。
   let startedAtMs: number | undefined;
   let abortedAtMs: number | undefined;
+  // rollout 未提供 reason/model 时保留可诊断的默认值，而不是让下游处理 undefined。
   let abortReason = 'interrupted';
   let model = 'unknown';
   let cwd: string | undefined;
   let developerInstructions: string | undefined;
   const promptParts: string[] = [];
+  // timeline 同时保存文本、工具调用和工具结果；builder 会按 timestamp + sequence 划分步骤。
   const timeline: CodexTimelineEvent[] = [];
+  // 只有见过调用的 callId 才接纳对应结果，防止范围边界附近的孤立结果串入当前 turn。
   const toolCallIds = new Set<string>();
+  // token_count 是累计快照而非单次增量，保留变化点供 builder 计算各步骤差值。
   const usageSamples: CodexTokenUsageSample[] = [];
   let lastUsage: CodexTokenUsage | undefined;
   let sequence = 0;
 
   /** 为 timeline 事件分配单调 sequence，确保相同毫秒内仍能按原始记录顺序稳定排序。 */
   const appendTimeline = (event: CodexTimelineEventInput): void => {
+    // 后置递增让第一条事件从 0 开始；token 样本也共享该序列空间。
     const nextSequence = sequence++;
     if (event.kind === 'assistant_message') {
+      // 显式重建对象既补入 sequence，也避免把联合类型中不属于该分支的字段带入结果。
       timeline.push({
         kind: 'assistant_message',
         timestampMs: event.timestampMs,
@@ -112,15 +120,19 @@ export function extractAbortedTurn(
   };
 
   for (const record of records) {
+    // rollout 内容来自外部进程，任何非对象 payload 都直接跳过，避免属性访问抛错。
     const payload = asRecord(record.payload);
     if (!payload) continue;
     const parsedTimestamp = timestampMs(record);
+    // 普通 timeline 项允许退回 turn 起始时间；唯独 abort 必须保留“时间无效”这一失败信号。
     const timestamp = parsedTimestamp ?? startedAtMs ?? Date.now();
 
     if (record.type === 'event_msg' && payload.type === 'task_started') {
       const turnId = stringValue(payload.turn_id);
       if (turnId === expectedTurnId) {
+        // 只打开调用者指定的 turn，范围内其他 turn 的起点不会改变当前目标。
         currentTurnId = turnId;
+        // `??=` 保留更早获得的合法起点，不被重复起始记录覆盖。
         startedAtMs ??= timestamp;
       }
       continue;
@@ -129,6 +141,7 @@ export function extractAbortedTurn(
     if (record.type === 'turn_context') {
       const turnId = stringValue(payload.turn_id);
       if (turnId !== expectedTurnId) continue;
+      // turn_context 兼作缺失 task_started 时的起点，并携带模型、cwd 和开发者指令。
       currentTurnId = turnId;
       startedAtMs ??= timestamp;
       model = stringValue(payload.model) ?? model;
@@ -137,38 +150,46 @@ export function extractAbortedTurn(
       continue;
     }
 
+    // 到这里仍未进入目标 turn 的记录属于范围前缀，只能忽略。
     if (currentTurnId !== expectedTurnId) continue;
 
     if (record.type === 'event_msg') {
       if (payload.type === 'agent_message') {
+        // agent_message 是可展示的 assistant 文本，按原始时间插入 timeline。
         const message = stringValue(payload.message);
         if (message) appendTimeline({ kind: 'assistant_message', timestampMs: timestamp, content: message });
       } else if (payload.type === 'token_count') {
+        // 只保存可解析且与上一累计值不同的样本，避免重复快照制造零增量步骤。
         const usage = extractLastTokenUsage(payload.info);
         if (usage && !sameUsage(lastUsage, usage)) {
           lastUsage = usage;
           usageSamples.push({ timestampMs: timestamp, sequence: sequence++, usage });
         }
       } else if (payload.type === 'turn_aborted' && stringValue(payload.turn_id) === expectedTurnId) {
+        // 使用 parsedTimestamp 而不是回退 timestamp；缺少真实中断时间时整次提取应失败并写诊断。
         abortedAtMs = parsedTimestamp;
         abortReason = stringValue(payload.reason) ?? abortReason;
       }
       continue;
     }
 
+    // 其余协议记录不参与中断恢复；response_item 才承载 prompt 和工具交互。
     if (record.type !== 'response_item') continue;
     const itemType = stringValue(payload.type);
     if (itemType === 'message') {
       if (stringValue(payload.role) === 'user') {
         const text = extractMessageText(payload.content);
+        // Codex 自己插入的 <turn_aborted> 控制消息不是用户意图，必须从 prompt 中排除。
         if (text && !isTurnAbortedInjection(text)) promptParts.push(text);
       }
       continue;
     }
 
     if (itemType === 'function_call' || itemType === 'custom_tool_call' || itemType === 'tool_search_call') {
+      // 不同工具协议把标识写在 call_id 或 id，按优先级兼容两种形状。
       const callId = stringValue(payload.call_id) ?? stringValue(payload.id);
       if (!callId) continue;
+      // custom_tool_call 使用 input，普通函数和工具搜索使用 arguments。
       const inputField = itemType === 'custom_tool_call' ? payload.input : payload.arguments;
       appendTimeline({
         kind: 'tool_call',
@@ -177,11 +198,13 @@ export function extractAbortedTurn(
         name: stringValue(payload.name) ?? (itemType === 'tool_search_call' ? 'tool_search' : 'unknown'),
         input: toJsonValue(parseMaybeJson(inputField)),
       });
+      // 先登记调用，后面的 output 才能通过归属校验。
       toolCallIds.add(callId);
       continue;
     }
 
     if (itemType === 'web_search_call') {
+      // 旧 Web Search 记录可能没有 ID；时间戳派生值让调用和下方合成结果仍能稳定配对。
       const callId = stringValue(payload.call_id) ?? stringValue(payload.id) ?? `web_search:${timestamp}`;
       appendTimeline({
         kind: 'tool_call',
@@ -191,6 +214,7 @@ export function extractAbortedTurn(
         input: toJsonValue(parseMaybeJson(payload.action)),
       });
       toolCallIds.add(callId);
+      // web_search_call 本身同时携带状态，没有独立 output 记录，因此当场合成一个 tool_result。
       appendTimeline({
         kind: 'tool_result',
         timestampMs: timestamp,
@@ -210,12 +234,14 @@ export function extractAbortedTurn(
 
     const callId = stringValue(payload.call_id) ?? stringValue(payload.id);
     if (!callId) continue;
+    // 范围中可能出现上一个 turn 发起、当前 turn 才返回的结果；没有本 turn 调用证据就丢弃。
     if (!toolCallIds.has(callId)) continue;
     appendTimeline({
       kind: 'tool_result',
       timestampMs: timestamp,
       callId,
       output: itemType === 'tool_search_output'
+        // tool_search_output 是结构化复合对象，普通工具结果则直接解析 output 字段。
         ? toJsonValue({
         ...(payload.status !== undefined ? { status: payload.status } : {}),
         ...(payload.execution !== undefined ? { execution: payload.execution } : {}),
@@ -225,8 +251,10 @@ export function extractAbortedTurn(
     });
   }
 
+  // 中断时间是“确实发生目标终态”的硬证据；缺失时不生成可能误报的 cancelled 事件。
   if (abortedAtMs === undefined) return null;
   return {
+    // meta 优先于文件名推导值；空 sessionId 也会回退，避免生成无会话归属的事件。
     sessionId: meta?.sessionId || fallbackSessionId,
     transcriptTurnId: expectedTurnId,
     provider: meta?.provider ?? 'openai',
@@ -236,6 +264,7 @@ export function extractAbortedTurn(
     ...(developerInstructions ? { developerInstructions } : {}),
     ...(meta?.baseInstructions ? { baseInstructions: meta.baseInstructions } : {}),
     ...(meta?.toolDefinitions !== undefined ? { toolDefinitions: meta.toolDefinitions } : {}),
+    // 极端情况下缺少起点，使用 abort 时刻可保证持续时间非负且事件仍可诊断。
     startedAtMs: startedAtMs ?? abortedAtMs,
     abortedAtMs,
     reason: abortReason,

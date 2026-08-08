@@ -17,19 +17,26 @@ const logger = createLogger('correlation-store');
 
 interface TurnRecord {
   type: 'turn';
+  /** 写入端对完整 prompt 计算的稳定摘要，首选匹配方式。 */
   contentHash?: string;
+  /** Agent 可能改写 prompt 时使用的兼容前缀；仅在 hash 未命中后检查。 */
   contentPrefix?: string;
+  /** 原始 W3C traceparent，格式校验由 TraceLinker 统一执行。 */
   traceparent: string;
 }
 
 interface SessionRecord {
   type: 'session';
+  /** 由环境变量 Hook 写入、只允许 session 第一轮消费的上游上下文。 */
   traceparent: string;
 }
 
 interface SessionState {
+  /** 最近加载时磁盘文件的修改时间，用于判断追加写后是否需要重读。 */
   mtimeMs: number;
+  /** 保持 JSONL 文件顺序的 turn 记录。 */
   turns: TurnRecord[];
+  /** 保持 JSONL 文件顺序的 session 记录；当前消费逻辑只取第一条。 */
   sessions: SessionRecord[];
   /** 已一次性消费的下标；文件重读后仍保留。 */
   consumedTurns: Set<number>;
@@ -70,7 +77,9 @@ function safeName(value: string): string {
  * 文件采用追加写、下标稳定，文件重读后仍能继续沿用已消费集合。
  */
 export class CorrelationStore {
+  /** acp-correlate 根目录；每个 session 对应一个安全化文件名。 */
   private readonly dir: string;
+  /** 进程内惰性缓存；不会持久化消费状态，Collector 重启后重新开始。 */
   private readonly states = new Map<string, SessionState>();
 
   /** @param correlateDir `<dataDir>/acp-correlate` 的绝对路径。 */
@@ -84,38 +93,37 @@ export class CorrelationStore {
    * 文件缺失返回 null，坏行逐行跳过；同步读取保证一次解析看到同一文件快照。
    */
   private load(sessionId: string): SessionState | null {
-    // 获取对应sessionId对应的文件路径
+    // safeName 同时阻止 `../` 路径穿越，并让异常字符不会创建子目录。
     const file = path.join(this.dir, `${safeName(sessionId)}.jsonl`);
     let stat: fs.Stats;
     try {
-      // 同步方法，获取 file 路径对应的文件元信息（大小、修改时间、是否存在等）
+      // 同步 stat/read 位于单条事件关联的短路径中：它让 mtime 判断与随后读取保持简单、
+      // 顺序一致；文件很大时对事件循环的影响由保留服务限制目录增长来缓解。
       stat = fs.statSync(file);
     } catch {
       return null; // 文件不存在或不可访问，表示该 session 暂无可用记录。
     }
 
     const existing = this.states.get(sessionId);
-    // 如果缓存中存在对应sessionId的数据，内存里有缓存 并且 缓存记录保存的文件修改时间 mtimeMs 等于磁盘当前文件的 mtimeMs
+    // mtime 相同表示写入端没有追加记录，直接复用解析结果和一次性消费游标。
     if (existing && existing.mtimeMs === stat.mtimeMs) {
-      // 磁盘文件自从上次加载后没有被修改过，内存缓存依然有效
       existing.lastAccessMs = Date.now();
       return existing;
     }
 
-    // 如果磁盘文件自从上次加载后有被修改过，需要重新读取
+    // 文件发生变化时从头解析，因为 JSONL 是追加格式且体量受保留策略限制；这样无需维护
+    // 半行缓冲和字节 offset，也能容忍写入端重建文件。
     const turns: TurnRecord[] = [];
     const sessions: SessionRecord[] = [];
     try {
-      // 读取文件内容
       const raw = fs.readFileSync(file, 'utf8');
-      // 按行读取
       for (const line of raw.split('\n')) {
         if (!line.trim()) continue;
         let rec: unknown;
         try {
-          // 将每行的数据转换成json数据
           rec = JSON.parse(line);
         } catch {
+          // 正在追加的最后一行或历史坏记录不会让整个 session 的有效记录失效。
           continue;
         }
         const r = rec as Record<string, unknown>;
@@ -132,6 +140,7 @@ export class CorrelationStore {
       }
     } catch (err) {
       logger.warn('failed to read correlation file', { sessionId, error: String(err) });
+      // 重读失败时继续使用旧快照，比完全丢失已解析关联更稳妥；首次加载则返回 null。
       return existing ?? null;
     }
 
@@ -163,6 +172,7 @@ export class CorrelationStore {
     const bucket = state.hashIndex.get(hash);
     if (bucket) {
       let c = state.hashCursor.get(hash) ?? 0;
+      // 前缀回退可能提前消费了同一桶中的成员，因此 cursor 前进时还要检查 consumedTurns。
       while (c < bucket.length && state.consumedTurns.has(bucket[c])) c += 1;
       if (c < bucket.length) {
         const idx = bucket[c];
@@ -191,6 +201,7 @@ export class CorrelationStore {
     const state = this.load(sessionId);
     if (!state || state.sessions.length === 0 || state.sessionConsumed) return null;
     state.sessionConsumed = true;
+    // 只采用文件中的第一条 session 记录，以保持“进程启动时继承的上游上下文”语义。
     return state.sessions[0].traceparent;
   }
 

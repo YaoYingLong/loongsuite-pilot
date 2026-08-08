@@ -26,6 +26,7 @@ export async function enrichCanonicalEntryWithGit(
   if (!probeDir) return;
 
   // 采用 fill-only，绝不覆盖 Agent 自己提供的更权威字段。
+  // await 会暂停当前转换，但不会阻塞事件循环；inferGitContext 内有 TTL 缓存并吞掉 Git 探测失败。
   const inferred = await inferGitContext(probeDir);
   if (!entry['git.repo'] && inferred.repo) entry['git.repo'] = inferred.repo;
   if (!entry['git.branch'] && inferred.branch) entry['git.branch'] = inferred.branch;
@@ -33,7 +34,10 @@ export async function enrichCanonicalEntryWithGit(
   if (!entry['workspace.current_root'] && inferred.root) entry['workspace.current_root'] = inferred.root;
 }
 
-/** 从 agent namespace 的 cwd 或 workspace_roots 中选择可探测目录。 */
+/**
+ * 从 Agent namespace 的 cwd 或 workspace_roots 中选择首个可探测目录。
+ * 只接受 Unix/WSL `/` 路径；字符串数组可来自真实数组或 JSON 文本，其他结构 fail-open 返回空。
+ */
 function extractProbeDir(
   entry: Record<string, unknown>,
   record: Record<string, unknown>,

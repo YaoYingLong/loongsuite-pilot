@@ -14,7 +14,13 @@ import { createLogger } from '../utils/logger.js';
 
 const logger = createLogger('HttpFlusher');
 
-/** 带周期 flush 和失败回队的 HTTP Flusher。 */
+/**
+ * 带周期 flush 和失败回队的 HTTP Flusher。
+ *
+ * buffer 只存在内存。每次 flush 用 `splice(0)` 把当时批次与新到数据隔离，网络失败再 unshift
+ * 回队首。类中没有 `flushing` 互斥标志，timer 与阈值触发可能并发发送不同快照；多个失败批次
+ * 回队时的全局顺序取决于请求完成顺序。
+ */
 export class HttpFlusher extends BaseFlusher {
   readonly name = 'http';
   private readonly config: HttpFlusherConfig;
@@ -23,13 +29,19 @@ export class HttpFlusher extends BaseFlusher {
   /** start 创建、shutdown 清理的事件循环定时器句柄。 */
   private flushTimer: ReturnType<typeof setInterval> | null = null;
 
-  /** @param config URL、headers、批量阈值、周期和请求超时。 */
+  /**
+   * @param config URL、headers、批量阈值、周期和请求超时；构造阶段不启动 timer 或发请求。
+   */
   constructor(config: HttpFlusherConfig) {
     super();
     this.config = config;
   }
 
-  /** 启动周期 flush；回调使用 void 丢弃 Promise，由 flush 自身记录请求错误。 */
+  /**
+   * 启动周期 flush；回调使用 `void` 丢弃 Promise。
+   * 当前方法没有幂等检查，生命周期管理方必须只调用一次 start，否则旧 timer 句柄会丢失且无法
+   * 全部清理。timer 未 unref，是需要 shutdown 释放的保活资源。
+   */
   async start(): Promise<void> {
     // 开启一个周期性定时器：每隔 ms 毫秒，持续执行回调函数。
     this.flushTimer = setInterval(
@@ -38,7 +50,11 @@ export class HttpFlusher extends BaseFlusher {
     );
   }
 
-  /** 序列化并入队单条事件，达到 batchMaxSize 时同步等待本次 flush。 */
+  /**
+   * 把标准事件序列化为字符串宽表并入队；达到阈值时 await 本次 flush。
+   * await 只等待该 flush 的 HTTP 请求结束；请求失败在 flush 内被捕获并回队，因此 send 仍正常
+   * 兑现，不表示远端写入成功。
+   */
   async send(entry: AgentActivityEntry): Promise<void> {
     // 序列化：过滤部分字段，如果是字符串直接返回，如果是对象，直接转换成json字符串
     const serialized = serialiseLogEntry(entry);
@@ -64,6 +80,10 @@ export class HttpFlusher extends BaseFlusher {
   /**
    * 取走当前 buffer 并 POST `{entries: batch}`。
    * 新事件可在 await 网络期间继续进入新 buffer；失败批次用 unshift 回到它们之前。
+   *
+   * axios 的 timeout、网络和非 2xx 默认都会 reject。catch 不再抛出，使 timer 不产生未处理
+   * rejection，也让 InputManager 继续处理后续事件。没有最大重试次数或内存上限；远端长期故障
+   * 时 buffer 会持续增长。
    */
   async flush(): Promise<void> {
     // 如果没有数据直接结束
@@ -90,7 +110,10 @@ export class HttpFlusher extends BaseFlusher {
     }
   }
 
-  /** 停止周期任务并最后尝试提交剩余事件。 */
+  /**
+   * 停止周期任务并最后尝试提交一次剩余事件。
+   * flush 失败会把批次留在内存但不 reject，所以 shutdown 仍返回；对象随后被释放时这些记录丢失。
+   */
   async shutdown(): Promise<void> {
     if (this.flushTimer) {
       clearInterval(this.flushTimer);
@@ -99,7 +122,10 @@ export class HttpFlusher extends BaseFlusher {
     await this.flush();
   }
 
-  /** 立即 POST 非标准 topic payload；失败只告警，不加入标准事件重试 buffer。 */
+  /**
+   * 立即 POST 非标准 topic payload；失败只告警，不加入标准事件重试 buffer。
+   * payload 展开在 topic 之后，因此 payload 中同名 `topic` 字段会覆盖方法参数，当前行为待确认。
+   */
   override async sendRaw(topic: string, payload: Record<string, unknown>): Promise<void> {
     try {
       await axios.post(this.config.url, { topic, ...payload }, {

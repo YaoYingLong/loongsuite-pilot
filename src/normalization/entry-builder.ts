@@ -25,14 +25,23 @@ import {
 
 /** 旧 IDE CodeGenerationEvent 构建路径接受的 camelCase 参数。 */
 export interface LegacyAgentActivityOptions {
+  /** IDE 会话标识，适配后写入 `gen_ai.session.id`。 */
   sessionId: string;
+  /** 安装/登录用户标识，适配后写入 `user.id`。 */
   userId: string;
+  /** 旧版 ClientType 枚举值。 */
   agentType: ClientType;
+  /** IDE 行为枚举，保留在 `agent.action_type` 扩展字段。 */
   actionType: ActionType;
+  /** 发生代码活动的文件路径。 */
   filePath: string;
+  /** 可选代码/消息正文；后续仍受内容策略和脱敏控制。 */
   content?: string;
+  /** 可选 inline diff 原文。 */
   inlineDiffMessage?: string;
+  /** IDE 私有补充字段，会转成 `agent.*` 扩展。 */
   extra?: Record<string, unknown>;
+  /** 源事件毫秒时间戳；缺失时使用构建时刻。 */
   timestamp?: number;
 }
 
@@ -83,12 +92,19 @@ export type StandardAgentActivityOptions = Partial<AgentActivityEntry> & {
   timestamp?: number;
 };
 
-/**
- * 构建一条满足输出 Schema 的标准 Agent 活动事件。
- *
- * @param opts 旧 IDE 参数或标准 dotted 字段；旧结构会先转成 Agent 扩展字段再递归构建。
- * @returns 新的 AgentActivityEntry，不保留 legacy alias。
- */
+  /**
+   * 构建一条满足输出 Schema 的标准 Agent 活动事件。
+   *
+   * 构建顺序是：识别 legacy 结构 -> 复制扩展字段 -> 用 canonical/alias 优先级覆盖标准字段 ->
+   * 规范工具状态和消息结构 -> 删除所有兼容别名。函数只做同步内存转换，不读写文件、不调用
+   * 网络，也不执行内容开关或敏感信息脱敏。
+   *
+   * 未提供 `event.id` 时生成 UUID v4，因此通用调用默认不具备重放去重能力；需要确定性 ID 的
+   * Input 应在 opts 中提前提供。源时间与观察时间分开计算，便于衡量采集延迟。
+   *
+   * @param opts 旧 IDE 参数或标准 dotted 字段；旧结构会先转成 Agent 扩展字段再递归构建。
+   * @returns 新的 AgentActivityEntry，不保留 legacy alias。
+   */
 export function buildAgentActivityEntry(
   opts: LegacyAgentActivityOptions | StandardAgentActivityOptions,
 ): AgentActivityEntry {
@@ -177,13 +193,14 @@ export function buildAgentActivityEntry(
   return entry;
 }
 
-/**
- * 将 IDE 层 CodeGenerationEvent 适配到兼容构建入口。
+  /**
+   * 将 IDE 层 CodeGenerationEvent 适配到兼容构建入口。
  *
  * @param event IDE 原始活动。
- * @param userId 安装配置或 InputManager 提供的用户标识。
- * @param sessionId 当前 IDE 会话标识。
- */
+   * @param userId 安装配置或 InputManager 提供的用户标识。
+   * @param sessionId 当前 IDE 会话标识。
+   * @returns 由统一 builder 生成的新事件；`rawData` 会被收敛到 `agent.*` 扩展字段。
+   */
 export function buildFromCodeGenerationEvent(
   event: CodeGenerationEvent,
   userId: string,
@@ -274,6 +291,7 @@ const LEGACY_ALIAS_FIELDS = new Set([
   'extra',
 ]);
 
+/** 日志宽表序列化的可选字段过滤策略。 */
 export interface SerialiseLogEntryOptions {
   /** 是否丢弃 `agent.<namespace>.*` 私有扩展；SLS/JSONL 默认开启，HTTP 保留。 */
   dropAgentScopedFields?: boolean;
@@ -282,9 +300,13 @@ export interface SerialiseLogEntryOptions {
 /** 精确识别带 Agent 命名空间的扩展字段，不匹配 `agent.channel` 等公共字段。 */
 const AGENT_SCOPED_FIELD_RE = /^agent\.[^.]+\..+$/;
 
-/**
- * 将标准事件序列化为日志后端可接受的字符串宽表。
- *
+  /**
+   * 将标准事件序列化为日志后端可接受的字符串宽表。
+   *
+   * JavaScript 对象/数组通过 JSON.stringify 保持结构，字符串不重复加引号，数字和布尔值通过
+   * String 转换。undefined/null 代表列缺失。函数创建新对象，适合同一 entry 被多个 Flusher
+   * 分别序列化；它本身不做脱敏，调用前必须经过 InputManager 的内容策略和 masker。
+   *
  * @param entry 已完成内容策略和脱敏的标准事件。
  * @param options 可选 Agent 私有字段过滤开关。
  * @returns 新建的 Record<string,string>；不会修改原 entry。
@@ -310,12 +332,15 @@ export function serialiseLogEntry(
   return out;
 }
 
-/**
- * 对旧 CodeGeneration 日志执行额外内容裁剪。
+  /**
+   * 对旧 CodeGeneration 日志执行额外内容裁剪。
  *
- * 该兼容 API 处理已经序列化的记录，因此 attributes 需要先 JSON.parse 后清字段；解析失败时
- * 删除整个 attributes，避免意外保留敏感原文。
- */
+   * 该兼容 API 处理已经序列化的记录，因此 attributes 需要先 JSON.parse 后清字段；解析失败时
+   * 删除整个 attributes，避免意外保留敏感原文。
+   *
+   * @param serialized 字符串宽表；函数不会修改传入对象。
+   * @returns 删除正文、文件路径和旧身份字段后的浅拷贝。
+   */
 export function redactCodeGenerationFields(
   serialized: SerializedLogEntry,
 ): SerializedLogEntry {
@@ -340,10 +365,15 @@ export function redactCodeGenerationFields(
   return copy;
 }
 
-/**
- * 把秒、毫秒、纳秒数字或可解析日期字符串统一为 Unix 纳秒字符串。
- * 无效/缺失输入回退当前时间，因此本函数不会抛错。
- */
+  /**
+   * 把秒、毫秒、纳秒数字或可解析日期字符串统一为 Unix 纳秒字符串。
+   * 无效/缺失输入回退当前时间，因此本函数不会抛错。
+   *
+   * 阈值是兼容性启发式而非精确单位标记：16 位以上数字字符串原样保留，数字值则按数量级
+   * 判断。调用方若掌握明确单位，应优先传标准 `time_unix_nano`，避免边界年份被误分类。
+   *
+   * @returns 十进制整数字符串，便于避免 JavaScript number 表示纳秒时的精度损失。
+   */
 export function timestampToUnixNanos(ts: number | string | undefined): string {
   if (typeof ts === 'string') {
     const trimmed = ts.trim();
@@ -362,7 +392,10 @@ export function timestampToUnixNanos(ts: number | string | undefined): string {
   return `${Math.trunc(value * 1000)}000000`;
 }
 
-/** 将纳秒/毫秒/秒量级值或日期字符串转换为 Unix 毫秒。 */
+/**
+ * 将纳秒/毫秒/秒量级值或日期字符串转换为 Unix 毫秒。
+ * 无效值与缺失值回退当前时间；纳秒除以 1,000,000 并向下取整。
+ */
 export function unixNanosToMillis(value: string | number | undefined): number {
   if (typeof value === 'number' && Number.isFinite(value)) {
     return value >= 1e16 ? Math.floor(value / 1_000_000) : normalizeTimestampToMillis(value);
@@ -420,7 +453,10 @@ function serializeValue(value: JsonValue): string {
   return String(value);
 }
 
-/** 将各 Agent 的旧事件名映射到七种标准事件；未知值降级为 other。 */
+/**
+ * 将各 Agent 的旧事件名映射到七种标准事件；未知值降级为 `other`。
+ * 该降级保证事件仍可输出，但调用方若需要保留源类型应另写 Agent 扩展字段。
+ */
 export function normalizeEventName(value: unknown): AgentEventName {
   switch (value) {
     case 'llm.request':
@@ -457,10 +493,12 @@ export function normalizeFinishReasons(value: unknown): string[] | undefined {
   return typeof value === 'string' && value.length > 0 ? [value] : undefined;
 }
 
-/**
- * 按“显式 provider > model 特征 > agent type 特征 > unknown”推断 Provider。
- * 显式字段始终优先，避免代理/私有模型名称被启发式覆盖。
- */
+  /**
+   * 按“显式 provider > model 特征 > agent type 特征 > unknown”推断 Provider。
+   * 显式字段始终优先，避免代理/私有模型名称被启发式覆盖。
+   *
+   * 判断只做字符串小写和正则匹配，不访问模型注册表；新模型未命中时稳定返回 unknown。
+   */
 export function inferProviderName(input: Record<string, unknown>): string {
   const explicit = stringAlias(input, 'gen_ai.provider.name', 'provider.name');
   if (explicit) return explicit;
@@ -568,10 +606,13 @@ function toJsonObject(value: Record<string, unknown>): { [key: string]: JsonValu
   return out;
 }
 
-/**
- * 将任意运行时值递归转换为 JsonValue。
- * undefined 被丢弃，函数/Symbol/BigInt 等非 JSON 值最终转成字符串。
- */
+  /**
+   * 将任意运行时值递归转换为 JsonValue。
+   * undefined 被丢弃，函数/Symbol/BigInt 等非 JSON 值最终转成字符串。
+   *
+   * 普通对象递归复制、数组逐项转换并过滤 undefined，因此返回值不与输入共享对象容器。
+   * 本函数不检测循环引用；循环对象会递归溢出，调用方应只传 JSON 类数据。
+   */
 export function toJsonValue(value: unknown): JsonValue | undefined {
   if (value === undefined) return undefined;
   if (

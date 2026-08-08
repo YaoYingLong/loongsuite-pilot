@@ -43,7 +43,11 @@ export class QoderApiPipeline implements Pipeline {
   private running = false;
   private polling = false;
 
-  /** 保存配置和目录，网络对象延迟到 start 创建。 */
+  /**
+   * 保存配置和目录，网络对象延迟到 `start()` 创建。
+   *
+   * @param opts PipelineManager 解析后的单条 pipeline 配置，以及状态、失败日志和安装数据目录。
+   */
   constructor(opts: QoderApiPipelineOptions) {
     this.config = opts.config;
     this.stateDir = opts.stateDir;
@@ -52,7 +56,13 @@ export class QoderApiPipeline implements Pipeline {
     this.logger = createLogger(`QoderApiPipeline:${opts.config.configName}`);
   }
 
-  /** 解析默认值，创建 client/input/sender，启动非保活周期并异步执行首轮。 */
+  /**
+   * 解析默认值，按 Client -> Input -> Sender 顺序创建组件并启动轮询。
+   *
+   * `setInterval` 回调只触发 Promise，不等待它；真正的串行约束由 `polling` 门控制。`unref()`
+   * 表示这个 timer 单独存在时不会阻止 Node.js 退出。首轮使用 fire-and-forget，是为了不让慢速
+   * 管理 API 阻塞 Orchestrator 完成其他模块启动，错误会在 `pollCycle()` 内捕获并记录。
+   */
   async start(): Promise<void> {
     if (this.running) return;
     this.running = true;
@@ -114,7 +124,13 @@ export class QoderApiPipeline implements Pipeline {
     });
   }
 
-  /** 停止产生新轮询并等待 sender 最多按其关闭策略排空。 */
+  /**
+   * 停止产生新轮询并等待 Sender 按其关闭策略排空。
+   *
+   * 本方法不会等待当前 `pollCycle()`：它先把 `running` 置 false 并清 timer，再关闭 Sender。
+   * 若采集请求恰好仍在途，它完成后的 enqueue 行为由既有执行顺序决定；该时序由上层统一停止
+   * 顺序保护。重复调用因 `running` 门直接返回。
+   */
   async stop(): Promise<void> {
     if (!this.running) return;
     this.running = false;
@@ -141,6 +157,10 @@ export class QoderApiPipeline implements Pipeline {
   /**
    * 执行一次“采集但不提交窗口 -> sender 接受 -> 确认窗口”事务式流程。
    * sender 满时不推进窗口，下轮会重采；确定性 event_id 供 SLS 去重。
+   *
+   * 这里没有数据库事务，而是用调用顺序实现两阶段确认：先 `collect()` 生成候选窗口，再
+   * `enqueue()` 转移内存所有权，最后 `confirmCycle()` 落 checkpoint。catch 吞掉周期异常，
+   * 因为 timer 回调没有 await 的调用者；`finally` 必须释放 `polling`，否则一次失败会永久停采。
    */
   private async pollCycle(): Promise<void> {
     if (!this.running || !this.input || !this.sender) return;

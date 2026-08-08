@@ -11,12 +11,23 @@ import { createLogger } from '../../../utils/logger.js';
 
 const logger = createLogger('FileWatcher');
 
-/** 管理多个父目录 watcher 和一次性 dirty 文件集合。 */
+/**
+ * 管理多个父目录 watcher 和一次性 dirty 文件集合。
+ *
+ * `fs.watch` 事件只是一种低延迟提示：不同平台可能合并、重复甚至漏掉事件，filename 也可能
+ * 为空。因此本类不读取文件、不判断 offset；FilePipeline 会把 dirty 集合与活跃 reader、周期
+ * 全量扫描合并。`Set` 自动折叠同一路径的重复提示。
+ */
 export class FileWatcher {
   private watchers: Map<string, fs.FSWatcher> = new Map();
   private dirtyFiles: Set<string> = new Set();
 
-  /** 为尚未监听的唯一目录创建 watcher；单目录失败不影响其他目录。 */
+  /**
+   * 为尚未监听的唯一目录创建 watcher；单目录失败不影响其他目录。
+   *
+   * watcher 回调由 Node.js 事件循环异步触发，只把路径加入 Set，不在回调中执行文件 I/O。
+   * 运行期 `error` 会关闭并移除对应句柄，使后续数据发现退化到 Pipeline 的 rescan。
+   */
   watch(dirs: string[]): void {
     const uniqueDirs = [...new Set(dirs)];
     for (const dir of uniqueDirs) {
@@ -40,7 +51,12 @@ export class FileWatcher {
     }
   }
 
-  /** 取出并清空本轮 dirty 文件，避免同一提示无限重复。 */
+  /**
+   * 以“快照后清空”的方式取出本轮 dirty 文件。
+   *
+   * 返回新数组，调用方处理期间新到达的 watch 事件会进入已清空的 Set，留给下一轮，不会混入
+   * 当前遍历；如果处理被背压推迟，FilePipeline 会通过 `addDirty()` 主动放回。
+   */
   getDirtyFiles(): string[] {
     const files = [...this.dirtyFiles];
     this.dirtyFiles.clear();
@@ -52,7 +68,11 @@ export class FileWatcher {
     this.dirtyFiles.add(filePath);
   }
 
-  /** 唤醒后关闭并重建现有目录 watcher，恢复失效的系统句柄。 */
+  /**
+   * 系统唤醒后关闭并重建现有目录 watcher，恢复可能失效的 OS 句柄。
+   *
+   * 只重建当前成功登记的目录；之前创建失败的目录仍依靠全量扫描，除非外层重新调用 watch。
+   */
   rewatch(): void {
     const dirs = [...this.watchers.keys()];
     for (const [, watcher] of this.watchers) {
@@ -72,7 +92,11 @@ export class FileWatcher {
   }
 }
 
-/** 从 glob 路径提取父目录并去重，供 watch 建立目录级监听。 */
+/**
+ * 从 glob 路径提取父目录并去重，供 `fs.watch` 建立目录级监听。
+ *
+ * glob 只作用于 basename，watcher 本身监听父目录；真正是否匹配仍由 FilePipeline 的正则判断。
+ */
 export function extractParentDirs(patterns: string[]): string[] {
   const dirs = new Set<string>();
   for (const pattern of patterns) {

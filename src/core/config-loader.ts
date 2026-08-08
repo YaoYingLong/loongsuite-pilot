@@ -303,7 +303,12 @@ export interface ConfigFile {
   };
 }
 
-/** 读取环境变量；Windows 下去掉两端空白，兼容 PowerShell/任务计划程序传值。 */
+/**
+ * 读取单个环境变量；Windows 下去掉两端空白，兼容 PowerShell/任务计划程序传值。
+ * `process.env` 是当前 Node 进程启动时继承的字符串映射，本函数不修改系统环境。
+ *
+ * @returns 环境变量存在时返回字符串（允许空字符串），不存在时返回 undefined。
+ */
 function env(key: string): string | undefined {
   const v = process.env[key];
   return v !== undefined ? (process.platform === 'win32' ? v.trim() : v) : undefined;
@@ -340,11 +345,17 @@ function envInt(key: string, fallback: number): number {
  *
  * 集团版还会额外读取 data_config.json。它不是用来覆盖用户配置，而是为 SLS/OTLP/CMS
  * 增加托管数据出口，因此用户出口和内置出口可以同时收到同一批采集数据。
+ *
+ * @returns 可直接传给 Orchestrator 的字段齐全配置；不会创建网络连接、timer 或子进程。
+ * @throws 当前 readJsonFile 对缺失/坏 JSON 采用 null 回退；其他未预期文件系统错误是否传播
+ * 取决于该工具函数的实现。
  */
 export async function loadConfig(): Promise<AnalyticsConfig> {
-  // ?? 空值合并运算符，如果 环境变量中AGENT_DATA_COLLECTION_CONFIG 是 null 或 undefined 返回 DEFAULT_CONFIG_PATH
+  // `??` 只在环境变量不存在时回退；若变量存在但为空字符串，resolveHome 会接收空路径。
+  // 这样保持环境变量“显式提供即最高优先级”的通用规则。
   const configPath = resolveHome(env('AGENT_DATA_COLLECTION_CONFIG') ?? DEFAULT_CONFIG_PATH);
-  // await：暂停当前异步函数代码执行，直到 Promise 完成（成功返回结果 / 失败拒绝），然后取出 Promise 内部的值赋值给变量 file
+  // await 只暂停当前 async 函数，不阻塞 Node 事件循环；文件缺失或解析失败由 readJsonFile
+  // 记录并返回 null，于是后续全部使用环境变量和默认值。
   const file = await readJsonFile<ConfigFile>(configPath);
 
   if (file) {
@@ -353,11 +364,11 @@ export async function loadConfig(): Promise<AnalyticsConfig> {
     logger.debug('no config file found, using env + defaults', { path: configPath });
   }
 
-  // 如果配置了LOONGSUITE_PILOT_DATA_DIR环境变量直接使用，如果没有配置环境变量使用~/.loongsuite-pilot/config.json文件中读取的dataDir对应的内容
-  // 如果该类容还是空，则默认使用~/.loongsuite-pilot
+  // dataDir 遵循环境变量、文件、内置目录三级优先级。这里先保留 `~` 写法，因为最终路径和
+  // 公开配置都需要原值；真正用于文件 I/O 的位置会各自调用 resolveHome。
   const dataDir = env('LOONGSUITE_PILOT_DATA_DIR') ?? file?.dataDir ?? '~/.loongsuite-pilot';
 
-  // 如果是~开头的路径，转换为绝对路径
+  // 托管出口配置固定跟随最终 dataDir，而不跟随 config.json 所在目录。
   const innerDataConfigPath = resolveHome(`${dataDir}/configs/inner/data_config.json`);
   const innerDataConfig = await readJsonFile<InnerDataConfig>(innerDataConfigPath);
 
@@ -369,7 +380,7 @@ export async function loadConfig(): Promise<AnalyticsConfig> {
 
   // 从这里开始把“可选的原始配置”转换成字段齐全、可直接给 Orchestrator 使用的配置。
   return {
-    // 优先使用LOONGSUITE_PILOT_ENABLED环境变量的值，如果配置使用配置文件中配置的enabled
+    // 总开关由环境变量覆盖文件配置；关闭时主入口在创建 Orchestrator 前正常返回。
     enabled: envBool('LOONGSUITE_PILOT_ENABLED', file?.enabled ?? true),
     autoStart: true, // 历史兼容字段，当前固定为 true；实际进程生命周期由服务管理器控制。
     dataDir,
@@ -396,7 +407,7 @@ export async function loadConfig(): Promise<AnalyticsConfig> {
     flushers: buildFlushersConfig(file, dataDir, serviceNamePrefix, innerDataConfig),
     // 构建日志保留时间策略配置，未配置的分类默认保留 7 天。
     retention: buildRetentionConfig(file),
-    // 配置具体的解析Agent级策略，以及具体agent是否采集完整 Prompt、Completion、工具参数和工具结果
+    // 配置 Agent 产品级门禁，以及是否保留 Prompt、Completion、工具参数和工具结果。
     agents: buildAgentsConfig(file),
     // 构建采集内容脱敏策略：none 不处理，all 启用全部规则，custom 只启用指定规则
     mask: buildMaskConfig(file),
@@ -495,6 +506,7 @@ const SUPPORTED_MASK_TYPES: readonly MaskType[] = [
   'databaseUrl',
 ];
 
+/** Set 只用于 O(1) 成员判断；数组仍用于保留 `all` 模式的稳定规则顺序。 */
 const SUPPORTED_MASK_TYPE_SET = new Set<string>(SUPPORTED_MASK_TYPES);
 
 /** 将数组或逗号分隔文本转换为受支持的敏感信息类型，未知类型直接忽略。 */
@@ -537,7 +549,7 @@ function buildListenersConfig(
 ): Record<string, { enabled: boolean; pollInterval: number }> {
   // Listener 对应具体采集实现。同一个 Agent 可能有 Hook、SQLite、Session 等多个 Listener，
   // Orchestrator 会再结合 Agent 级开关和准入控制决定最终启停状态。
-  // Record<KeyType, ValueType> 是 TS 内置工具类型：
+  // Record<string, ...> 表示任意 listener ID 都映射到同一配置结构，便于兼容未来新增项。
   const defaults: Record<string, { enabled: boolean; pollInterval: number }> = {
     qoder: { enabled: true, pollInterval: 30_000 },
     'qoder-sqlite': { enabled: true, pollInterval: 30_000 },
@@ -555,14 +567,13 @@ function buildListenersConfig(
     'codex-transcript': { enabled: true, pollInterval: 30_000 },
     'pi-coding-agent-log': { enabled: true, pollInterval: 30_000 },
   };
-  // ... 是对象展开运算符，浅拷贝对象自身可枚举属性，等价于const result = Object.assign({}, defaults);
-  // 创建了一个全新对象，result 和 defaults 不是同一个引用 后续可以修改 result 而不污染原 defaults
-  // 对象里的 value 依然是引用类型，如果直接修改 result.xxx 内部属性，会影响原对象
+  // 对象展开创建新的顶层映射；默认 value 仍是共享引用，但下面覆盖时总是替换整个 value，
+  // 历史环境变量只修改三个默认 value。defaults 是函数内临时对象，因此不会跨调用污染。
   const result = { ...defaults };
 
   // 用户只需写想覆盖的字段；其余字段继承该 Listener 默认值。
   if (file?.listeners) {
-    // Object.entries把对象转换成 [key, value][] 数组
+    // Object.entries 允许保留未知 listener ID；这样外部扩展无需先修改本地默认表。
     for (const [key, val] of Object.entries(file.listeners)) {
       result[key] = {
         enabled: val.enabled ?? result[key]?.enabled ?? true,
@@ -599,7 +610,7 @@ function buildListenersConfig(
 function buildRetentionConfig(file: ConfigFile | null): LogRetentionConfig {
   const unifiedDays = envInt('LOONGSUITE_PILOT_LOG_RETENTION_DAYS', 0);
 
-  // 单项保留天数遵循“分类配置 > 统一环境变量 > 分类默认值”的优先级。
+  // 命名闭包捕获 unifiedDays，统一实现“分类配置 > 统一环境变量 > 分类默认值”的优先级。
   const resolve = (fileVal: number | undefined, fallback: number): number => {
     if (fileVal !== undefined) return fileVal;
     if (unifiedDays > 0) return unifiedDays;
@@ -629,11 +640,11 @@ function buildHookWatchdogConfig(file: ConfigFile | null): HookWatchdogConfig {
     enabled: envBool('LOONGSUITE_PILOT_HOOK_WATCHDOG_ENABLED', file?.hookWatchdog?.enabled ?? true),
     intervalMs: envInt(
       'LOONGSUITE_PILOT_HOOK_WATCHDOG_INTERVAL_MS',
-      file?.hookWatchdog?.intervalMs ?? 5 * 60_000, // 5 minutes
+      file?.hookWatchdog?.intervalMs ?? 5 * 60_000, // 默认每 5 分钟检查一次。
     ),
     repairCooldownMs: envInt(
       'LOONGSUITE_PILOT_HOOK_WATCHDOG_COOLDOWN_MS',
-      file?.hookWatchdog?.repairCooldownMs ?? 10 * 60_000, // 10 minutes
+      file?.hookWatchdog?.repairCooldownMs ?? 10 * 60_000, // 同一目标默认至少间隔 10 分钟修复。
     ),
   };
 }
@@ -710,6 +721,7 @@ function buildFlushersConfig(
  * 有效 endpoint 时才返回配置。日志类 SLS/JSONL/HTTP 不受此函数影响。
  */
 export function buildOtlpTraceConfig(config: AnalyticsConfig): OtlpTraceFlusherConfig | undefined {
+  // 总开关在任何 endpoint 解析之前短路，避免禁用 Trace 时读取和解析凭据环境变量。
   if (!config.collectTrace) return undefined;
 
   const endpoints: OtlpEndpoint[] = [];
@@ -753,6 +765,7 @@ export function buildOtlpTraceConfig(config: AnalyticsConfig): OtlpTraceFlusherC
   // 错误序列化；单次坏配置不能拖垮全部日志和 Trace 输出。
   const innerOtlp = Array.isArray(config.innerTrace?.otlp) ? config.innerTrace!.otlp : [];
   innerOtlp.forEach((ep, i) => {
+    // 单个缺 endpoint 的托管条目没有发送意义，跳过而不让整份控制面配置失效。
     if (!ep.endpoint) return;
     endpoints.push({
       name: ep.name ?? `inner-otlp-${i}`,
@@ -809,6 +822,7 @@ function cmsEntryToOtlpEndpoint(
   armsResourceAttributes: Record<string, string>,
   serviceName?: string,
 ): OtlpEndpoint {
+  // 每个 endpoint 使用独立 headers 对象，避免后续补字段时污染配置源或其他目的地。
   const headers: Record<string, string> = {};
   const armsProject = cms.project || extractArmsProject(cms.endpoint);
   if (cms.licenseKey) headers['x-arms-license-key'] = cms.licenseKey;
@@ -823,6 +837,7 @@ function stableHeaderKey(headers?: Record<string, string>): string {
   if (!headers) return '';
   return Object.keys(headers)
     .sort()
+    // 这里只构造进程内比较键，不记录日志；否则认证 Header 会被泄露。
     .map(k => `${k}=${headers[k]}`)
     .join('&');
 }
@@ -901,6 +916,7 @@ function resolveCaptureMessageContent(agents: AgentsConfig): boolean {
  * 未写 mode 时，有完整 AK/SK 就选签名模式，否则使用 WebTracking 匿名模式。
  */
 function parseSlsEndpointEntry(ep: SlsEndpointEntry, index: number): SlsEndpoint {
+  // 只有 AK 和 SK 同时存在才自动选 ak；凭据不完整时回退 webtracking，避免半签名请求。
   const mode: SlsMode = ep.mode ?? (ep.accessKeyId && ep.accessKeySecret ? 'ak' : 'webtracking');
   const rawEndpoint = ep.endpoint ?? '';
   const endpoint = rawEndpoint
@@ -916,6 +932,7 @@ function parseSlsEndpointEntry(ep: SlsEndpointEntry, index: number): SlsEndpoint
     redact: false,
   };
   if (mode === 'ak') {
+    // 仅 ak 模式复制凭据，避免 webtracking 配置对象无意义携带敏感字段。
     result.accessKeyId = ep.accessKeyId ?? '';
     result.accessKeySecret = ep.accessKeySecret ?? '';
   }
@@ -936,6 +953,7 @@ function buildSlsConfig(file: ConfigFile | null, serviceNamePrefix: string, inne
 
   if (single?.destinationOverride !== undefined) {
     // 旧版本曾允许二选一目的地；现在固定采用并集，保留警告帮助用户清理无效字段。
+    // 日志正文保留配置字段原名，便于用户准确定位；该警告不改变合并行为。
     logger.warn('config.sls.destinationOverride is deprecated and ignored — remove it from config.json');
   }
 
@@ -1037,6 +1055,7 @@ function buildUserSlsEndpoint(args: {
   accessKeyId: string | undefined;
   accessKeySecret: string | undefined;
 }): SlsEndpoint {
+  // 旧单对象没有 name，统一命名为 user-sls，使指标和失败文件路径保持稳定。
   const mode: SlsMode = args.mode ?? (args.accessKeyId && args.accessKeySecret ? 'ak' : 'webtracking');
 
   const rawEndpoint = args.rawEndpoint ?? '';
@@ -1071,6 +1090,7 @@ function normalizeEndpointUrl(raw: string): string {
   if (!/^https?:\/\//.test(s)) s = `https://${s}`;
   s = s.replace(/\/+$/, '');
   // 只处理协议和主机部分，不能破坏某些后端区分大小写的 URL path。
+  // replace 回调只重建协议和 authority；下划线参数是有意忽略的完整匹配文本。
   return s.replace(/^(https?:\/\/)([^/]+)/i, (_, scheme: string, host: string) =>
     `${scheme.toLowerCase()}${host.toLowerCase()}`,
   );
@@ -1100,8 +1120,7 @@ function dedupSlsEndpoints(endpoints: SlsEndpoint[]): SlsEndpoint[] {
 function buildJsonlConfig(file: ConfigFile | null, dataDir: string) {
   return {
     enabled: envBool('JSONL_ENABLED', file?.jsonl?.enabled ?? true),
-    // 如果有配置JSONL_OUTPUT_DIR环境变量则使用该环境变量，若没有配置使用配置文件中配置的
-    // 如配置文件中也没有就使用默认路径~/.loongsuite-pilot/logs/output
+    // 输出目录按环境变量、文件、`<dataDir>/logs/output` 回退，并在交给 Flusher 前展开 `~`。
     outputDir: resolveHome(
       env('JSONL_OUTPUT_DIR') ?? file?.jsonl?.outputDir ?? `${dataDir}/logs/output`,
     ),
@@ -1120,6 +1139,7 @@ function buildHttpConfig(file: ConfigFile | null) {
   const envHeaders = env('HTTP_REPORT_HEADERS');
   if (envHeaders) {
     try {
+      // JSON.parse 只做语法解析；Header 值的最终合法性由 HTTP 客户端在发送时校验。
       headers = JSON.parse(envHeaders);
     } catch {
       // Header JSON 无效时忽略，避免一个可选输出的配置错误阻断 Collector 启动。
@@ -1128,6 +1148,7 @@ function buildHttpConfig(file: ConfigFile | null) {
     headers = file?.http?.headers;
   }
 
+  // 必须再次检查环境变量“是否存在”，才能区分未设置与显式空字符串关闭通道。
   const enabled = env('HTTP_REPORT_URL') !== undefined
     ? !!url
     : file?.http?.enabled ?? !!url;

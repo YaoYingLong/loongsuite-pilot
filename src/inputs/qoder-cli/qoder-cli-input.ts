@@ -63,29 +63,36 @@ export class QoderCliInput extends BaseHookInput {
   protected async transformRecord(
     record: Record<string, unknown>,
   ): Promise<AgentActivityEntry | null> {
+    // 版本号属于 Input 运行状态而非单条事件转换结果，后续状态页通过 getAgentVersion() 读取。
     const ver = record['agent.qoder.version'] ?? record.version;
     if (typeof ver === 'string' && ver) this.lastAgentVersion = ver;
 
+    // 新 Hook 已输出统一 canonical schema，优先直通可避免再次猜测旧 transcript 字段。
     const canonicalEntry = buildCanonicalHookEntry(record, ClientType.QoderCli);
     if (canonicalEntry) {
       await enrichCanonicalEntryWithGit(canonicalEntry, record, 'qoder');
       return canonicalEntry;
     }
 
+    // 部分 CLI 版本仍写 PostToolUse 专用结构，canonical 失败后再走该兼容分支。
     const hookEntry = await buildPostToolUseEntry(record);
     if (hookEntry) return hookEntry;
 
+    // 剩余分支处理 Claude 风格的 assistant/user transcript；标题、进度等控制行没有业务事件。
     const rowType = record.type as string | undefined;
     if (!rowType || IGNORED_ROW_TYPES.has(rowType)) return null;
     if (rowType !== 'assistant' && rowType !== 'user') return null;
 
+    // 一条 message 可能同时含 thinking/text/tool 块，只选择最能代表本事件语义的主块。
     const message = asRecord(record.message);
     const contentBlock = selectDominantContentBlock(message.content);
     if (!contentBlock) return null;
 
+    // 旧日志目录可能混有 CLI 与 IDE 记录，variant 同时决定 agent.type 和 turn.id 处理方式。
     const variant = inferVariant(record);
     const eventName = inferEventName(rowType, contentBlock);
     const timestamp = parseTimestamp(record.timestamp) ?? Date.now();
+    // 历史版本使用过多种 session 字段名，按明确优先级兼容读取，仍缺失时保留空串。
     const sessionId = getStringValue(record, 'sessionId')
       ?? getStringValue(record, 'session_id')
       ?? getStringValue(record, 'sessionid')
@@ -95,6 +102,7 @@ export class QoderCliInput extends BaseHookInput {
     const model = getStringValue(message, 'model') ?? UNKNOWN_MODEL;
     const toolResultPayload = buildToolResultPayload(record, contentBlock);
     const messageId = getStringValue(message, 'id');
+    // sourceFields 可能触发一次有缓存的 Git 子进程探测，因此必须在 async transform 中 await。
     const sourceFields = await buildSourceFields(record);
 
     return buildAgentActivityEntry({
@@ -116,6 +124,7 @@ export class QoderCliInput extends BaseHookInput {
         ? buildOutputMessages(contentBlock)
         : undefined,
       'gen_ai.tool.name': eventName === 'tool.call' ? getStringValue(contentBlock, 'name') : undefined,
+      // call 与 result 使用相同 ID 字段，OTLP 转换时才能把两条事件闭合为一个工具 span。
       'gen_ai.tool.call.id': eventName === 'tool.call' || eventName === 'tool.result'
         ? getStringValue(contentBlock, 'id') ?? getStringValue(contentBlock, 'tool_use_id')
         : undefined,
@@ -152,15 +161,18 @@ function parseTimestamp(value: unknown): number | undefined {
  * 识别 Qoder CLI 的 PostToolUse Hook，并构建成功的 tool.result；其他事件类型返回 null。
  */
 async function buildPostToolUseEntry(record: Record<string, unknown>): Promise<AgentActivityEntry | null> {
+  // 某些 wrapper 把 Hook payload 包在 data 中，另一些直接写顶层；这里统一展开为 data。
   const data = (record.data && typeof record.data === 'object' && !Array.isArray(record.data))
     ? record.data as Record<string, unknown>
     : record;
   const eventType = (data.event_type ?? data.hook_event_name ?? record.hookEvent) as string | undefined;
   if (eventType !== 'PostToolUse') return null;
 
+  // tool_input 必须是普通对象；异常类型降级为空对象，避免读取属性时抛错。
   const toolInput = (data.tool_input && typeof data.tool_input === 'object' && !Array.isArray(data.tool_input))
     ? data.tool_input as Record<string, unknown>
     : {};
+  // cwd/repo 等上下文优先从解包后的 Hook data 推断。
   const sourceFields = await buildSourceFields(data);
 
   return buildAgentActivityEntry({

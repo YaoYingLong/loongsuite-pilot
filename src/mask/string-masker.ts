@@ -27,9 +27,16 @@ export function isLargeString(value: string, thresholdBytes: number): boolean {
   return Buffer.byteLength(value, 'utf8') > thresholdBytes;
 }
 
-/**
- * 按一组编译规则脱敏字符串。
- *
+  /**
+   * 按一组编译规则脱敏字符串。
+   *
+   * 普通字符串先检查小写 prefilter，命中后才运行正式正则；超过 byte 阈值的字符串只扫描关键词
+   * 周围窗口。窗口坐标与 RegExp 坐标都使用 JavaScript UTF-16 code unit 下标，只有阈值和私钥
+   * 块上限使用 UTF-8 字节数。
+   *
+   * 完整字符串已经是 `[..._MASKED]` 占位符时直接返回以保证幂等；嵌在更长文本中的占位符不会
+   * 触发该快捷路径。规则不匹配和所有范围被过滤时保持原字符串值。
+   *
  * @param value 原始字符串。
  * @param rules RuleLoader 生成的规则；可同时包含 regex/block/url 类型。
  * @param options 大字符串和块大小限制。
@@ -58,7 +65,10 @@ export function maskString(
   return applyMaskRanges(value, ranges);
 }
 
-/** 用默认值补齐可选配置，避免深层函数反复处理 undefined。 */
+/**
+ * 用默认值补齐可选配置，避免深层函数反复处理 undefined。
+ * 当前不校验负数或 NaN，生产配置由内部常量提供；测试/外部调用传入异常值的行为待确认。
+ */
 function resolveStringMaskOptions(options: StringMaskOptions): ResolvedStringMaskOptions {
   return {
     largeStringThresholdBytes:
@@ -70,7 +80,10 @@ function resolveStringMaskOptions(options: StringMaskOptions): ResolvedStringMas
   };
 }
 
-/** 任一规则的任一预筛关键词存在时才进入成本更高的正式匹配。 */
+/**
+ * 任一规则的任一预筛关键词存在时才进入成本更高的正式匹配。
+ * prefilter 是性能门也是匹配前置条件：规则正则即使能命中，文本不含关键词仍不会执行。
+ */
 function hasAnyPrefilter(
   normalizedValue: string,
   rules: readonly CompiledMaskRule[],
@@ -86,7 +99,10 @@ function ruleHasPrefilter(normalizedValue: string, rule: CompiledMaskRule): bool
   return rule.normalizedPrefilter.some(keyword => normalizedValue.includes(keyword));
 }
 
-/** 对大字符串构建并扫描关键词窗口，返回相对于原字符串的全局区间。 */
+/**
+ * 对大字符串构建并扫描关键词窗口，返回相对于原字符串的全局区间。
+ * 每个局部 matcher 返回前加回 window.start，因此最终范围仍可直接作用于完整原文。
+ */
 function collectLargeStringRanges(
   value: string,
   normalizedValue: string,
@@ -108,9 +124,12 @@ function collectLargeStringRanges(
   return ranges;
 }
 
-/**
- * 找出每个唯一关键词周围的上下文窗口，并合并相交/相邻窗口。
- *
+  /**
+   * 找出每个唯一关键词周围的上下文窗口，并合并相交/相邻窗口。
+   *
+   * `contextWindow` 单位是 JavaScript 字符串下标，不是 UTF-8 字节。搜索游标至少前进 1，防止
+   * 异常空关键词导致死循环；正常规则在加载阶段已过滤空关键词。
+   *
  * @returns 按 start 升序、互不重叠的半开区间数组。
  */
 function buildKeywordWindows(
@@ -157,7 +176,10 @@ function buildKeywordWindows(
   return merged;
 }
 
-/** 在单个片段内按规则 kind 分派匹配器，并把 offset 加回全局坐标。 */
+/**
+ * 在单个片段内按规则 kind 分派 matcher，并把 offset 加回全局坐标。
+ * 同一片段会按规则清单顺序运行；重叠冲突最后统一交给 normalizeMaskRanges 决策。
+ */
 function collectRangesForSegment(
   segment: string,
   normalizedSegment: string,
@@ -181,7 +203,10 @@ function collectRangesForSegment(
   return ranges;
 }
 
-/** 收集普通正则的全部非空命中，并重置共享 RegExp 的 lastIndex。 */
+/**
+ * 收集普通正则的全部非空命中，并在前后重置共享 RegExp 的 `lastIndex`。
+ * 编译规则缓存在进程级并跨事件复用；若不归零，全局正则会从上次位置继续而漏掉前部命中。
+ */
 function collectRegexRanges(
   segment: string,
   offset: number,
@@ -206,7 +231,10 @@ function collectRegexRanges(
   return ranges;
 }
 
-/** 收集跨行块命中；超过字节上限的块不替换，避免异常输入造成巨额复制。 */
+/**
+ * 收集跨行块命中；超过字节上限的块不替换，避免异常输入造成巨额复制。
+ * 这是资源保护性的 fail-open：超大敏感块会保留原文，部署方应通过内容采集开关限制此风险。
+ */
 function collectBlockRanges(
   segment: string,
   offset: number,
@@ -233,7 +261,10 @@ function collectBlockRanges(
   return ranges;
 }
 
-/** 提取带密码且 scheme 在规则白名单中的数据库 URL。 */
+/**
+ * 提取带密码且 scheme 在规则白名单中的数据库 URL。
+ * 一旦确认命中，替换整个 URL 而不只是 password，避免用户名、主机、数据库名等连接信息泄露。
+ */
 function collectUrlWithPasswordRanges(
   segment: string,
   offset: number,
@@ -276,9 +307,12 @@ function isDatabaseUrlWithPassword(candidate: string, rule: CompiledMaskRule): b
   }
 }
 
-/**
- * 规范化命中区间后，从字符串末尾向前应用替换。
- *
+  /**
+   * 规范化命中区间后，从字符串末尾向前应用替换。
+   *
+   * 倒序是必要的：先替换高下标区间，不会改变低下标区间坐标。每次模板字符串都会创建新字符串，
+   * 命中数很多时有复制成本，因此上游预筛与窗口合并尽量减少范围数量。
+   *
  * @param value 原始字符串。
  * @param ranges 以原字符串坐标表示的候选命中。
  * @returns 替换后的字符串；没有合法区间时保持原引用。
@@ -296,7 +330,10 @@ export function applyMaskRanges(value: string, ranges: readonly MaskRange[]): st
   return result;
 }
 
-/** 过滤越界/空区间，排序并采用最先区间消除重叠命中。 */
+/**
+ * 过滤越界/空区间，按“起点升序、同起点更长优先”排序并消除重叠。
+ * 不按规则类型设置优先级；不同规则重叠时，排序后最先接受的范围决定最终 replacement。
+ */
 function normalizeMaskRanges(
   valueLength: number,
   ranges: readonly MaskRange[],

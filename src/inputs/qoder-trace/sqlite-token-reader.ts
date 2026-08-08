@@ -30,9 +30,11 @@ export interface SqliteTokenResult {
  * 单库查询失败只记录 debug 并继续下一个；均无数据时返回空数组和 null 路径。
  */
 export async function readSqliteTokensForSession(sessionId: string): Promise<SqliteTokenResult> {
+  // 同机可能同时安装 Desktop 与 JetBrains，必须逐库查 session，不能仅按平台选择单一路径。
   const dbPaths = resolveAllQoderDbPaths();
   if (dbPaths.length === 0) return { rows: [], matchedDbPath: null };
 
+  // LEFT JOIN chat_record 只为在 message.model_info 缺失时补模型；token 主数据仍来自 chat_message。
   const sql = `
     SELECT
       cm.id AS message_id,
@@ -52,6 +54,7 @@ export async function readSqliteTokensForSession(sessionId: string): Promise<Sql
     ORDER BY cm.gmt_create ASC
   `;
 
+  // 数据库相互独立：一个库失败或没有该 session 时继续尝试下一个。
   for (const dbPath of dbPaths) {
     let rows: Array<{
       message_id?: string;
@@ -71,6 +74,7 @@ export async function readSqliteTokensForSession(sessionId: string): Promise<Sql
 
     if (rows.length === 0) continue;
 
+    // 数据库保证按 gmt_create 排序，保持该顺序供 token-enricher 做结构匹配。
     const results: SqliteTokenData[] = [];
     for (const row of rows) {
       const info = parseTokenInfo(row.token_info);
@@ -83,9 +87,11 @@ export async function readSqliteTokensForSession(sessionId: string): Promise<Sql
         inputTokens: info.promptTokens,
         outputTokens: info.completionTokens,
         cacheReadTokens: info.cachedTokens,
+        // 新版本模型在 model_info，旧版本可能只在 chat_record.extra 中保存。
         model: parseModelKey(row.model_info) ?? parseRecordModelKey(row.record_extra),
       });
     }
+    // 首个产生有效 token 的数据库就是 session 所属变体；路径交给上层修正 QoderIdea 类型。
     if (results.length > 0) return { rows: results, matchedDbPath: dbPath };
   }
   return { rows: [], matchedDbPath: null };
@@ -121,6 +127,7 @@ function resolveAllQoderDbPaths(): string[] {
   const available: string[] = [];
   for (const candidate of candidates) {
     try {
+      // 同步 access 仅检查极少量固定路径，避免把异步目录探测扩散到纯路径辅助函数调用方。
       fs.accessSync(candidate);
       available.push(candidate);
     } catch {
@@ -174,8 +181,10 @@ function parseRecordModelKey(raw: string | null | undefined): string | undefined
  */
 function queryReadonly<T>(dbPath: string, sql: string, params: unknown[]): Promise<T[]> {
   return new Promise((resolve, reject) => {
+    // OPEN_READONLY 明确禁止采集器修改或创建 Agent 数据库。
     const db = new sqlite3.Database(dbPath, sqlite3.OPEN_READONLY, (openErr) => {
       if (openErr) { reject(openErr); return; }
+      // 查询完成后先关闭连接，再向 Promise 调用方返回；关闭告警不掩盖已取得的查询结果。
       db.all(sql, params, (queryErr: Error | null, rows: T[]) => {
         db.close((closeErr) => {
           if (closeErr) logger.debug('sqlite close warning', { error: String(closeErr) });
