@@ -28,12 +28,18 @@ export async function directoryExists(path: string): Promise<boolean> {
 }
 
 /**
- * 读取并解析 JSON 文件；文件不存在、无权读取或内容解析失败时统一返回 null。
- * 适合读取允许缺失或损坏后降级的配置与状态快照。
+ * 读取并解析 JSON 文件；文件不存在、无权读取或内容解析失败时统一返回 null 适合读取允许缺失或损坏后降级的配置与状态快照。
+ * <T>：表示泛型
+ * fs/promises：异步读取文件，以 UTF-8 编码读出文本字符串
+ * export：可以在别的文件 import 导入
+ * async：异步函数，调用必须加 await，返回一定是 Promise
+ * Promise<X>：async 函数返回 Promise，最终兑现的值类型是 X
+ * T | null：联合类型，两种可能结果：成功 = T；失败 = null
  */
 export async function readJsonFile<T>(path: string): Promise<T | null> {
   try {
     const text = await fsp.readFile(path, 'utf8');
+    // 将文本反序列化为 JS 对象，并断言为类型 T
     return JSON.parse(text) as T;
   } catch {
     return null;
@@ -141,14 +147,14 @@ export async function ensureDir(path: string): Promise<void> {
 }
 
 /**
- * 将独立的 `~` 或路径开头的 `~/` 展开为当前用户主目录；Windows 同时支持 `~\`。
- * 出现在路径其他位置的 `~` 保持原样。
+ * 将独立的 `~` 或路径开头的 `~/` 展开为当前用户主目录；Windows 同时支持 `~\`。 出现在路径其他位置的 `~` 保持原样。
  */
 export function resolveHome(filepath: string): string {
   if (filepath === '~') {
     return os.homedir();
   }
   if (filepath.startsWith('~/') || filepath.startsWith(`~${nodePath.sep}`)) {
+    // 将目录转换为绝对路径，filepath.slice(2)表示截掉2个前面两个字符串
     return nodePath.join(os.homedir(), filepath.slice(2));
   }
   return filepath;

@@ -14,8 +14,11 @@ import { copyFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// ES Module（ESM）内置变量 返回当前脚本文件的 file:// 协议 URL 字符串
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
+// 从右向左拼接路径，并自动解析 ./ ../，返回绝对路径, 返回__dirname的上级目录即../loongsuite-pilot
 const repoRoot = path.resolve(__dirname, '..');
+// 得到../loongsuite-pilot/app/macos-status-bar/Sources/LoongSuitePilotMenuBarApp
 const sourceDir = path.join(repoRoot, 'app', 'macos-status-bar', 'Sources', 'LoongSuitePilotMenuBarApp');
 const binaryName = 'LoongSuitePilotMenuBarApp';
 

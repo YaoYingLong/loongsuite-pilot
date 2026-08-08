@@ -59,8 +59,7 @@ export interface SlsSingleConfig {
 }
 
 /**
- * 集团版控制面下发的内置数据出口配置，读取自
- * `<dataDir>/configs/inner/data_config.json`；开源版通常没有此文件。
+ * 集团版控制面下发的内置数据出口配置，读取自`<dataDir>/configs/inner/data_config.json`；开源版通常没有此文件。
  */
 export interface InnerDataConfig {
   sls?: SlsEndpointEntry[];
@@ -163,6 +162,7 @@ export interface ConfigFile {
   /** 按 Agent 产品维度控制准入及是否保留消息正文，例如 codex、claude-code。 */
   agents?: Record<string, {
     enabled?: boolean;
+    // 设置为 false 可避免采集完整 Prompt、Completion、工具参数和工具结果，前提是对应集成支持该策略。
     captureMessageContent?: boolean | string;
   }>;
 
@@ -234,8 +234,9 @@ function envInt(key: string, fallback: number): number {
  * 增加托管数据出口，因此用户出口和内置出口可以同时收到同一批采集数据。
  */
 export async function loadConfig(): Promise<AnalyticsConfig> {
-  // 配置文件本身也可换位置，适合多实例、容器挂载或测试环境。
+  // ?? 空值合并运算符，如果 环境变量中AGENT_DATA_COLLECTION_CONFIG 是 null 或 undefined 返回 DEFAULT_CONFIG_PATH
   const configPath = resolveHome(env('AGENT_DATA_COLLECTION_CONFIG') ?? DEFAULT_CONFIG_PATH);
+  // await：暂停当前异步函数代码执行，直到 Promise 完成（成功返回结果 / 失败拒绝），然后取出 Promise 内部的值赋值给变量 file
   const file = await readJsonFile<ConfigFile>(configPath);
 
   if (file) {
@@ -244,10 +245,11 @@ export async function loadConfig(): Promise<AnalyticsConfig> {
     logger.debug('no config file found, using env + defaults', { path: configPath });
   }
 
-  // dataDir 先确定，因为内置配置、日志、状态文件和本地输出都依赖这个根目录。
+  // 如果配置了LOONGSUITE_PILOT_DATA_DIR环境变量直接使用，如果没有配置环境变量使用~/.loongsuite-pilot/config.json文件中读取的dataDir对应的内容
+  // 如果该类容还是空，则默认使用~/.loongsuite-pilot
   const dataDir = env('LOONGSUITE_PILOT_DATA_DIR') ?? file?.dataDir ?? '~/.loongsuite-pilot';
 
-  // 此文件由集团版安装/控制面维护；文件不存在或损坏时按“没有内置出口”继续运行。
+  // 如果是~开头的路径，转换为绝对路径
   const innerDataConfigPath = resolveHome(`${dataDir}/configs/inner/data_config.json`);
   const innerDataConfig = await readJsonFile<InnerDataConfig>(innerDataConfigPath);
 
@@ -259,6 +261,7 @@ export async function loadConfig(): Promise<AnalyticsConfig> {
 
   // 从这里开始把“可选的原始配置”转换成字段齐全、可直接给 Orchestrator 使用的配置。
   return {
+    // 优先使用LOONGSUITE_PILOT_ENABLED环境变量的值，如果配置使用配置文件中配置的enabled
     enabled: envBool('LOONGSUITE_PILOT_ENABLED', file?.enabled ?? true),
     autoStart: true, // 历史兼容字段，当前固定为 true；实际进程生命周期由服务管理器控制。
     dataDir,
@@ -277,9 +280,13 @@ export async function loadConfig(): Promise<AnalyticsConfig> {
         }
       : undefined,
     autoUpdate: buildAutoUpdateConfig(file),
-
+    // Listener 对应具体采集实现。同一个 Agent 可能有 Hook、SQLite、Session 等多个 Listener，
+    // Orchestrator 会再结合 Agent 级开关和准入控制决定最终启停状态。
     listeners: buildListenersConfig(file),
+    // 构建日志类输出通道。三个 Flusher 可以同时开启，Orchestrator 会组装成 MultiFlusher。
+    // SLS 可合并用户与集团内置目的地；JSONL 默认写本地；HTTP 是用户自定义批量 POST。
     flushers: buildFlushersConfig(file, dataDir, serviceNamePrefix, innerDataConfig),
+    // 构建日志保留时间策略配置，未配置的分类默认保留 7 天。
     retention: buildRetentionConfig(file),
     agents: buildAgentsConfig(file),
     mask: buildMaskConfig(file),
@@ -335,8 +342,7 @@ function parseOptionalBool(value: unknown): boolean | undefined {
 }
 
 /**
- * 构建用户 CMS/ARMS 简写配置。
- * licenseKey 是启用标志；真正创建 Trace 出口时还要求 endpoint 非空。
+ * 构建用户 CMS/ARMS 简写配置。 licenseKey 是启用标志；真正创建 Trace 出口时还要求 endpoint 非空。
  */
 function buildCmsConfig(file: ConfigFile | null): CmsConfig {
   const licenseKey = env('LOONGSUITE_PILOT_CMS_LICENSE_KEY') ?? file?.cms?.licenseKey ?? '';
@@ -415,6 +421,7 @@ function buildListenersConfig(
 ): Record<string, { enabled: boolean; pollInterval: number }> {
   // Listener 对应具体采集实现。同一个 Agent 可能有 Hook、SQLite、Session 等多个 Listener，
   // Orchestrator 会再结合 Agent 级开关和准入控制决定最终启停状态。
+  // Record<KeyType, ValueType> 是 TS 内置工具类型：
   const defaults: Record<string, { enabled: boolean; pollInterval: number }> = {
     qoder: { enabled: true, pollInterval: 30_000 },
     'qoder-sqlite': { enabled: true, pollInterval: 30_000 },
@@ -432,11 +439,14 @@ function buildListenersConfig(
     'codex-transcript': { enabled: true, pollInterval: 30_000 },
     'pi-coding-agent-log': { enabled: true, pollInterval: 30_000 },
   };
-
+  // ... 是对象展开运算符，浅拷贝对象自身可枚举属性，等价于const result = Object.assign({}, defaults);
+  // 创建了一个全新对象，result 和 defaults 不是同一个引用 后续可以修改 result 而不污染原 defaults
+  // 对象里的 value 依然是引用类型，如果直接修改 result.xxx 内部属性，会影响原对象
   const result = { ...defaults };
 
   // 用户只需写想覆盖的字段；其余字段继承该 Listener 默认值。
   if (file?.listeners) {
+    // Object.entries把对象转换成 [key, value][] 数组
     for (const [key, val] of Object.entries(file.listeners)) {
       result[key] = {
         enabled: val.enabled ?? result[key]?.enabled ?? true,
@@ -467,9 +477,8 @@ function buildListenersConfig(
 }
 
 /**
- * 构建日志保留策略。
- * LOONGSUITE_PILOT_LOG_RETENTION_DAYS 是“一键统一天数”；config.json 中某个分类显式
- * 配置后，该分类优先使用自己的值。未配置的分类默认保留 7 天。
+ * 构建日志保留策略。 LOONGSUITE_PILOT_LOG_RETENTION_DAYS 是“一键统一天数”；
+ * config.json 中某个分类显式配置后，该分类优先使用自己的值。未配置的分类默认保留 7 天。
  */
 function buildRetentionConfig(file: ConfigFile | null): LogRetentionConfig {
   const unifiedDays = envInt('LOONGSUITE_PILOT_LOG_RETENTION_DAYS', 0);
@@ -974,6 +983,8 @@ function dedupSlsEndpoints(endpoints: SlsEndpoint[]): SlsEndpoint[] {
 function buildJsonlConfig(file: ConfigFile | null, dataDir: string) {
   return {
     enabled: envBool('JSONL_ENABLED', file?.jsonl?.enabled ?? true),
+    // 如果有配置JSONL_OUTPUT_DIR环境变量则使用该环境变量，若没有配置使用配置文件中配置的
+    // 如配置文件中也没有就使用默认路径~/.loongsuite-pilot/logs/output
     outputDir: resolveHome(
       env('JSONL_OUTPUT_DIR') ?? file?.jsonl?.outputDir ?? `${dataDir}/logs/output`,
     ),
@@ -983,8 +994,7 @@ function buildJsonlConfig(file: ConfigFile | null, dataDir: string) {
 }
 
 /**
- * 构建通用 HTTP 批量输出。
- * 只要设置 HTTP_REPORT_URL 就由该环境变量决定启停：非空开启、空字符串关闭；未设置时
+ * 构建通用 HTTP 批量输出。只要设置 HTTP_REPORT_URL 就由该环境变量决定启停：非空开启、空字符串关闭；未设置时
  * 使用 config.json 的 enabled，若 enabled 也未写则根据 url 是否非空自动判断。
  */
 function buildHttpConfig(file: ConfigFile | null) {
