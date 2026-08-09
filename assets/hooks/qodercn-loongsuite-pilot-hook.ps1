@@ -13,6 +13,7 @@ if (-not (Test-Path $Processor)) { exit 0 }
 
 $MIN_NODE_MAJOR = 18
 
+# 返回兼容性布尔值；stderr 被丢弃，候选的版本错误不会污染宿主协议输出。
 function Test-NodeSuitable {
     param([string]$bin)
     if (-not (Test-Path $bin)) { return $false }
@@ -24,6 +25,7 @@ function Test-NodeSuitable {
     } catch { return $false }
 }
 
+# 只读解析 Node 路径，固定 pin 优先，随后才搜索用户版本管理器和系统 PATH。
 function Resolve-NodeBin {
     $pinFile = Join-Path $env:USERPROFILE ".loongsuite-pilot\node-bin"
     if (Test-Path $pinFile) {
@@ -98,6 +100,7 @@ try {
         $psi.RedirectStandardError = $false
         $psi.CreateNoWindow = $true
 
+        # 原始字节写入子进程 stdin，确保 Qoder CN 中文 transcript 路径不会被错误转码。
         $proc = [System.Diagnostics.Process]::Start($psi)
         $proc.StandardInput.BaseStream.Write($rawBytes, 0, $rawBytes.Length)
         $proc.StandardInput.Close()

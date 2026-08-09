@@ -10,6 +10,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROCESSOR="$SCRIPT_DIR/cursor-hook-processor.mjs"
 EMPTY_RESULT='{}'
 
+# 将 wrapper 自身错误追加到独立 JSONL；该函数无论日志是否成功都保持成功返回。
 log_error() {
   local stage="$1"
   local message="$2"
@@ -42,6 +43,7 @@ fi
 
 MIN_NODE_MAJOR=18
 
+# 验证候选文件可执行且 Node 主版本不低于要求；版本命令失败时继续尝试下一候选。
 node_is_suitable() {
   local bin="$1"
   [[ -x "$bin" ]] || return 1
@@ -54,6 +56,7 @@ node_is_suitable() {
   return 0
 }
 
+# macOS .app 私有运行时可能只能在其宿主环境加载，不能作为通用 Node 候选。
 node_is_app_bundle() {
   local resolved
   resolved="$(realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || echo "$1")"
@@ -109,6 +112,7 @@ if [[ -z "$NODE_BIN" ]]; then
   exit 0
 fi
 
+# Cursor payload 继续从原 stdin 进入 processor；失败分支输出宿主要求的空 JSON。
 if ! "$NODE_BIN" "$PROCESSOR"; then
   echo "[loongsuite-pilot] hook processor failed" >&2
   log_error "processor_failed" "hook processor exited with non-zero status"

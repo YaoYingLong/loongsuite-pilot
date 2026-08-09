@@ -36,6 +36,10 @@ declare module '@alicloud/log' {
 
   /** 本项目使用到的 SDK Client 最小方法集合。 */
   class Client {
+    /**
+     * 使用 AK、区域和可选 endpoint 创建 SDK Client。
+     * 构造阶段只建立客户端配置；真正的网络请求由下方各异步方法发起。
+     */
     constructor(config: LogClientConfig);
 
     /** 异步写入一组日志，失败时 Promise reject，由 SlsTransport 重试。 */
@@ -46,13 +50,17 @@ declare module '@alicloud/log' {
       options?: Record<string, unknown>,
     ): Promise<string>;
 
+    /** 查询 Project 是否存在；返回结构未被本项目读取，因此保留 unknown。 */
     getProject(projectName: string): Promise<unknown>;
+    /** 列出 Project 下 Logstore；可选 data 承载 SDK 查询参数。 */
     listLogStore(projectName: string, data?: Record<string, unknown>): Promise<unknown>;
+    /** 创建 Logstore；失败时 Promise reject，由调用方决定是否降级。 */
     createLogStore(
       projectName: string,
       logstoreName: string,
       data?: Record<string, unknown>,
     ): Promise<unknown>;
+    /** 查询时间区间内日志；当前声明只约束本项目实际使用的参数形态。 */
     getLogs(
       projectName: string,
       logstoreName: string,

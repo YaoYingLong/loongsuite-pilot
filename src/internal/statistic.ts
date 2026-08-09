@@ -30,10 +30,15 @@ const SELECTED_FIELDS = new Set([
 
 let callCount = 0;
 
-/** 抽样选择字段并异步发送；非发送周期立即返回。 */
+/**
+ * 抽样选择字段并异步发送；非发送周期立即返回。
+ * 第一次调用（旧值 0）会立即发送，之后每 72 次调用发送一次；计数只存在当前进程内，重启归零。
+ */
 export function sendRunningStatus(data: Record<string, unknown>): void {
+  // 后置自增先用旧值做取模，因此 callCount=0 的首条状态会命中发送周期。
   if (callCount++ % SEND_INTERVAL_COUNT !== 0) return;
 
+  // 创建新对象而非删除原对象字段，避免修改 MetricsWriter 仍可能使用的 metrics。
   const status: Record<string, unknown> = {};
   // 只复制白名单中且调用数据真实存在的字段。
   for (const key of SELECTED_FIELDS) {

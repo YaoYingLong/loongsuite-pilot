@@ -67,6 +67,10 @@ export function parseQwenTranscript(transcriptPath, byteOffset = 0, mainSessionI
 
 // ─── 增量文件读取（与 Claude parser 同策略） ───
 
+/**
+ * 按字节读取 offset 到当前 EOF，并返回候选 nextOffset；函数本身不持久化 checkpoint。
+ * 超过 50MB 时选择“保留最近数据、舍弃最早积压”，以免短命 Hook 因内存压力拖垮宿主。
+ */
 function readIncremental(transcriptPath, byteOffset) {
   let stat;
   try { stat = fs.statSync(transcriptPath); } catch { return { content: '', nextOffset: byteOffset }; }
@@ -137,6 +141,10 @@ export function splitIntoTurns(records) {
 
 // ─── 丰富每 turn 的 LLM 调用与工具配对 ───
 
+/**
+ * 在一个原始 turn 内按源顺序建立 LLM step、输入增量、工具配对和 API telemetry 关联。
+ * mainSessionId 用于排除子 Agent 的 prompt_id；返回值仅为内存结构，由 processor 负责写事件。
+ */
 function enrichTurn(turn, mainSessionId) {
   const userRec = turn.userRecord;
   const promptText = extractUserPromptText(userRec);

@@ -114,16 +114,21 @@ export class TraceLinker {
   private async stampEntry(entry: AgentActivityEntry): Promise<void> {
     const sessionId = entry['gen_ai.session.id'] as string | undefined;
     const turnId = entry['gen_ai.turn.id'] as string | undefined;
+    // 上游关联以 session + turn 为查找键；任一身份缺失时无法安全猜测父 Span。
     if (!sessionId || !turnId) return;
 
+    // 刷新 session 活跃时间，供 retention 删除长期未访问的 firstTurnBySession 状态。
     this.sessionLastAccess.set(sessionId, Date.now());
     if (!this.firstTurnBySession.has(sessionId)) {
+      // 第一次看到的 turn 作为 session 首 turn；后续回退查找只允许首 turn 使用 session 级关联。
       this.firstTurnBySession.set(sessionId, turnId);
     }
 
     const key = `${sessionId}|${turnId}`;
     const cached = this.cache.get(key);
     if (cached) {
+      // cache 同时保存成功命中和“已经查过但未命中”。只有 resolved 项才写 trace/parent；
+      // 未命中项直接返回，可避免同一 turn 的每条 entry 都重复读取关联仓库。
       if (cached.resolved) this.apply(entry, cached);
       return; // 已解析，或已经尝试过但未命中；两种情况都不再重复访问仓库。
     }

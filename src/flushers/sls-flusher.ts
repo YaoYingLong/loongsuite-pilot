@@ -515,15 +515,18 @@ export class SlsFlusher extends BaseFlusher {
    * endpoint 串行发送，单个失败被 catch 且不保存失败摘要，也不阻断后续 endpoint。
    */
   override async sendRaw(topic: string, payload: Record<string, unknown>): Promise<void> {
+    // SLS content 只接受字符串值；字符串原样保留，结构化值统一 JSON 序列化。
     const content: Record<string, string> = { topic };
     for (const [k, v] of Object.entries(payload)) {
       content[k] = typeof v === 'string' ? v : JSON.stringify(v);
     }
 
+    // 同一 raw payload 会扇出到所有 mcp/trace endpoint；普通 agent endpoint 由 send() 路径处理。
     for (const endpoint of this.config.endpoints) {
       if (endpoint.kind !== 'mcp' && endpoint.kind !== 'trace') continue;
       try {
         if (endpoint.mode === 'ak') {
+          // AK 模式复用缓存 SDK Client，并携带 endpoint 配置生成的 tags。
           const client = this.getAkClient(endpoint);
           await client.postLogStoreLogs(endpoint.project, endpoint.logstore, {
             logs: [{ timestamp: Math.floor(Date.now() / 1000), content }],
@@ -532,6 +535,7 @@ export class SlsFlusher extends BaseFlusher {
             tags: this.buildAkTags(endpoint),
           });
         } else {
+          // WebTracking 不需要 AK，直接向公开采集端点 POST；userAgent 用于服务端识别 Pilot 版本。
           await postWebtracking(
             {
               endpoint: endpoint.endpoint,
@@ -548,6 +552,7 @@ export class SlsFlusher extends BaseFlusher {
           );
         }
       } catch {
+        // raw 通道目前只有 warning，没有失败文件持久化；一个 endpoint 失败后继续尝试其余目的地。
         logger.warn('sendRaw failed', { topic, endpoint: endpoint.name });
       }
     }
@@ -560,20 +565,24 @@ export class SlsFlusher extends BaseFlusher {
    * `void flush()` 保持 send 低延迟，flush 内部负责吞掉 endpoint 级失败。
    */
   private enqueue(endpoint: SlsEndpoint, content: Record<string, string>, agentType?: string): void {
+    // endpoint 三元组隔离不同目的地；启用 serviceName 时再按 Agent 拆桶，确保批次 tag 一致。
     const base = `${endpoint.name}/${endpoint.project}/${endpoint.logstore}`;
     const key = (this.effectiveServiceName(endpoint) && agentType)
       ? `${base}/${agentType}`
       : base;
     let bucket = this.queue.get(key);
     if (!bucket) {
+      // Map 中只在首条记录到来时建桶，flush 清空后会删除空桶。
       bucket = [];
       this.queue.set(key, bucket);
     }
+    // byteSize 在入队时计算并随项保存，flush 分批和指标无需反复序列化估算。
     const byteSize = Buffer.byteLength(JSON.stringify(content));
     bucket.push({ content, endpoint, agentType, byteSize });
 
     const counter = this.endpointCounters.get(endpoint.name);
     if (counter) {
+      // in* 表示已接收入内存队列，并不代表远端写入成功；out*/failed* 在 flush 后更新。
       counter.inEntries++;
       counter.inBytes += byteSize;
       if (!counter.startTime) counter.startTime = formatTime(new Date());

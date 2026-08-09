@@ -139,6 +139,8 @@ export class InputManager extends EventEmitter {
       type: input.collectionMethod,
       lastActiveTime: 0,
     });
+    // registerInput 只绑定数据处理链，不会启动 Input。Discovery 后续调用 input.start() 后，entries
+    // 才会依次经过计数、userId/上游 Trace 补全、正文采集策略、mask 脱敏和 Flusher 输出。
     input.on('entries', (entries: AgentActivityEntry[]) => {
       // EventEmitter 监听器本身是同步调用的；这里不直接 await，而是把异步工作挂到该
       // Input 的尾 Promise。这样 emit() 能立即返回，同时仍保留文件偏移对应的批次顺序。
@@ -309,6 +311,8 @@ export class InputManager extends EventEmitter {
       }
     }
 
+    // Agent 级 captureMessageContent=false 时删除 Prompt、Completion、工具参数和工具结果；
+    // 这一步先于 mask，因为已经禁止采集的正文无需再进入敏感信息规则扫描。
     const policyAppliedEntries = entries.map(entry =>
       applyAgentContentPolicy(entry, this.agentsConfig),
     );
@@ -352,6 +356,7 @@ export class InputManager extends EventEmitter {
       // sendBatch 兑现只代表当前 Flusher 契约成功；MultiFlusher 可在内部隔离个别通道失败。
       await this.flusher.sendBatch(entries);
       if (counter) counter.outEvents += entries.length;
+      // 只有整个 sendBatch Promise 兑现后才发 flushed；监听者可据此刷新成功输出统计。
       this.emit('flushed', { count: entries.length, bytes: batchBytes });
     } catch (err) {
       if (counter) counter.outFailed += entries.length;

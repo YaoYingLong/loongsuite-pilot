@@ -24,6 +24,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+# PowerShell 5.1 的原生命令错误并不总是终止异常，调用 Node/schtasks 的位置仍需显式检查退出码或 try/catch。
 
 # ============================================================
 # 常量与路径
@@ -63,6 +64,7 @@ $LOONGSUITE_PILOT_BIN = Join-Path $env:USERPROFILE ".local\bin\loongsuite-pilot.
 # ============================================================
 # 创建数据、日志、版本和稳定 bin 目录，已存在时保持幂等。
 function Ensure-Dirs {
+    # 管道把两个路径逐一交给 ForEach-Object；`-Force` 让已存在目录保持幂等。
     @($LOG_DIR, $BOOTSTRAP_DIR) | ForEach-Object {
         if (-not (Test-Path $_)) { New-Item -ItemType Directory -Path $_ -Force | Out-Null }
     }
@@ -83,6 +85,7 @@ function Test-NodeSuitable {
 # 按 node-bin、nvm-windows、fnm、Volta、Program Files 和 PATH 解析可用 Node，并更新 pin。
 function Resolve-Node {
     # 1. 优先读取安装器固定的 Node 路径。
+    # Scheduled Task 的 PATH 很精简，安装时固定的绝对路径是最可靠来源。
     if (Test-Path $NODE_PIN_FILE) {
         $pinned = (Get-Content $NODE_PIN_FILE -ErrorAction SilentlyContinue).Trim()
         if ($pinned -and (Test-NodeSuitable $pinned)) {
@@ -147,6 +150,7 @@ function Sync-InstalledScriptsFromVersion {
     param([string]$versionDir)
     $srcDir = Join-Path $versionDir "scripts"
     $required = @("collector-daemon.js", "updater-daemon.js")
+    # 两个 daemon 任一缺失就不开始覆盖，避免稳定 bin 目录出现混合版本。
     foreach ($f in $required) {
         if (-not (Test-Path (Join-Path $srcDir $f))) { return $false }
     }
@@ -222,6 +226,7 @@ function Test-PidRunning {
         Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
         return $false
     }
+    # Get-Process 只证明 PID 存在，无法防止 PID 被其他程序复用；这里没有再校验命令行所有权。
     $proc = Get-Process -Id $pidVal -ErrorAction SilentlyContinue
     if ($proc) { return $true }
     Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
@@ -236,6 +241,7 @@ function Stop-PidFile {
         return
     }
     $pidVal = (Get-Content $pidFile -ErrorAction SilentlyContinue).Trim()
+    # 首次请求普通终止；最多等待约 10 秒后 `-Force`，后者无法保证 Collector 清理完成。
     try { Stop-Process -Id $pidVal -ErrorAction SilentlyContinue } catch {}
     $count = 0
     while ($count -lt 10) {
@@ -249,7 +255,8 @@ function Stop-PidFile {
     Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
 }
 
-# 按命令行匹配只清理当前用户数据目录对应的遗留 daemon。
+# 按命令行包含的 daemon 文件名清理遗留 Node 进程。
+# 待确认：当前过滤器没有核对 DATA_DIR/用户名，同一账号运行多套 Pilot 时可能影响另一套实例。
 function Stop-OrphanProcesses {
     Get-Process -Name "node" -ErrorAction SilentlyContinue |
         Where-Object {
@@ -294,6 +301,7 @@ function Register-PilotTask {
     )
     $userId = whoami
     $lastErr = $null
+    # S4U 可脱离交互登录运行但需要批处理权限；失败后再退到仅登录会话可运行的 Interactive。
     foreach ($logonType in @("S4U", "Interactive")) {
         # 先清理上次失败留下的 Task；S4U 注册可能在 principal 报错前已创建条目，
         # 若不删除会让后续 Interactive 重试因“已存在”再次失败。
@@ -354,6 +362,7 @@ sh.Run """$nodeEsc"" ""$entryEsc""", 0, True
     # 固定 Unicode 可避免中文等非 ASCII 用户目录乱码导致 daemon 无法启动。
     # BOM 能让不同 PowerShell 版本与系统 code page 都正确识别编码。
     # 因此这里不能改用依赖系统区域设置的默认编码。
+    # Windows Script Host 对 UTF-16LE（PowerShell `Unicode`）兼容稳定；action 通过 wscript 隐藏控制台。
     Set-Content -Path $vbsPath -Value $vbs -Encoding Unicode
     return (New-ScheduledTaskAction -Execute "wscript.exe" -Argument "`"$vbsPath`"" -WorkingDirectory $CACHE_DIR)
 }
@@ -473,8 +482,10 @@ function Cmd-Run {
         exit 1
     }
 
+    # `$PID` 是当前 PowerShell 包装进程；与 Bash exec 不同，下面 `& node` 会创建子进程。
     Set-Content -Path $PID_FILE -Value $PID
     $env:AGENT_DATA_COLLECTION_CONFIG = $CONFIG_FILE
+    # 同步调用让包装进程等待 Node 结束，因此 Scheduled Task 的 Running 状态覆盖 Collector 生命周期。
     & $nodeBin $entry
 }
 
@@ -533,6 +544,7 @@ function Cmd-Start {
     # 注册并启动 Task Scheduler。
     $taskInstalled = $false
     try {
+        # Collector Task 是必需项，Updater Task 是可选项；只有 ok1 成功才进入启动阶段。
         $ok1 = Install-CollectorTask $nodeBin
         $ok2 = Install-UpdaterTask $nodeBin
         if ($ok1) {
@@ -541,6 +553,7 @@ function Cmd-Start {
                 Start-ScheduledTask -TaskName $TASK_NAME_UPDATER -TaskPath "$TASK_FOLDER\" -ErrorAction SilentlyContinue
             }
             Set-Content -Path $INIT_TYPE_FILE -Value "taskscheduler"
+            # 每 2 秒查询一次，共等待 10 秒；这里只观察 Task 状态，不解析 Collector 业务健康日志。
             for ($i = 0; $i -lt 5; $i++) {
                 Start-Sleep -Seconds 2
                 if (Get-TaskRunning $TASK_NAME_COLLECTOR) {
@@ -596,6 +609,7 @@ function Cmd-Stop {
     Stop-PidFile $UPDATER_PID_FILE
 
     # 最后清理没有有效 PID 文件的遗留进程。
+    # PID 文件可能缺失或包装进程已退出，最后按命令行清理残留 daemon。
     Stop-OrphanProcesses
 
     Write-Host "loongsuite-pilot stopped"
@@ -930,6 +944,7 @@ function Cmd-Rollback {
     }
 
     # 交换 current/previous 指针。
+    # 两次 Set-Content 不是事务；进程中断可能造成 current/previous 只交换一半。
     Set-Content -Path $CURRENT_FILE -Value $prevDir
     if ($currDir) {
         Set-Content -Path $PREVIOUS_FILE -Value $currDir
@@ -984,6 +999,7 @@ function Cmd-SpanAttr {
     if ($sub.ToLower() -in @("set", "unset", "list")) {
         $nodeBin = Resolve-Node
         if (-not $nodeBin) { Write-Error "[span-attr] node runtime not found"; exit 1 }
+        # 单引号 here-string 禁止 PowerShell 展开内嵌 JavaScript；业务参数通过 argv 传递。
         $js = @'
 const fs = require("fs");
 const file = process.argv[1], op = process.argv[2], key = process.argv[3], value = process.argv[4];
@@ -1040,6 +1056,7 @@ function Cmd-Help {
 # ============================================================
 # 子命令分派
 # ============================================================
+# run/run-updater 是 Scheduled Task 内部入口；用户通常使用 start/stop/status。
 switch ($Command.ToLower()) {
     "start"              { Cmd-Start }
     "stop"               { Cmd-Stop }

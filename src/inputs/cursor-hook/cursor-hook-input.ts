@@ -146,17 +146,21 @@ function buildAttributes(
   payload: Record<string, unknown>,
   hookEvent: string,
 ): { [key: string]: JsonValue } {
+  // 只复制已知、对诊断有价值的 Cursor 字段；toJsonObject 会过滤 undefined 和不可 JSON 化值。
   return toJsonObject({
+    // hook_event_name 是规范后的事件来源，后续字段保留 Cursor 原始运行上下文。
     'cursor.hook_event_name': hookEvent,
     user_email: payload.user_email,
     cursor_version: payload.cursor_version,
     workspace_roots: payload.workspace_roots,
     transcript_path: payload.transcript_path,
     cwd: payload.cwd,
+    // command/sandbox 描述工具执行环境，composer_mode/attachments 描述交互形态。
     command: payload.command,
     sandbox: payload.sandbox,
     composer_mode: payload.composer_mode,
     attachments: payload.attachments,
+    // status/loop_count 主要用于 Stop 与 Agent 循环诊断，不提升为跨 Agent 公共字段。
     status: payload.status,
     loop_count: payload.loop_count,
   });

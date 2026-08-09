@@ -15,6 +15,7 @@ if (-not (Test-Path $Processor)) { exit 0 }
 
 $MIN_NODE_MAJOR = 18
 
+# 测试候选路径与主版本；所有探测错误返回 false，让搜索继续而不是抛出终止异常。
 function Test-NodeSuitable {
     param([string]$bin)
     if (-not (Test-Path $bin)) { return $false }
@@ -26,6 +27,7 @@ function Test-NodeSuitable {
     } catch { return $false }
 }
 
+# 依次检查安装 pin、nvm-windows、fnm、Volta、系统目录和 PATH，只返回首个兼容 node.exe。
 function Resolve-NodeBin {
     $pinFile = Join-Path $env:USERPROFILE ".loongsuite-pilot\node-bin"
     if (Test-Path $pinFile) {
@@ -104,6 +106,7 @@ try {
         $psi.RedirectStandardError = $false
         $psi.CreateNoWindow = $true
 
+        # 通过 BaseStream 原样写入 stdin，避免 PowerShell 把 UTF-8 Hook JSON转换为本地代码页。
         $proc = [System.Diagnostics.Process]::Start($psi)
         $proc.StandardInput.BaseStream.Write($rawBytes, 0, $rawBytes.Length)
         $proc.StandardInput.Close()

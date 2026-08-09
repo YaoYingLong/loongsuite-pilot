@@ -37,6 +37,10 @@ import {
   getStringValue,
 } from './agent-event-normalizer.mjs';
 
+/**
+ * 单次 Stop Hook 入口：读取 stdin、确定 transcript 新增行、组装记录并在成功后提交行号 checkpoint。
+ * Qoder Work/CN 共用本处理器，wrapper 通过 agentId 选择变体；解析失败时不推进状态。
+ */
 async function main() {
   const { agentId, logPrefix } = parseArgs();
   const payload = await parseStdinPayload(agentId);
@@ -79,6 +83,10 @@ async function main() {
   }
 }
 
+/**
+ * 将已解析 JSONL 行切成 turn，再为每个 turn 构造标准事件。
+ * 这是内存转换阶段，不读写 checkpoint；返回数组由 main 一次性追加 history，避免部分写成功后误提交。
+ */
 function processTranscript(parsed, sessionId, agentId, runtimeConfig, cwd, opts = {}) {
   const observedTs = timestampToUnixNanos(Date.now());
   const records = [];
@@ -138,6 +146,10 @@ function processTranscript(parsed, sessionId, agentId, runtimeConfig, cwd, opts 
   return records;
 }
 
+/**
+ * 以真实用户 prompt 为边界切分 transcript；边界之前的孤立系统行不会单独形成 turn。
+ * 最后一个尚未遇到下一 prompt 的分组也会在循环结束后提交。
+ */
 function splitIntoTurns(contentRows) {
   const turns = [];
   let currentTurn = [];
@@ -181,6 +193,10 @@ function isPureSystemReminder(text) {
     && text.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim().length === 0;
 }
 
+/**
+ * 展开一个 Qoder Work turn：先输出用户入口，再按 assistant/tool_result 分组生成多步 LLM/TOOL 链。
+ * turnId/sessionId 在所有记录间共享，stepId 由分组顺序产生；内容策略在最终 record 构造时应用。
+ */
 function buildTurnEvents(turnRows, turnId, sessionId, userId, providerName, version, observedTs, runtimeConfig, cwd, agentId) {
   const records = [];
 
@@ -317,6 +333,10 @@ function groupByParentUuid(assistantRows) {
  * 不按 parentUuid 的原因：一个响应可能以不同 parentUuid 写 thinking 和 tool_use；误拆后，
  * “前一 tool_result 作为 request 开始”会错误地把工具执行时间归入后半段 LLM。
  */
+/**
+ * 每遇到 tool_result 即闭合前一批 assistant 输出，使下一批 assistant 成为新的模型 step。
+ * 返回分组保留原始顺序，后续可把工具结果作为下一次 request 的 input delta。
+ */
 function groupAssistantRowsByToolResults(turnRows) {
   const groups = [];
   let current = [];
@@ -336,6 +356,7 @@ function groupAssistantRowsByToolResults(turnRows) {
   return groups;
 }
 
+/** 构造一个 step 的 request、response 及配对工具事件；返回顺序就是下游消费的因果顺序。 */
 function buildStepEvents(group, toolResultsByUseId, stepId, turnId, sessionId, userId, providerName, version, observedTs, runtimeConfig, agentId, isLastStep, inputDelta, cwd, llmRequestTs, turnMetadata = {}) {
   const records = [];
   const firstRow = group[0];

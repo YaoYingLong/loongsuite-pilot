@@ -17,6 +17,7 @@ const LOG_LEVEL = (process.env.LOG_LEVEL?.toLowerCase() ?? 'info') as pino.Level
 const pinoOpts: pino.LoggerOptions = {
   level: LOG_LEVEL,
   formatters: {
+    // Pino 默认输出数字 level；这里改为大写文本，便于直接阅读 JSONL 服务日志。
     level(label) {
       return { level: label.toUpperCase() };
     },
@@ -52,6 +53,7 @@ function getChild(tag: string): pino.Logger {
  */
 export async function initFileLogging(logFilePath: string): Promise<void> {
   // 初始化是一次性操作；重复调用直接复用当前根 logger。
+  // 标记在 await build 前设置，因此首次 build 失败后，本进程内再次调用不会自动重试。
   if (fileLoggingInitialized) return;
   fileLoggingInitialized = true;
 

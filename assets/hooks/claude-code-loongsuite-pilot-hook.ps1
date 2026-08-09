@@ -21,6 +21,7 @@ if ($Subcommand -notin @("stop", "subagent-start", "subagent-stop")) {
     exit 0
 }
 
+# 错误日志写入失败也会被吞掉，避免诊断路径反过来阻断 Claude Code。
 function Log-Error {
     param([string]$Stage, [string]$Message)
     try {
@@ -46,6 +47,7 @@ if (-not (Test-Path $Processor)) {
 
 $MIN_NODE_MAJOR = 18
 
+# 调用 `node --version` 并解析主版本；重定向 2>$null 防止候选错误污染 Hook stdout。
 function Test-NodeSuitable {
     param([string]$bin)
     if (-not (Test-Path $bin)) { return $false }
@@ -57,6 +59,7 @@ function Test-NodeSuitable {
     } catch { return $false }
 }
 
+# 从固定 pin 到版本管理器再到 PATH 搜索 Node；找到首个 >=18 的候选即提前 return。
 function Resolve-NodeBin {
     $pinFile = Join-Path $env:USERPROFILE ".loongsuite-pilot\node-bin"
     if (Test-Path $pinFile) {
@@ -140,6 +143,7 @@ try {
         $psi.RedirectStandardError = $false
         $psi.CreateNoWindow = $true
 
+        # 用原始 BaseStream 写 stdin，避免含中文 JSON 经 PowerShell 默认代码页二次编码。
         $proc = [System.Diagnostics.Process]::Start($psi)
         $proc.StandardInput.BaseStream.Write($rawBytes, 0, $rawBytes.Length)
         $proc.StandardInput.Close()

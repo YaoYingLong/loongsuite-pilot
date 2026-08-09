@@ -66,6 +66,7 @@ import { resolveDbPath } from './kiro-cli/db-path.mjs';
 const AGENT_ID = 'kiro-cli';
 const PROVIDER_NAME = 'amazon'; // Kiro CLI = Amazon Q CodeWhisperer 再分发
 
+/** 解析 Pilot 数据根目录；Hook wrapper 与主服务通过同一环境变量共享状态和日志位置。 */
 function pilotDataDir() {
   return process.env.LOONGSUITE_PILOT_DATA_DIR || path.join(os.homedir(), '.loongsuite-pilot');
 }
@@ -89,6 +90,10 @@ function defaultLogDir() {
   return path.join(pilotDataDir(), 'logs', AGENT_ID);
 }
 
+/**
+ * 读取宿主通过 stdin 传入的一次 Hook JSON。
+ * readStdinJson 会同步读到 EOF；解析失败只写独立诊断并返回空对象，调用链继续按 fail-open 退出。
+ */
 function tryReadStdin() {
   try {
     return readStdinJson();
@@ -132,6 +137,10 @@ function isoToMs(iso) {
  * postToolUse: 把 tool_response 缓冲到 per-cwd 文件，stop 时再 join。
  * 不发任何 JSONL（避免无 step 上下文的孤立 tool 事件）。
  */
+/**
+ * 缓存 PostToolUse 的结果正文。该短命 Hook 不立即构造 span，因为工具所属 step 要等 transcript
+ * 完整后才能确定；缓存由 delayedCollect 按 session/时间窗口一次性 drain。
+ */
 function cmdPostToolUse() {
   const event = tryReadStdin();
   const cwd = event && event.cwd;
@@ -151,6 +160,7 @@ function cmdPostToolUse() {
  * preToolUse: 缓冲 {toolName, toolInput, startTs} 到 per-cwd 独立文件。
  * stop 时与 transcript tool_use join，为 tool.call 提供真实起点时间。
  */
+/** 缓存工具开始事件，为 transcript 缺少精确开始时间时提供 call 时间和参数补充。 */
 function cmdPreToolUse() {
   const event = tryReadStdin();
   const cwd = event && event.cwd;
@@ -168,6 +178,7 @@ function cmdPreToolUse() {
  * userPromptSubmit: 不单独发 JSONL。
  * transcript 主干已覆盖 prompt。
  */
+/** 已注册但当前不需要采集的 Hook 事件只消费 stdin，保持 wrapper 的 `{}` stdout 协议。 */
 function cmdNoop() {
   // 有意为空：prompt 已在 transcript 主干中，额外输出会重复。
 }
@@ -179,6 +190,10 @@ function cmdNoop() {
  *  - 真正的采集由主服务侧的 KiroCliSessionInput 延迟触发（SIGUSR1 唤醒 + 10s 成熟延迟）
  *
  * 入队字段：cwd / stop 时刻 / 两条 offset 快照 / assistant_response / userId。
+ */
+/**
+ * 把 Stop 上下文加入持久化 pending 队列并唤醒主服务。
+ * 此处故意不等待 SQLite/session JSONL 刷盘，避免 Kiro CLI 的 Stop Hook 被慢 I/O 阻塞。
  */
 function cmdStop() {
   const event = tryReadStdin();
@@ -224,6 +239,10 @@ function cmdStop() {
  *   3. SQLite 未命中时回退到 session JSONL（同样带轮询，但因为已经延迟过，
  *      正常情况下 sidecar 已就绪；--allow-fallback 时即便时序不完整也接受）
  *   4. 去重 / 构造记录 / 写 JSONL / 推进 offset
+ */
+/**
+ * sidecar 成熟延迟结束后调用的内部子命令入口。
+ * 参数来自主服务而非 stdin；成功与失败都只影响遥测文件，不向 Kiro 原会话传播。
  */
 async function cmdDelayedCollect() {
   const pendingPath = process.argv[3];
@@ -296,6 +315,13 @@ async function cmdDelayedCollect() {
  * @param {string}  ctx.userId 归一化事件写入的用户标识。
  * @param {boolean} ctx.allowFallback 为 true 时，即使时序不完整也强制发出回退记录。
  * @returns {Promise<'ok'|'timing_pending'|'no_data'>}
+ */
+/**
+ * 执行一次 Kiro 会话采集事务：选数据源、读取 checkpoint、关联工具缓存、写 JSONL，再保存状态。
+ * checkpoint 的更新位于写出之后；若解析或落盘抛错，旧 offset/已发 step 集合保留供下次重试。
+ *
+ * @param {object} ctx pending Stop 记录，包含 cwd、session、时间窗口和日志目录等上下文。
+ * @returns {Promise<void>} SQLite 路径主要同步执行，JSONL fallback 搜索包含异步文件操作。
  */
 async function runCollect(ctx) {
   const { cwd, assistantResponse, userId, allowFallback } = ctx;
@@ -433,6 +459,10 @@ async function runCollect(ctx) {
  * @param {boolean} [opts.allowFallback] 为 true 时，即使时序不完整也返回，让调用方发出回退记录。
  * @returns {Promise<import('./kiro-cli/transcript-parser.mjs').TranscriptData|null>}
  */
+/**
+ * SQLite 不可用时扫描 Kiro session JSONL，选择与 cwd/时间最匹配的文件并做增量解析。
+ * 返回 null 表示没有可用候选；调用方据此保留 checkpoint，等待下一次 Stop/轮询重试。
+ */
 async function trySessionJsonl(cwd, sinceMs = 0, opts = {}) {
   const { allowFallback = false } = opts;
   const MAX_ATTEMPTS = 3;
@@ -518,6 +548,10 @@ async function trySessionJsonl(cwd, sinceMs = 0, opts = {}) {
 
 // ─── buildRecords — 整会话的 trace 记录构造 ───
 
+/**
+ * 把 transcript 中的模型 step 与两类 Hook 工具缓存合并为统一事件数组。
+ * emittedSteps 用于跨采集调用去重；函数只返回新记录和新的状态建议，真正落盘/持久化由 runCollect 负责。
+ */
 function buildRecords(transcript, toolEvents, preToolEvents, cwd, userId, stopEvent, opts = {}) {
   const records = [];
   const sessionId = transcript.conversationId || transcript.continuationId || 'unknown';

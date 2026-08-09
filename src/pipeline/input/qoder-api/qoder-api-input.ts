@@ -642,6 +642,7 @@ export class QoderApiInput {
     reportTs: string,
     index: number,
   ): Record<string, string> {
+    // 公共窗口字段描述“本轮拉取覆盖的时间范围”，raw_json 保留 API 原貌供问题排查和后续扩展。
     const log: Record<string, string> = {
       kind: 'usage.member_event',
       org_id: this.orgId,
@@ -680,6 +681,7 @@ export class QoderApiInput {
     endIso: string,
     reportTs: string,
   ): Record<string, string> {
+    // quota 是采集窗口末端的成员快照，不是窗口内发生的增量事件。
     const log: Record<string, string> = {
       kind: 'usage.member_quota',
       org_id: this.orgId,
@@ -690,6 +692,7 @@ export class QoderApiInput {
       report_ts: reportTs,
       raw_json: safeStringify(q),
     };
+    // 四组 used/limit 分别代表总额、套餐、资源包和共享额度，不能相加为新的总量。
     setIfPresent(log, 'quota_key', q.quotaKey);
     setIfPresent(log, 'total_used', q.totalQuota?.quotaSummary?.usedValue);
     setIfPresent(log, 'total_limit', q.totalQuota?.quotaSummary?.limitValue);
@@ -699,9 +702,11 @@ export class QoderApiInput {
     setIfPresent(log, 'pack_limit', q.resourcePackageQuota?.quotaSummary?.limitValue);
     setIfPresent(log, 'shared_used', q.sharedQuota?.quotaSummary?.usedValue);
     setIfPresent(log, 'shared_limit', q.sharedQuota?.quotaSummary?.limitValue);
+    // 状态及重置边界用于解释额度突变；时间字符串保持服务端格式，不在采集端改时区。
     setIfPresent(log, 'quota_status', q.status);
     setIfPresent(log, 'last_reset_at', q.lastResetAt);
     setIfPresent(log, 'next_reset_at', q.nextResetAt);
+    // 每个成员每天保留一个确定性快照身份；重复轮询同一天可由 event_id 去重。
     log.event_id = sha256([
       'usage.member_quota',
       this.orgId,
@@ -728,6 +733,7 @@ export class QoderApiInput {
       report_ts: reportTs,
       raw_json: safeStringify(c),
     };
+    // setIfPresent 会跳过 null/undefined，避免 SLS 中出现无法区分“缺失”和字符串 "undefined" 的值。
     setIfPresent(log, 'change_id', c.changeId);
     setIfPresent(log, 'change_source', c.source);
     setIfPresent(log, 'model', c.model);
@@ -735,8 +741,10 @@ export class QoderApiInput {
     setIfPresent(log, 'lines_deleted', c.totalLinesDeleted);
     setIfPresent(log, 'created_at', c.createdAt);
     if (Array.isArray(c.metadata)) {
+      // metadata 是结构化数组，而 Pipeline 输出要求字符串 map，因此单独序列化为 JSON 字段。
       log.metadata_json = safeStringify(c.metadata);
     }
+    // event_id 由业务主键和发生时间哈希；相同 API 数据在重试窗口中会得到相同 ID。
     log.event_id = sha256([
       'code.tracking_change',
       this.orgId,
@@ -754,6 +762,7 @@ export class QoderApiInput {
     endIso: string,
     reportTs: string,
   ): Record<string, string> {
+    // commit 事件先写所有记录共有的组织、成员、窗口和原始响应字段。
     const log: Record<string, string> = {
       kind: 'code.tracking_commit',
       org_id: this.orgId,
@@ -764,12 +773,15 @@ export class QoderApiInput {
       report_ts: reportTs,
       raw_json: safeStringify(c),
     };
+    // Git 身份字段用于定位提交；API 缺失时不写空占位，只有 member 公共字段固定存在。
     setIfPresent(log, 'commit_hash', c.commitHash);
     setIfPresent(log, 'repo_name', c.repoName);
     setIfPresent(log, 'branch_name', c.branchName);
     setIfPresent(log, 'is_primary_branch', c.isPrimaryBranch);
     setIfPresent(log, 'total_added', c.totalLinesAdded);
     setIfPresent(log, 'total_deleted', c.totalLinesDeleted);
+    // 以下行数按“非 AI / IDE 补全 / 插件补全 / Agent / Quest / Inline Chat”来源拆分，
+    // 下游可以在不重新解析 raw_json 的情况下计算各渠道的 AI 代码占比。
     setIfPresent(log, 'non_ai_added', c.nonAiLinesAdded);
     setIfPresent(log, 'non_ai_deleted', c.nonAiLinesDeleted);
     setIfPresent(log, 'ide_next_added', c.ideNextLinesAdded);
@@ -788,8 +800,10 @@ export class QoderApiInput {
     setIfPresent(log, 'ide_inline_chat_deleted', c.ideInlineChatLinesDeleted);
     setIfPresent(log, 'jb_inline_chat_added', c.jbInlineChatLinesAdded);
     setIfPresent(log, 'jb_inline_chat_deleted', c.jbInlineChatLinesDeleted);
+    // 提交时间和 message 是 Git 语义字段；message 可能包含任意文本，只由后续输出/脱敏策略处理。
     setIfPresent(log, 'commit_ts', c.commitTs);
     setIfPresent(log, 'commit_message', c.message);
+    // hash 不包含可变的统计明细和 message，保证同一成员的同一 commit 在窗口重叠时仍可去重。
     log.event_id = sha256([
       'code.tracking_commit',
       this.orgId,
@@ -808,6 +822,7 @@ export class QoderApiInput {
     reportTs: string,
     index: number,
   ): Record<string, string> {
+    // usage 事件没有稳定服务端 ID，因此除业务字段外还加入本响应数组 index 形成确定性哈希输入。
     const log: Record<string, string> = {
       kind: 'usage.org_event',
       org_id: this.orgId,
@@ -824,6 +839,7 @@ export class QoderApiInput {
     setIfPresent(log, 'model_tier', u.modelTier);
     setIfPresent(log, 'credits', u.credits);
     setIfPresent(log, 'cost', u.cost);
+    // index 仅区分同一响应内其他字段完全相同的两条记录；重试同一页时顺序稳定即可得到同一 ID。
     log.event_id = sha256([
       'usage.org_event',
       this.orgId,
@@ -1055,6 +1071,7 @@ export class QoderApiInput {
   ): Record<string, string>[] {
     const out: Record<string, string>[] = [];
     for (const it of ranking.items ?? []) {
+      // API 排名项是松散对象，成员身份字段先做 typeof 收窄，其他可选数值交给 setIfPresent。
       const log: Record<string, string> = {
         kind: 'code.stats_member_ranking',
         org_id: this.orgId,
@@ -1065,11 +1082,13 @@ export class QoderApiInput {
         report_ts: reportTs,
         raw_json: safeStringify(it),
       };
+      // 排名展示字段和代码贡献指标保持服务端口径，不在采集端重新计算 share rate。
       setIfPresent(log, 'display_name', it.displayName);
       setIfPresent(log, 'total_lines_added', it.totalLinesAdded);
       setIfPresent(log, 'ai_lines_added', it.aiLinesAdded);
       setIfPresent(log, 'ai_share_rate', it.aiShareRate);
       setIfPresent(log, 'commit_count', it.commitCount);
+      // 排名每日变化，因此成员 ID 与窗口结束日期共同组成快照身份。
       log.event_id = sha256([
         'code.stats_member_ranking',
         this.orgId,

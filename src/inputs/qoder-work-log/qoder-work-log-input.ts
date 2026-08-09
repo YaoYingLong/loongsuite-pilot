@@ -104,6 +104,7 @@ interface ActiveTurn {
  */
 export type SdkEvent =
   | {
+      /** SDK 进程初始化快照，为 session 保存订阅层级、cwd 和可用 Agent/工具。 */
       kind: 'system_init';
       ts: number;
       sessionId: string;
@@ -123,8 +124,10 @@ export type SdkEvent =
       compactModel: string;
       sceneModel: string;
     }
+  /** assistant message 开始；创建 ActiveTurn，但正文 block 尚未到达。 */
   | { kind: 'message_start'; ts: number; sessionId: string; messageId: string }
   | {
+      /** 新内容 block 的元数据；tool_use 在这里提供工具名和调用 ID。 */
       kind: 'block_start';
       ts: number;
       sessionId: string;
@@ -134,6 +137,7 @@ export type SdkEvent =
       toolId?: string;
     }
   | {
+      /** 流式增量片段；blockIndex 用于关联具体 thinking/text/tool input block。 */
       kind: 'delta';
       ts: number;
       sessionId: string;
@@ -141,9 +145,12 @@ export type SdkEvent =
       content: string;
       blockIndex?: number;
     }
+  /** assistant message 的结束元数据，包含 finish reason 和本 turn token。 */
   | { kind: 'message_delta'; ts: number; sessionId: string; stopReason: string; inputTokens: number; outputTokens: number }
+  /** 流式消息完全结束；触发当前 ActiveTurn 输出并清理。 */
   | { kind: 'message_stop'; ts: number; sessionId: string }
   | {
+      /** SDK session 级最终结果，用于生成 session 汇总事件。 */
       kind: 'result';
       ts: number;
       sessionId: string;
@@ -154,6 +161,7 @@ export type SdkEvent =
       numTurns: number;
       contextUsageRatio: number;
     }
+  /** Hook 侧补充的工具执行结果；通过 toolUseId 与先前 tool.call 配对。 */
   | { kind: 'post_tool_use'; ts: number; sessionId: string; toolUseId: string; toolName: string; toolResponse: string; transcriptPath: string };
 
 /**
@@ -635,6 +643,7 @@ export class QoderWorkLogInput extends BaseSessionInput {
 
     out.push(
       buildAgentActivityEntry({
+        // response 与前面的 request 共用 trace/turn/step，messageId 同时作为稳定 response ID。
         timestamp: turn.endTimestamp,
         'event.id': hashId([filePath, sessionId, turn.messageId, 'response']),
         'event.name': 'llm.response',
@@ -646,6 +655,7 @@ export class QoderWorkLogInput extends BaseSessionInput {
         'gen_ai.agent.type': this.agentType,
         'gen_ai.request.model': model,
         'gen_ai.response.model': model,
+        // SDK message_delta 提供本条消息 token；仅在数值有限时输出，总量由两项同时存在时求和。
         'gen_ai.usage.input_tokens': finiteNum(turn.inputTokens),
         'gen_ai.usage.output_tokens': finiteNum(turn.outputTokens),
         'gen_ai.usage.total_tokens': sumIfPresent(
@@ -654,6 +664,7 @@ export class QoderWorkLogInput extends BaseSessionInput {
         ),
         'gen_ai.response.finish_reasons': turn.stopReason ? [turn.stopReason] : undefined,
         attributes: {
+          // 工具数量和 session 快照属于 Qoder Work 私有诊断维度，不提升为公共字段。
           source: SOURCE,
           event_kind: 'response',
           message_id: turn.messageId,
@@ -668,6 +679,7 @@ export class QoderWorkLogInput extends BaseSessionInput {
       const tc = turn.toolCalls[i];
       out.push(
         buildAgentActivityEntry({
+          // 数组 index 加入 event.id，兼容同一 message 中极端情况下重复出现相同工具 ID。
           timestamp: turn.endTimestamp,
           'event.id': hashId([
             filePath,
@@ -686,6 +698,7 @@ export class QoderWorkLogInput extends BaseSessionInput {
           'gen_ai.agent.type': this.agentType,
           'gen_ai.request.model': model,
           'gen_ai.response.model': model,
+          // SDK 只暴露一个 tool ID，因此同时填 call.id 与 exec.id；参数因 delta 顺序不可靠而省略。
           'gen_ai.tool.name': tc.name,
           'gen_ai.tool.call.id': tc.id,
           'gen_ai.tool.call.exec.id': tc.id,

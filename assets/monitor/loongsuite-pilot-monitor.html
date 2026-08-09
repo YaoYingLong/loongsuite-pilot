@@ -456,6 +456,8 @@
   <div id="chart-tooltip" class="chart-tooltip"></div>
 
   <script>
+    // 本页没有打包器或前端框架：浏览器直接执行这段普通 JavaScript，并向同源 MonitorServer
+    // 请求只读 API。所有状态只存在于当前标签页，刷新页面即可完全重建，不会修改 Collector 配置。
     // 刷新周期、最多绘图点数和服务端指标查询窗口；均只影响本页展示。
     const DEFAULT_REFRESH_MS = 10000;
     const MAX_POINTS = 240;
@@ -517,6 +519,7 @@
         && Number(row.rss_kb) > 0);
     }
 
+    /** 从 CSV 行读取有限数字；缺列、空串、NaN 和 Infinity 都回退为 0，避免 Canvas 坐标变为 NaN。 */
     function number(row, key) {
       const value = Number(row[key]);
       return Number.isFinite(value) ? value : 0;
@@ -555,6 +558,7 @@
       return date.toLocaleString(undefined, { dateStyle: 'short', timeStyle: 'medium' });
     }
 
+    /** 更新错误提示条；使用 textContent 而非 innerHTML，服务端错误文本不会被当作 HTML 执行。 */
     function setNotice(message) {
       $('notice').textContent = message || '';
       $('notice').classList.toggle('show', Boolean(message));
@@ -601,6 +605,7 @@
       $('reporting-wording').textContent = overview.cache?.outputPartial
         ? `${overview.reporting.wording} Indexing local output logs; today's totals may still be catching up.`
         : overview.reporting.wording;
+      // 这些区域需要批量模板渲染，因此使用 innerHTML；所有来自 API 的文本均先 escapeHtml。
       $('reporting-channels').innerHTML = overview.reporting.channels.map((channel) => (
         `<span class="${badgeClass(channel.status)}">${escapeHtml(channel.label)}: ${escapeHtml(channel.message)}</span>`
       )).join('');
@@ -783,6 +788,7 @@
         ]);
         if (!overviewResponse.ok) throw new Error(`overview request failed: ${overviewResponse.status}`);
         state.overview = await overviewResponse.json();
+        // 两个可选接口失败时保留上一轮图表；overview 是页面主数据，失败则进入统一 catch。
         if (csvResponse.ok) state.rows = parseCsv(await csvResponse.text());
         if (metricsStatusResponse.ok) state.metricsStatus = await metricsStatusResponse.json();
         renderOverview(state.overview);
@@ -798,6 +804,7 @@
     /** 清除旧 timer 后启动新周期，防止多次 change 叠加并发刷新。 */
     function startRefreshTimer() {
       if (state.refreshTimer) clearInterval(state.refreshTimer);
+      // setInterval 不等待上一次 Promise 完成；本地接口通常远快于最短刷新周期，当前未设置请求互斥。
       state.refreshTimer = setInterval(refresh, state.refreshMs);
     }
 
@@ -862,6 +869,7 @@
     }
 
     // 页面初始化顺序：先注册监听，再立即刷新一次，最后开启周期 timer。
+    // resize 只重绘现有内存数据，不重新请求网络；Canvas backing store 会在 drawChart 中按新尺寸重建。
     window.addEventListener('resize', renderCharts);
     setupChartTooltips();
     setupRefreshSelect();

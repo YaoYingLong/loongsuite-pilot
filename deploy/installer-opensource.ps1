@@ -56,7 +56,9 @@ param(
     [switch]$Purge
 )
 
+# 把非终止错误提升为终止异常，使 try/finally 能统一清理；调用外部 exe 时仍需检查 `$LASTEXITCODE`。
 $ErrorActionPreference = "Stop"
+# Windows PowerShell 5.1 默认控制台编码可能不是 UTF-8，显式设置后中英文提示才不会乱码。
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 # ============================================================
@@ -98,6 +100,7 @@ if ($MaskTypes -and $MaskMode -ne "custom") {
 # 解析显式版本或 latest 对应的发布包 URL。
 # ============================================================
 if (-not $PackageUrl) {
+    # -Version 只决定下载 URL；最终版本目录名仍来自压缩包内 VERSION。
     if ($Version) {
         $PackageUrl = "$_OSS_BASE_URL/$Version/$PACKAGE_NAME.zip"
     } else {
@@ -135,6 +138,7 @@ function Test-NodeSuitable {
     param([string]$bin)
     if (-not (Test-Path $bin)) { return $false }
     try {
+        # `&` 是 PowerShell 调用运算符；`2>$null` 只隐藏候选探测错误，不隐藏最终依赖错误。
         $ver = & $bin --version 2>$null
         if (-not $ver) { return $false }
         $major = [int]($ver -replace '^v','').Split('.')[0]
@@ -178,6 +182,7 @@ function Resolve-Node {
     $pathNode = Get-Command node -ErrorAction SilentlyContinue
     if ($pathNode) { $candidates += $pathNode.Source }
 
+    # 数组顺序就是优先级；不去重不会改变结果，只可能对同一路径重复执行一次 --version。
     foreach ($c in $candidates) {
         if (Test-NodeSuitable $c) {
             return $c
@@ -202,6 +207,7 @@ function Check-Deps {
         exit 1
     }
 
+    # 外部 Node 的 stderr/exit code 不应被 Stop 自动包装成 PowerShell 异常，暂时切为 Continue 后再恢复。
     $prevEAP = $ErrorActionPreference; $ErrorActionPreference = "Continue"
     $nodeMajor = & $script:NODE_BIN -e "process.stdout.write(String(process.versions.node.split('.')[0]))"
     $ErrorActionPreference = $prevEAP
@@ -213,6 +219,7 @@ function Check-Deps {
 
     # 固定 Node 绝对路径，供 Hook 和后台任务复用。
     if (-not (Test-Path $DataDir)) { New-Item -ItemType Directory -Path $DataDir -Force | Out-Null }
+    # pin 文件供 Scheduled Task 使用，避免后台任务拿到与安装终端不同的 PATH。
     Set-Content -Path (Join-Path $DataDir "node-bin") -Value $script:NODE_BIN
 
     # 从同一 Node 安装目录解析 npm，避免 PATH 指向另一版本。
@@ -245,6 +252,7 @@ $script:INSTALL_SRC = ""
 
 # 下载或复制 zip 到临时目录，Expand-Archive 后定位 package.json 所在包根。
 function Download-AndExtract {
+    # Get-Random 降低并行安装临时目录冲突概率；目录在 Cmd-* 的 finally 中清理。
     $tmpDir = Join-Path $env:TEMP "loongsuite-pilot-install-$(Get-Random)"
     New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
     $script:TMP_DIR = $tmpDir
@@ -254,6 +262,7 @@ function Download-AndExtract {
     Msg "==> 下载安装包: $PackageUrl" "==> Downloading: $PackageUrl"
 
     try {
+        # Windows PowerShell 5.1 某些系统默认 TLS 版本较旧，下载前强制允许 TLS 1.2。
         [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
         Invoke-WebRequest -Uri $PackageUrl -OutFile $archivePath -UseBasicParsing
     } catch {
@@ -278,6 +287,7 @@ function Download-AndExtract {
     } elseif (Test-Path (Join-Path $tmpDir "package.json")) {
         $script:INSTALL_SRC = $tmpDir
     } else {
+        # 标准顶层布局均未命中时，最多向下两层寻找首个 package.json 作为兼容回退。
         $found = Get-ChildItem $tmpDir -Recurse -Depth 2 -Filter "package.json" -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($found) {
             $script:INSTALL_SRC = $found.DirectoryName
@@ -299,11 +309,13 @@ $script:PROBE_RESULT = "[]"
 function Probe-Agents {
     Msg "==> 探测 AI Agent..." "==> Probing AI Agents..."
     $probeScript = Join-Path $script:INSTALL_SRC "dist\cli-probe.cjs"
+    # 探测是可降级步骤：失败恢复 `[]`，安装本体仍可完成。
     $prevEAP = $ErrorActionPreference; $ErrorActionPreference = "Continue"
     if (Test-Path $probeScript) {
         try {
             $raw = & $script:NODE_BIN $probeScript 2>$null
             if ($raw) {
+                # PowerShell 会把多行 stdout 变成字符串数组；无分隔 join 还原 cli-probe 的 JSON 文本。
                 $script:PROBE_RESULT = if ($raw -is [array]) { $raw -join "" } else { $raw }
             }
         } catch {
@@ -337,6 +349,7 @@ function Select-Agents {
     if (-not $agentCount -or $agentCount -eq "0") { return }
 
     # 非交互模式使用探测结果或显式列表。
+    # CI/计划任务可能没有 RawUI，即使进程标记 UserInteractive 也不能调用 Read-Host。
     $isInteractive = [Environment]::UserInteractive -and $Host.UI.RawUI -ne $null
     if (-not $isInteractive) {
         $prevEAP = $ErrorActionPreference; $ErrorActionPreference = "Continue"
@@ -511,13 +524,15 @@ function Deploy-BootstrapScripts {
     $srcDir = Join-Path $script:PERMANENT_DIR "scripts"
     $bootDir = Join-Path $env:USERPROFILE ".loongsuite-pilot\bin"
     if (-not (Test-Path $bootDir)) { New-Item -ItemType Directory -Path $bootDir -Force | Out-Null }
+    # Windows 开源包当前只复制 Collector daemon；Updater 是否存在/注册由后续 CLI 单独判断。
     Copy-Item (Join-Path $srcDir "collector-daemon.js") $bootDir -Force
 }
 
 # ============================================================
 # 部署包到不可变 versions 目录
 # ============================================================
-# 复制到不可变 versions 目录、安装生产依赖并原子更新 current/previous。
+# 复制到 versions 目录并安装生产依赖，然后更新 current/previous。
+# 当前实现会删除同名目标并用 Set-Content 直接写指针，不是严格不可变目录或原子指针替换。
 function Deploy-Package {
     param([string]$src)
     $cacheDir = Join-Path $env:USERPROFILE ".loongsuite-pilot"
@@ -539,6 +554,7 @@ function Deploy-Package {
         $dirName = "${ver}_${commit}"
         $target = Join-Path $versionsDir $dirName
 
+        # previous 在复制新包前写入；后续复制/npm 失败时 install 不会自动恢复，upgrade 依赖健康检查回滚。
         if (Test-Path $currentFile) {
             $oldDir = (Get-Content $currentFile -ErrorAction SilentlyContinue).Trim()
             if ($oldDir -and $oldDir -ne $dirName) {
@@ -548,6 +564,7 @@ function Deploy-Package {
 
         Msg "==> 部署到 $target ..." "==> Deploying to $target ..."
         if (-not (Test-Path $versionsDir)) { New-Item -ItemType Directory -Path $versionsDir -Force | Out-Null }
+        # 相同 version+commit 重装会先移除旧目录，因此中途失败可能留下目标缺失/不完整。
         if (Test-Path $target) { Remove-Item $target -Recurse -Force }
         Copy-Item $src $target -Recurse
 
@@ -563,15 +580,18 @@ function Deploy-Package {
     Msg "    ✅ 部署完成" "    ✅ Deployed"
     Write-Host ""
 
+    # current 已经切换；以下 npm/postinstall 是部署完成前仍可能失败的步骤。
     Deploy-BootstrapScripts
 
     Msg "==> 安装依赖..." "==> Installing dependencies..."
     $nodeDir = Split-Path $script:NODE_BIN
     $savedPath = $env:PATH
     if ($env:PATH -notlike "*$nodeDir*") { $env:PATH = "$nodeDir;$env:PATH" }
+    # Push/Pop-Location 将 npm 工作目录限制在版本目录；finally 也恢复临时修改的 PATH。
     Push-Location $script:PERMANENT_DIR
     try {
         $prevEAP = $ErrorActionPreference; $ErrorActionPreference = "Continue"
+        # 管道只展示 npm 最后一行；外部程序是否成功必须从紧随其后的 `$LASTEXITCODE` 读取。
         & $script:NPM_BIN install --omit=dev --omit=optional 2>&1 | Select-Object -Last 1
         $npmExit = $LASTEXITCODE
         $ErrorActionPreference = $prevEAP
@@ -591,6 +611,7 @@ function Deploy-Package {
     # `$DataDir` 参数不会自动写入子进程环境变量 LOONGSUITE_PILOT_DATA_DIR。
     # 因此自定义 -DataDir 时，postinstall 的 Hook/Plugin/Skill 实际落点需后续核实；
     # 未确认前不能假定它与 config.json 中 dataDir 一致。
+    # 待确认：自定义 -DataDir 未导出为 LOONGSUITE_PILOT_DATA_DIR，postinstall 可能仍写默认数据根。
     if (Test-Path $postinstallScript) {
         $prevEAP = $ErrorActionPreference; $ErrorActionPreference = "Continue"
         & $script:NODE_BIN $postinstallScript
@@ -640,7 +661,8 @@ function Migrate-LegacyLayout {
 # ============================================================
 # 合并并写入 config.json
 # ============================================================
-# 合并旧 config.json 与本次参数，通过临时文件原子替换并保留未涉及字段。
+# 合并旧 config.json 与本次参数并保留未涉及字段。
+# 参数通过临时 JSON 安全传给 Node，但最终 config.json 由 writeFileSync 直接覆盖，并非原子 rename。
 function Write-Config {
     $configFile = Join-Path $DataDir "config.json"
     Msg "==> 写入配置文件 $configFile ..." "==> Writing config to $configFile ..."
@@ -668,10 +690,13 @@ function Write-Config {
         maskTypes         = "$MaskTypes"
         probeResult       = "$($script:PROBE_RESULT)"
     }
+    # 结构化 JSON 传参避免把用户值直接插入 JavaScript 源码，从而正确保留引号和反斜杠。
     $cfgJson = $cfgArgs | ConvertTo-Json -Compress
     $cfgTmp = Join-Path $env:TEMP "lp-config-args.json"
     [System.IO.File]::WriteAllText($cfgTmp, $cfgJson, [System.Text.UTF8Encoding]::new($false))
 
+    # Here-string 使用单引号分隔符，内部 `$` 不被 PowerShell 展开；cfgTmp 路径作为 argv 传入。
+    # 内嵌 Node 只把精确字符串 `true` 写成布尔 true，其他非空值（包括 `1`）会写 false。
     $prevEAP = $ErrorActionPreference; $ErrorActionPreference = "Continue"
     & $script:NODE_BIN -e @'
 const fs = require('fs');
@@ -1170,6 +1195,7 @@ function Cmd-Install {
 
     Stop-PilotService
 
+    # finally 只保证下载临时目录被删除，不会回滚已经复制的版本、配置或命令入口。
     try {
         Download-AndExtract
         Probe-Agents
@@ -1183,6 +1209,7 @@ function Cmd-Install {
         Msg "==> 启动服务..." "==> Starting service..."
         $ps1Path = Join-Path $env:USERPROFILE ".local\bin\loongsuite-pilot.ps1"
         if (Test-Path $ps1Path) {
+            # start/status 非零不应跳过 finally；暂时降级为 Continue，再以固定状态文本判断健康。
             $prevEAP = $ErrorActionPreference; $ErrorActionPreference = "Continue"
             & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ps1Path start 2>$null
             Start-Sleep -Seconds 2
@@ -1233,6 +1260,7 @@ function Cmd-Upgrade {
         $newCommit = Get-CommitFromDir $script:INSTALL_SRC
         $oldCommit = Get-CommitFromDir $script:PERMANENT_DIR
 
+        # 版本号和 commit 均相同才短路；相同版本的新 commit 仍执行升级。
         if ($newVer -and $newVer -eq $oldVer -and $newCommit -eq $oldCommit) {
             Msg "✅ 已是最新版本 v${newVer} (${newCommit})，无需升级" `
                 "✅ Already at latest version v${newVer} (${newCommit}), nothing to do"
@@ -1273,6 +1301,7 @@ function Cmd-Upgrade {
             if (Test-Path $ps1Path) {
                 $prevEAP = $ErrorActionPreference; $ErrorActionPreference = "Continue"
                 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ps1Path stop 2>$null
+                # rollback 的退出码当前未检查，后面的“已回滚”提示不构成成功证明，应再用 status/info 复核。
                 & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $ps1Path rollback 2>$null
                 $ErrorActionPreference = $prevEAP
             }
@@ -1346,6 +1375,7 @@ function Cmd-Uninstall {
     Remove-PiCodingAgentExtension
     Write-Host ""
 
+    # DataDir 位于默认安装根之外时，本分支才体现 -Purge 与非 Purge 的实际差别。
     if ($Purge) {
         Msg "==> 删除数据目录 (-Purge)..." "==> Removing data directory (-Purge)..."
         if (Test-Path $DataDir) { Remove-Item $DataDir -Recurse -Force }

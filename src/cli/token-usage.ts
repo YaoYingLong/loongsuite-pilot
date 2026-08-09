@@ -8,104 +8,175 @@
  */
 
 
+// `node:path` 只负责跨平台拼接数据目录；本命令不会创建或修改这些路径。
 import * as path from 'node:path';
+// 使用 Promise 版文件 API，便于同时读取摘要和运行状态，避免两次磁盘等待串行叠加。
 import { readFile } from 'node:fs/promises';
+// 复用项目的宽容 JSON 读取和 `~` 展开规则，使 CLI 与 Collector 解析同一数据目录。
 import { readJsonFile, resolveHome } from '../utils/fs-utils.js';
 
 /** CLI 支持的三个聚合区间，与 MetricsSummary.ranges key 一致。 */
 export type MetricsRange = 'today' | 'sevenDays' | 'thirtyDays';
 
+/** 带比例的排行项基类；`share` 是 0..1 的小数，渲染前还会再次做边界收敛。 */
 export interface ShareEntry {
+  /** 当前项占所在统计维度总量的比例；旧摘要可能缺失，所以是可选字段。 */
   share?: number;
 }
 
+/** 单模型 token 排行项，由状态栏摘要写入器预先聚合。 */
 export interface ModelShareEntry extends ShareEntry {
+  /** 上游模型标识；缺失时界面显示 unknown。 */
   model?: string;
+  /** 该模型输入与输出 token 的合计。 */
   totalTokens?: number;
+  /** 该模型累计输入 token。 */
   inputTokens?: number;
+  /** 输入中命中缓存的 token 数，用于排行后的补充说明。 */
   cacheReadTokens?: number;
 }
 
+/** 单 Agent 产品的会话、事件与 token 排行项。 */
 export interface AgentShareEntry extends ShareEntry {
+  /** Agent ID，例如 codex 或 claude-code。 */
   agentType?: string;
+  /** 选定日期区间内出现的去重会话数。 */
   sessions?: number;
+  /** 选定日期区间内的 canonical 事件数。 */
   events?: number;
+  /** 该 Agent 归属的 token 总量。 */
   tokens?: number;
 }
 
+/** 单模型服务商的 token 排行项。 */
 export interface ProviderShareEntry extends ShareEntry {
+  /** Provider 名称，例如 openai 或 anthropic。 */
   provider?: string;
+  /** 该 Provider 在区间内的 token 总量。 */
   totalTokens?: number;
 }
 
+/** 单 Git 仓库的活动排行；当前摘要不计算 token 占比。 */
 export interface RepoShareEntry {
+  /** 规范化后的仓库名；无法推断时可能缺失。 */
   repo?: string;
+  /** 仓库内出现的去重会话数。 */
   sessions?: number;
+  /** 仓库关联的 canonical 事件数。 */
   events?: number;
 }
 
+/** 日趋势中的一个自然日数据点。 */
 export interface DailyPoint {
+  /** 本地日期字符串，通常为 YYYY-MM-DD。 */
   day?: string;
+  /** 该日的 token 数或 session 数，取决于所属数组。 */
   value?: number;
 }
 
+/** 一个时间范围内的完整聚合结果；字段可选用于兼容旧版或部分生成的摘要。 */
 export interface RangeData {
+  /** 输入 token 与输出 token 的合计口径。 */
   totalTokens?: number;
+  /** 模型请求累计输入 token。 */
   inputTokens?: number;
+  /** 模型响应累计输出 token。 */
   outputTokens?: number;
+  /** 输入 token 中由 Provider 报告为缓存读取的数量。 */
   cacheReadTokens?: number;
+  /** Provider 报告的缓存创建/写入 token 数。 */
   cacheCreationTokens?: number;
+  /** 区间内去重后的 session 数。 */
   totalSessions?: number;
+  /** `llm.request` 事件数，并非 HTTP 请求数。 */
   totalRequests?: number;
+  /** `tool.call` 事件数；一次调用及其结果不会计为两次。 */
   totalToolCalls?: number;
+  /** 区间内读取到的全部 canonical 事件数。 */
   totalEvents?: number;
+  /** 按 token 降序的模型占比列表。 */
   modelShares?: ModelShareEntry[];
+  /** 按 token/活动量聚合的 Agent 列表。 */
   agentShares?: AgentShareEntry[];
+  /** 按 token 聚合的 Provider 列表。 */
   providerShares?: ProviderShareEntry[];
+  /** 按事件数聚合的仓库列表。 */
   repoShares?: RepoShareEntry[];
 }
 
+/** `logs/metrics-summary.json` 的只读兼容视图。 */
 export interface MetricsSummary {
+  /** 摘要文件 Schema 版本，而非 Pilot 软件版本。 */
   version?: number;
+  /** 摘要最后生成时间的 ISO 字符串。 */
   generatedAt?: string;
+  /** 生成摘要的 Pilot 包版本。 */
   packageVersion?: string;
+  /** today/sevenDays/thirtyDays 中可能只存在部分范围。 */
   ranges?: Partial<Record<MetricsRange, RangeData>>;
+  /** 每日 token 趋势，渲染时按所选范围截取尾部 7 或 30 项。 */
   dailyTokens?: DailyPoint[];
+  /** 每日 session 趋势，通过 day 与 dailyTokens 对齐。 */
   dailySessions?: DailyPoint[];
 }
 
+/** `logs/runtime.json` 中本命令实际使用的最小字段集合。 */
 export interface RuntimeRecord {
+  /** RuntimeWriter 写入的生命周期状态；只有 active 才继续验证 PID。 */
   status?: string;
+  /** 当前 Collector 包版本。 */
   packageVersion?: string;
+  /** Collector 进程号；还需通过 signal 0 验证，不能只信任文件。 */
   pid?: number;
+  /** RuntimeWriter 最近一次心跳时间。 */
   updatedAt?: string;
 }
 
+/** 用户 config.json 中用于定位真实数据目录的最小结构。 */
 interface ConfigFile {
+  /** Collector 实际使用的数据根目录，可包含开头的 `~`。 */
   dataDir?: string;
 }
 
+/** 参数解析完成后供读取与渲染阶段使用的选项。 */
 export interface TokenUsageOptions {
+  /** 展示的聚合区间，默认 today。 */
   range: MetricsRange;
+  /** 显式覆盖的数据根目录；缺失时再读取环境变量和 config.json。 */
   dataDir?: string;
+  /** 是否输出 ANSI SGR 控制码。 */
   color: boolean;
+  /** 是否只输出帮助；为 true 时不会读取任何文件。 */
   help: boolean;
 }
 
+/** 文件读取阶段产生的纯数据视图，渲染函数不会再做 I/O。 */
 export interface TokenUsageViewData {
+  /** 展开 `~` 后最终采用的数据根目录。 */
   dataDir: string;
+  /** 便于诊断和测试保留的摘要绝对/平台路径。 */
   summaryPath: string;
+  /** 便于诊断和测试保留的 runtime 文件路径。 */
   runtimePath: string;
+  /** 成功解析的指标摘要；文件缺失或损坏时为 null。 */
   summary: MetricsSummary | null;
+  /** 成功解析的运行状态；文件缺失或损坏时为 null。 */
   runtime: RuntimeRecord | null;
+  /** runtime.status、PID 格式和操作系统存活探测共同得出的实时结论。 */
   runtimeAlive: boolean;
+  /** 摘要读取失败的用户可读类别，不暴露本地路径和底层异常细节。 */
   summaryError?: string;
+  /** runtime 读取失败的用户可读类别。 */
   runtimeError?: string;
+  /** 在读取结束时捕获的当前时间；可由测试固定，保证渲染稳定。 */
   now: Date;
 }
 
+/** 参数解析结果；发现首个错误时保留此前已解析选项并设置 error。 */
 export interface ParseResult {
+  /** 即使有错误也始终存在，调用方无需判空。 */
   options: TokenUsageOptions;
+  /** 缺失值、非法范围或未知选项的英文 CLI 错误文本。 */
   error?: string;
 }
 
@@ -134,19 +205,23 @@ export function parseTokenUsageArgs(
   env: NodeJS.ProcessEnv = process.env,
   isTTY = Boolean(process.stdout.isTTY),
 ): ParseResult {
+  // 默认只展示今日数据；颜色同时受 TTY 与 NO_COLOR 通用约定控制。
   const options: TokenUsageOptions = {
     range: 'today',
     color: isTTY && env.NO_COLOR === undefined,
     help: false,
   };
 
+  // 使用索引循环是因为 `--range value` 和 `--data-dir value` 需要额外消费下一项。
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
+    // help 只设置标记，仍继续扫描，以便解析结果保持确定；主流程稍后优先输出帮助。
     if (arg === '--help' || arg === '-h' || arg === 'help') {
       options.help = true;
       continue;
     }
     if (arg === '--once') {
+      // 历史版本可能支持持续刷新；当前命令固定单次运行，保留参数只为脚本兼容。
       continue;
     }
     if (arg === '--no-color') {
@@ -166,12 +241,14 @@ export function parseTokenUsageArgs(
       continue;
     }
     if (arg.startsWith('--range=')) {
+      // `slice` 只取等号后的值，再统一交给别名解析器处理。
       const range = parseRangeValue(arg.slice('--range='.length));
       if (!range) return { options, error: `Invalid range: ${arg.slice('--range='.length)}` };
       options.range = range;
       continue;
     }
     if (arg === '--range') {
+      // 前置递增让下一轮循环跳过已经作为 value 使用的参数。
       const value = args[++i];
       const range = parseRangeValue(value);
       if (!range) return { options, error: `Invalid range: ${value ?? ''}` };
@@ -183,6 +260,7 @@ export function parseTokenUsageArgs(
       continue;
     }
     if (arg === '--data-dir') {
+      // 与 range 一样消费后一项；空字符串或已到数组末尾都视为缺值。
       const value = args[++i];
       if (!value) return { options, error: 'Missing value for --data-dir' };
       options.dataDir = value;
@@ -199,17 +277,21 @@ export function parseTokenUsageArgs(
  * @returns 建议进程退出码；不直接 process.exit，主入口负责设置 exitCode。
  */
 export async function runTokenUsageCommand(args: string[] = process.argv.slice(3)): Promise<number> {
+  // `slice(3)` 跳过 node、入口脚本和 token-usage 子命令本身。
   const parsed = parseTokenUsageArgs(args);
   if (parsed.error) {
+    // 参数错误写 stderr，供 shell 管道区分正常报表输出；返回 1 但不强制终止进程。
     process.stderr.write(`${parsed.error}\n\n${renderHelp()}\n`);
     return 1;
   }
   if (parsed.options.help) {
+    // 帮助属于成功路径，只写 stdout 且不访问磁盘。
     process.stdout.write(`${renderHelp()}\n`);
     return 0;
   }
 
   const options = parsed.options;
+  // 文件错误被 loadViewData 收敛为 null/error，所以这里通常不会因摘要缺失而 reject。
   const data = await loadViewData(options);
   process.stdout.write(`${renderTokenUsage(data, options, terminalWidth())}\n`);
   return data.summary ? 0 : 1;
@@ -236,7 +318,9 @@ export function renderHelp(): string {
  * dataDir 优先级：显式参数 > LOONGSUITE_PILOT_DATA_DIR > 指定/默认 config.json > 默认目录。
  */
 export async function resolveTokenUsageDataDir(explicitDataDir?: string): Promise<string> {
+  // 命令行显式值拥有最高优先级，适合临时查看另一套安装目录。
   if (explicitDataDir) return resolveHome(explicitDataDir);
+  // 服务脚本通常设置该变量，因此 CLI 与正在运行的 Collector 会自然指向同一目录。
   if (process.env.LOONGSUITE_PILOT_DATA_DIR) {
     return resolveHome(process.env.LOONGSUITE_PILOT_DATA_DIR);
   }
@@ -245,6 +329,7 @@ export async function resolveTokenUsageDataDir(explicitDataDir?: string): Promis
     process.env.AGENT_DATA_COLLECTION_CONFIG ?? path.join(DEFAULT_DATA_DIR, 'config.json'),
   );
   const config = await readJsonFile<ConfigFile>(configPath);
+  // readJsonFile 对缺失/坏 JSON 返回 null；CLI 因此可安全回退标准目录。
   return resolveHome(config?.dataDir ?? DEFAULT_DATA_DIR);
 }
 
@@ -257,11 +342,13 @@ export async function loadViewData(options: TokenUsageOptions): Promise<TokenUsa
   const summaryPath = path.join(dataDir, 'logs', 'metrics-summary.json');
   const runtimePath = path.join(dataDir, 'logs', 'runtime.json');
 
+  // 两个文件互不依赖，用 Promise.all 并行读取；各 Promise 自己捕获错误，不会相互取消。
   const [summaryResult, runtimeResult] = await Promise.all([
     readJsonWithError<MetricsSummary>(summaryPath),
     readJsonWithError<RuntimeRecord>(runtimePath),
   ]);
 
+  // runtime.json 可能是上次异常退出遗留，必须再向操作系统验证 PID。
   const runtimeAlive = runtimeResult.data ? isRuntimeAlive(runtimeResult.data) : false;
 
   return {
@@ -287,11 +374,13 @@ export function renderTokenUsage(
   width = 100,
 ): string {
   const color = makeColor(options.color);
+  // 缺少所选 range 时使用空对象，使所有 KPI 按 0 展示而不是中断整个报表。
   const rangeData = data.summary?.ranges?.[options.range] ?? {};
   const generatedAt = formatDateTime(data.summary?.generatedAt);
   const runtimeUpdated = formatDateTime(data.runtime?.updatedAt);
   const serviceState = formatServiceState(data, color);
   const heading = `${color.bold('LoongSuite Pilot Token Usage')}  ${serviceState}`;
+  // 先分别构造元信息行，后续 trimLines 会统一处理宽度与尾空格。
   const rangeLine = [
     `Range ${RANGE_LABELS[options.range]}`,
     `Generated ${generatedAt ?? data.summaryError ?? 'not found'}`,
@@ -310,11 +399,13 @@ export function renderTokenUsage(
   ];
 
   if (!data.summary) {
+    // 摘要是报表主体；runtime 单独存在不足以生成 KPI，因此提前返回可操作的空状态。
     lines.push(color.yellow('No metrics summary found yet.'));
     lines.push('Start loongsuite-pilot and wait for the metrics summary writer to refresh.');
     return trimLines(lines, width);
   }
 
+  // 各 section 返回字符串或字符串数组，这里只负责固定展示顺序和空行分隔。
   lines.push(...renderKpis(rangeData, color));
   lines.push('');
   lines.push(renderTokenBreakdown(rangeData, width, color));
@@ -369,6 +460,7 @@ function parseRangeValue(value: string | undefined): MetricsRange | null {
 async function readJsonWithError<T>(filePath: string): Promise<{ data: T | null; error?: string }> {
   try {
     const raw = await readFile(filePath, 'utf8');
+    // JSON.parse 的 SyntaxError 与读取错误都由下方 catch 转成稳定类别，不向 CLI 顶层传播。
     return { data: JSON.parse(raw) as T };
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
@@ -382,6 +474,7 @@ function isRuntimeAlive(runtime: RuntimeRecord): boolean {
   if (runtime.status !== 'active') return false;
   if (!runtime.pid || runtime.pid <= 0) return false;
   try {
+    // signal 0 不终止进程，只让内核检查 PID 是否存在以及当前用户是否有权访问。
     process.kill(runtime.pid, 0);
     return true;
   } catch {
@@ -391,6 +484,7 @@ function isRuntimeAlive(runtime: RuntimeRecord): boolean {
 
 /** 将八个核心 KPI 排成两组四列。 */
 function renderKpis(rangeData: RangeData, color: ReturnType<typeof makeColor>): string[] {
+  // 颜色函数与值一起保存，方便 Input/Output 等普通指标保持默认颜色。
   const cells = [
     { label: 'Tokens', value: compactNumber(rangeData.totalTokens ?? 0), paint: color.cyan },
     { label: 'Input', value: compactNumber(rangeData.inputTokens ?? 0), paint: color.normal },
@@ -404,6 +498,7 @@ function renderKpis(rangeData: RangeData, color: ReturnType<typeof makeColor>): 
 
   const width = 12;
   const rows: string[] = [color.bold('Summary')];
+  // 每四项输出一行标签和一行值，固定宽度确保上下列对齐。
   for (let i = 0; i < cells.length; i += 4) {
     const row = cells.slice(i, i + 4);
     rows.push(`  ${row.map(cell => color.dim(padRight(cell.label, width))).join('  ')}`);

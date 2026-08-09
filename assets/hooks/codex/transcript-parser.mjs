@@ -61,11 +61,17 @@ import fs from 'node:fs';
 
 const MAX_TRANSCRIPT_READ_BYTES = 50 * 1024 * 1024; // 单次最多读取 50 MB。
 
+/**
+ * 尝试把 transcript 中以字符串保存的 arguments/output 还原为 JSON。
+ * Codex 不同事件版本有时给对象、有时给 JSON 字符串；解析失败时保留原文本，不能因单个
+ * 工具参数格式异常而丢弃整个 turn。
+ */
 function parseMaybeJsonValue(value) {
   if (typeof value !== 'string') return value ?? null;
   try { return JSON.parse(value); } catch { return value; }
 }
 
+/** 把 message 的字符串或 content block 数组拼成纯文本，未知 block 会被忽略。 */
 function extractMessageContentText(content) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return '';
@@ -80,6 +86,10 @@ function extractMessageContentText(content) {
   return parts.filter(Boolean).join('\n');
 }
 
+/**
+ * 把非 assistant 的 response_item:message 转成标准输入消息。
+ * assistant 消息由上层的 agentMessages/response 路径处理，这里排除它是为避免输出回流到输入。
+ */
 function transcriptMessageToInputMessage(payload) {
   const role = typeof payload?.role === 'string' ? payload.role : '';
   if (!role || role === 'assistant') return null;
@@ -88,11 +98,13 @@ function transcriptMessageToInputMessage(payload) {
   return { role, parts: [{ type: 'text', content }] };
 }
 
+/** Codex 写 ISO 时间，Hook 内部工具事件使用秒；非法时间返回 0 交由调用方采用回退值。 */
 function entryTimestampSeconds(entry) {
   const ms = Date.parse(entry?.timestamp || '');
   return Number.isFinite(ms) ? ms / 1000 : 0;
 }
 
+/** 把 session_meta.dynamic_tools 转成 GenAI function definition；无名称的定义不可调用，直接跳过。 */
 function mapDynamicTool(t) {
   const rawName = typeof t.name === 'string' ? t.name : '';
   if (!rawName) return null;
@@ -105,6 +117,10 @@ function mapDynamicTool(t) {
   };
 }
 
+/**
+ * 将 Codex 的 snake_case token 统计复制为内部 camelCase 结构。
+ * Number 与 `|| 0` 同时兼容数字、数字字符串及字段缺失；这里不计算 total，保留源端口径。
+ */
 function parseTokenUsage(raw) {
   return {
     inputTokens: Number(raw['input_tokens'] || 0),
@@ -140,6 +156,7 @@ function tokenUsageEqual(a, b) {
  * @returns {TranscriptData|null}
  */
 export function parseTranscript(transcriptPath, byteOffset = 0, initialLastUsage = null) {
+  // Hook 属于旁路采集：路径缺失或文件尚未创建时返回 null，让调用方安静退出而不是打断 Codex。
   if (!transcriptPath || !fs.existsSync(transcriptPath)) return null;
 
   let content;
@@ -149,6 +166,7 @@ export function parseTranscript(transcriptPath, byteOffset = 0, initialLastUsage
     fileSize = stat.size;
 
     if (byteOffset >= fileSize) {
+      // offset 恰好位于 EOF 表示“没有新增事件”。仍返回完整空结果，以便调用方保留去重锚点。
       return {
         model: 'unknown',
         modelProvider: 'openai',
@@ -162,6 +180,7 @@ export function parseTranscript(transcriptPath, byteOffset = 0, initialLastUsage
       };
     }
 
+    // 负 offset 没有文件语义，收敛到文件开头；上限保护 Hook 不会一次同步读入超大 session。
     const readFrom = Math.max(byteOffset, 0);
     const rawLen = fileSize - readFrom;
     const readLen = Math.min(rawLen, MAX_TRANSCRIPT_READ_BYTES);
@@ -169,6 +188,7 @@ export function parseTranscript(transcriptPath, byteOffset = 0, initialLastUsage
       process.stderr.write(`[codex-transcript-parser] transcript ${transcriptPath} truncated: ${rawLen} bytes > ${MAX_TRANSCRIPT_READ_BYTES} limit\n`);
     }
     if (readFrom > 0) {
+      // 增量路径必须按“字节”定位，不能先转字符串再 slice：UTF-8 中文字符占多个字节。
       const fd = fs.openSync(transcriptPath, 'r');
       try {
         const buf = Buffer.alloc(readLen);
@@ -178,12 +198,14 @@ export function parseTranscript(transcriptPath, byteOffset = 0, initialLastUsage
         fs.closeSync(fd);
       }
     } else {
+      // 首次读取无需显式 fd，但同样应用 50MB 上限，与增量路径的资源边界保持一致。
       content = fs.readFileSync(transcriptPath, 'utf-8').slice(0, MAX_TRANSCRIPT_READ_BYTES);
     }
   } catch (err) {
     throw new Error(`[codex-transcript-parser] failed to read ${transcriptPath}: ${err?.message || err}`);
   }
 
+  // 下列聚合器只存在于本次调用；跨调用状态仅由 byteOffset/initialLastUsage 显式传入。
   let model = 'unknown';
   let modelProvider = 'openai';
   /** @type {TokenUsage[]} */
@@ -200,6 +222,7 @@ export function parseTranscript(transcriptPath, byteOffset = 0, initialLastUsage
   // tool 事件提取（从 response_item:function_call/function_call_output）
   /** @type {ToolEvent[]} */
   const toolEvents = [];
+  // call_id 将 function_call 与稍后到达的 output 配对；结果到达后立即删除，控制 Map 生命周期。
   const pendingToolCalls = new Map();
 
   // agent_message 事件提取（从 event_msg:agent_message）— 模型的推理/评论文本
@@ -235,6 +258,7 @@ export function parseTranscript(transcriptPath, byteOffset = 0, initialLastUsage
   // 用搜索前最后一个非 web_search 事件的时间戳近似搜索发起时刻，
   // 使 tool.call 与 tool.result 有合理的时间差（duration > 0）。
   let lastNonWebSearchTs = 0;
+  // JSONL 每行互相独立。损坏行或写到一半的尾行会被忽略，不能让一条坏记录使整次 Stop 失败。
   for (const line of content.split('\n')) {
     lineIndex++;
     const trimmed = line.trim();
@@ -259,6 +283,7 @@ export function parseTranscript(transcriptPath, byteOffset = 0, initialLastUsage
     }
 
     if (entryType === 'session_meta') {
+      // session_meta 提供跨 turn 的模型提供方、基础指令和动态工具定义。
       if (typeof payload.model_provider === 'string' && payload.model_provider) {
         modelProvider = payload.model_provider;
       }
@@ -278,6 +303,7 @@ export function parseTranscript(transcriptPath, byteOffset = 0, initialLastUsage
         }
       }
     } else if (entryType === 'turn_context') {
+      // turn_context 是最可靠的 turn 边界；边界前暂存的 message 在此归入新 turn。
       if (typeof payload.model === 'string' && payload.model) model = payload.model;
       if (typeof payload.developer_instructions === 'string' && payload.developer_instructions) {
         lastDeveloperInstructions = payload.developer_instructions;
@@ -300,6 +326,7 @@ export function parseTranscript(transcriptPath, byteOffset = 0, initialLastUsage
         }
       }
     } else if (entryType === 'event_msg') {
+      // event_msg 承载面向 UI 的生命周期、提示词、assistant 文本以及 token 心跳。
       const payloadType = payload.type;
 
       if (payloadType === 'turn_aborted' && typeof payload.turn_id === 'string' && payload.turn_id) {
@@ -362,6 +389,7 @@ export function parseTranscript(transcriptPath, byteOffset = 0, initialLastUsage
         }
       }
     } else if (entryType === 'response_item') {
+      // response_item 是工具配对和结构化消息的主来源；各 item.type 的字段形态不同，逐类收窄。
       const itemType = payload.type;
       if (itemType === 'message') {
         const inputMessage = transcriptMessageToInputMessage(payload);
@@ -412,6 +440,7 @@ export function parseTranscript(transcriptPath, byteOffset = 0, initialLastUsage
           parentToolCallIds.add(callId);
         }
       } else if (itemType === 'web_search_call') {
+        // web_search 只有一个完成事件，因此在这里合成 call/result 两条记录；开始时间用最近事件近似。
         const endTime = entryTimestampSeconds(entry);
         const startTime = lastNonWebSearchTs > 0 ? lastNonWebSearchTs : endTime;
         const callId = String(payload.call_id || payload.id || `web_search:${endTime}:${lineIndex}`);
@@ -452,6 +481,7 @@ export function parseTranscript(transcriptPath, byteOffset = 0, initialLastUsage
           parentToolCallIds.add(callId);
         }
       } else if (itemType === 'function_call_output') {
+        // output 使用同一 call_id 回查名称和 turn；缺失 pre 时仍输出 unknown，保留可诊断数据。
         const callId = String(payload.call_id || payload.id || '');
         if (callId) {
           const pre = pendingToolCalls.get(callId);
@@ -521,7 +551,8 @@ export function parseTranscript(transcriptPath, byteOffset = 0, initialLastUsage
   }
 
   // 为孤立的 function_call（无 function_call_output）生成 synthetic post_tool_use，
-  // 避免 buildReactSteps 中 pendingToolIds 永远不清空导致 step 切分失效
+  // 避免 buildReactSteps 中 pendingToolIds 永远不清空导致 step 切分失效。合成结果沿用开始时间，
+  // 所以它表达的是“调用边界已闭合但结果未知”，而不是伪造真实工具耗时或成功状态。
   for (const [callId, preEvent] of pendingToolCalls) {
     toolEvents.push({
       type: 'post_tool_use',
@@ -542,6 +573,7 @@ export function parseTranscript(transcriptPath, byteOffset = 0, initialLastUsage
     systemInstruction.push({ type: 'text', content: lastDeveloperInstructions });
   }
 
+  // turn 边界本身也有恢复价值，但 `hasContent` 只判断是否存在可输出的遥测正文。
   const hasContent =
     tokenEvents.length > 0 ||
     !!lastTotalUsage ||
@@ -551,6 +583,7 @@ export function parseTranscript(transcriptPath, byteOffset = 0, initialLastUsage
     agentMessages.length > 0;
 
   if (!hasContent) {
+    // 即使没有可输出事件也推进 offset，避免下一次 Stop 重复扫描同一批无关 JSONL 行。
     return {
       model,
       modelProvider,
@@ -563,11 +596,13 @@ export function parseTranscript(transcriptPath, byteOffset = 0, initialLastUsage
       agentMessages: [],
       totalUsage: null,
       toolEvents: [],
+      // 当前实现以本次 stat 得到的 EOF 作为 checkpoint；若触发 50MB 上限，超出部分不会重读。
       nextOffset: fileSize,
       lastEmittedUsage,
     };
   }
 
+  // 返回聚合结果而不在解析器内落盘：调用方负责按 turn 组装 span，并在成功后持久化 offset。
   return {
     model,
     modelProvider,

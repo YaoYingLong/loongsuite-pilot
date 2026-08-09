@@ -175,7 +175,9 @@ async function buildPostToolUseEntry(record: Record<string, unknown>): Promise<A
   // cwd/repo 等上下文优先从解包后的 Hook data 推断。
   const sourceFields = await buildSourceFields(data);
 
+  // PostToolUse 只有执行后的快照，因此直接生成 tool.result；对应 tool.call 由 transcript 主链提供。
   return buildAgentActivityEntry({
+    // Git/workspace 字段异步探测后先展开，后续 canonical 字段不会与其冲突。
     ...sourceFields,
     timestamp: parseTimestamp(data.timestamp) ?? Date.now(),
     'event.name': 'tool.result',
@@ -184,20 +186,24 @@ async function buildPostToolUseEntry(record: Record<string, unknown>): Promise<A
     'gen_ai.agent.type': ClientType.QoderCli,
     'gen_ai.request.model': UNKNOWN_MODEL,
     'gen_ai.response.model': UNKNOWN_MODEL,
+    // tool_use_id 同时充当逻辑 call ID 和执行实例 ID，保证下游能与 transcript 调用配对。
     'gen_ai.tool.name': getStringValue(data, 'tool_name'),
     'gen_ai.tool.call.id': getStringValue(data, 'tool_use_id'),
     'gen_ai.tool.call.exec.id': getStringValue(data, 'tool_use_id'),
     'gen_ai.tool.call.arguments': toJsonValue(toolInput),
+    // 当前 Hook 只提取文件写入常用结果字段；缺失值由 toJsonValue 过滤，不伪造空文本。
     'gen_ai.tool.call.result': toJsonValue({
       file_path: getStringValue(toolInput, 'file_path') ?? getStringValue(data, 'file_path'),
       content: toolInput.content ?? toolInput.new_string,
     }),
     'tool.result.status': 'success',
     attributes: toJsonObject({
+      // source/variant/raw_type 标识兼容路径，便于定位同一产品的 IDE 与 CLI 数据来源。
       source: SOURCE,
       qoder_variant: 'qoder-cli',
       raw_type: eventType,
       cwd: data.cwd,
+      // pre_file_exists 是 wrapper 在执行前记录的快照，用于区分新建和修改文件。
       loongsuite_pilot_pre_file_exists: data.loongsuite_pilot_pre_file_exists,
       file_path: getStringValue(toolInput, 'file_path') ?? getStringValue(data, 'file_path'),
     }),

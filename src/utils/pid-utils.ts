@@ -18,13 +18,21 @@ export type ProcessCommandPattern = string | RegExp;
 
 /** 可直接供状态命令和 watchdog 记录的结构化存活结论。 */
 export interface ProcessLiveness {
+  /** 是否确认找到目标服务进程。 */
   running: boolean;
+  /** pid 文件或进程扫描得到的 PID；没有可信候选时缺失。 */
   pid?: number;
+  /** 最终结论来自 pid 文件、全表扫描还是均未命中。 */
   source: ProcessLivenessSource;
+  /** 面向日志/CLI 的英文诊断原因。 */
   reason: string;
+  /** pid 文件自身的缺失、非法、陈旧或匹配状态。 */
   pidFileState?: PidFileState;
+  /** pid 文件中的 PID 是否仍被操作系统占用。 */
   pidFileProcessAlive?: boolean;
+  /** 按该 PID 查询到的完整命令行；查询失败时为空字符串。 */
   pidFileCommand?: string;
+  /** 命令可读取时是否归属于目标服务；无法读取时为 undefined。 */
   pidFileCommandMatched?: boolean;
 }
 
@@ -47,6 +55,7 @@ export const UPDATER_PROCESS_PATTERNS: readonly ProcessCommandPattern[] = [
 
 /** 只检查 pid 文件指向的进程是否存在，不验证其命令归属。 */
 export function isPidFileRunning(pidFile: string): boolean {
+  // 这是轻量检查，故意不防 PID 复用；需要归属验证的调用方应使用 checkProcessLiveness。
   const pid = readPidFile(pidFile);
   return pid !== null && isProcessAlive(pid);
 }
@@ -54,6 +63,7 @@ export function isPidFileRunning(pidFile: string): boolean {
 /** 读取正整数 PID；文件缺失、不可读或内容非法时返回 null。 */
 export function readPidFile(pidFile: string): number | null {
   try {
+    // 同步读取适合一次性 status/watchdog 探测；内容必须能完整转换成正整数。
     const raw = fs.readFileSync(pidFile, 'utf-8');
     const pid = Number(raw.trim());
     return Number.isInteger(pid) && pid > 0 ? pid : null;
@@ -77,6 +87,7 @@ export function isProcessAlive(pid: number): boolean {
 
 /** 判断完整命令行是否命中任一字符串包含规则或正则规则。 */
 export function isCommandMatch(command: string, patterns: readonly ProcessCommandPattern[]): boolean {
+  // some 在首个命中时短路；本项目提供的 RegExp 均不带 global/sticky 状态。
   return patterns.some(pattern => typeof pattern === 'string'
     ? command.includes(pattern)
     : pattern.test(command));
@@ -84,6 +95,7 @@ export function isCommandMatch(command: string, patterns: readonly ProcessComman
 
 /** 按当前操作系统选择 CIM 或 ps 扫描实现。 */
 export function findProcessByCommand(patterns: readonly ProcessCommandPattern[]): ProcessLiveness {
+  // 该 API 同步调用外部系统命令，调用期间会短暂阻塞 Node.js 事件循环。
   if (process.platform === 'win32') {
     return findWindowsProcessByCommand(patterns);
   }
@@ -127,6 +139,7 @@ export function checkProcessLiveness(pidFile: string, patterns: readonly Process
     }
   }
 
+  // pid 文件不可信时才做成本更高的全进程表扫描。
   const discovered = findProcessByCommand(patterns);
   if (discovered.running) {
     // 扫描命中说明服务实际运行，同时保留 pid 文件陈旧原因供修复。
@@ -161,6 +174,7 @@ function readProcessCommand(pid: number): string {
   try {
     if (process.platform === 'win32') {
       // CIM 能取得完整 CommandLine；隐藏 PowerShell 窗口避免后台服务弹窗。
+      // PID 已验证为正整数后才插入固定 PowerShell 表达式，不接受外部任意命令文本。
       return execFileSync('powershell.exe', [
         '-NoProfile',
         '-WindowStyle',
@@ -182,6 +196,7 @@ function readProcessCommand(pid: number): string {
 /** 扫描 Unix 进程表并返回首个命中项。 */
 function findUnixProcessByCommand(patterns: readonly ProcessCommandPattern[]): ProcessLiveness {
   try {
+    // `-a`/`-x` 覆盖有无终端的进程，`-o pid=,command=` 输出无表头的 PID 与完整命令。
     const out = execFileSync('ps', ['-axo', 'pid=,command='], {
       timeout: 5000,
       encoding: 'utf-8',
@@ -192,6 +207,7 @@ function findUnixProcessByCommand(patterns: readonly ProcessCommandPattern[]): P
       if (!match) continue;
       const pid = Number(match[1]);
       const command = match[2] ?? '';
+      // 排除当前 Collector，避免命令行中恰好包含目标模式时自我命中。
       if (pid === process.pid || !Number.isInteger(pid) || pid <= 0) continue;
       if (isCommandMatch(command, patterns)) {
         return {
@@ -211,6 +227,7 @@ function findUnixProcessByCommand(patterns: readonly ProcessCommandPattern[]): P
 /** 通过 PowerShell CIM 扫描 Windows 进程表。 */
 function findWindowsProcessByCommand(patterns: readonly ProcessCommandPattern[]): ProcessLiveness {
   try {
+    // CIM 返回 ProcessId/CommandLine，再由 PowerShell 格式化为便于 Node 解析的 TSV。
     const out = execFileSync('powershell.exe', [
       '-NoProfile',
       '-WindowStyle',

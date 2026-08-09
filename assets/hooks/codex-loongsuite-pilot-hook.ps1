@@ -13,6 +13,7 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Processor = Join-Path $ScriptDir "codex-hook-processor.mjs"
 $Subcommand = if ($args.Count -gt 0) { $args[0] } else { "unknown" }
 
+# PowerShell 没有结构化日志 API，这里手工转义字符串并追加 JSONL；catch 为空是有意的 fail-open。
 function Log-Error {
     param([string]$Stage, [string]$Message)
     try {
@@ -43,6 +44,7 @@ if (-not (Test-Path $Processor)) {
 
 $MIN_NODE_MAJOR = 18
 
+# 返回布尔值而非退出进程，使 Resolve-NodeBin 可以逐项探测多个候选。
 function Test-NodeSuitable {
     param([string]$bin)
     if (-not (Test-Path $bin)) { return $false }
@@ -54,6 +56,7 @@ function Test-NodeSuitable {
     } catch { return $false }
 }
 
+# 解析顺序为安装 pin、nvm-windows、fnm、Volta、系统安装目录、PATH；函数只读环境，不改配置。
 function Resolve-NodeBin {
     $pinFile = Join-Path $env:USERPROFILE ".loongsuite-pilot\node-bin"
     if (Test-Path $pinFile) {
@@ -130,6 +133,7 @@ try {
         $psi.RedirectStandardError = $false
         $psi.CreateNoWindow = $true
 
+        # ProcessStartInfo 绕过 PowerShell 文本管道，BaseStream.Write 会逐字节转发已修复的 UTF-8。
         $proc = [System.Diagnostics.Process]::Start($psi)
         $proc.StandardInput.BaseStream.Write($rawBytes, 0, $rawBytes.Length)
         $proc.StandardInput.Close()

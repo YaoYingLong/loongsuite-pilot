@@ -64,6 +64,7 @@ function defaultLogDir() {
   return path.join(pilotDataDir(), 'logs', AGENT_ID);
 }
 
+/** 同步读取一次 Hook stdin JSON；失败写诊断并返回空对象，使命令处理器自然提前结束。 */
 function tryReadStdin() {
   try { return readStdinJson(); }
   catch (err) {
@@ -76,6 +77,7 @@ function tryReadStdin() {
   }
 }
 
+/** 校验跨进程状态的主键；缺少 session_id 时禁止写入 `unknown` 共享状态，避免不同会话串数据。 */
 function requireSessionId(event, stage = 'cmd') {
   const sid = event && event.session_id;
   if (typeof sid === 'string' && sid.length > 0) return sid;
@@ -149,6 +151,11 @@ function cmdSubagentStop() {
   saveState(sessionId, state);
 }
 
+/**
+ * Stop 子命令先持久化 Hook 上下文，再尝试导出 transcript。
+ * `_next_transcript_offset` 是 exportSession 的暂存结果，只有导出无异常返回后才转正为 checkpoint；
+ * catch 分支不推进 offset，使下一次 Stop 可以重新读取同一段字节。
+ */
 async function cmdStop() {
   const event = tryReadStdin();
   const sessionId = requireSessionId(event, 'stop');
@@ -187,6 +194,10 @@ async function cmdStop() {
 
 // ─── 等待 transcript 稳定 ───
 
+/**
+ * 每 150ms 观察一次文件大小，连续两次不变即认为本轮写入暂时稳定，最长约 1.5 秒。
+ * 这是有限等待而非文件锁；超时后仍返回，让解析器按完整 JSONL 行尽可能恢复。
+ */
 async function waitForTranscriptStable(transcriptPath, minSize = 0) {
   let prevSize = -1;
   let stableCount = 0;
@@ -210,6 +221,10 @@ async function waitForTranscriptStable(transcriptPath, minSize = 0) {
 
 // ─── Stop 主导出流程 ───
 
+/**
+ * 从上次字节 offset 增量解析 Qwen transcript，构造 turn 记录并追加 JSONL。
+ * 函数只把新 offset 写到临时字段，不直接保存 state；事务提交由 cmdStop 在成功返回后完成。
+ */
 async function exportSession(state, stopReason) {
   const runtimeConfig = loadHookRuntimeConfig(pilotDataDir());
   const sessionId = state.session_id || 'unknown';
@@ -320,6 +335,10 @@ async function exportSession(state, stopReason) {
  * @param {string} turnStopReason 本 turn 最后一次 LLM 调用的停止原因。
  * @param {string|undefined} cwd 可选工作目录，写入 agent.qwen-code-cli.cwd。
  * @returns {{records: object[], hash: string}} records 是待写 JSONL 的事件数组，hash 是更新后的链头。
+ */
+/**
+ * 将一个已解析 turn 展开为 user、STEP、LLM 和 TOOL 标准事件，并计算下一轮消息哈希。
+ * 此纯构造函数不读写文件；返回记录顺序就是 JSONL 顺序，供下游按 step 重建调用链。
  */
 export function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, turnStopReason, cwd) {
   const records = [];

@@ -6,4 +6,5 @@
  */
 
 export function sendAlarm(_topic: string, _data: Record<string, unknown>): void {}
+/** 开源构建的状态上报空实现；下划线参数名表明有意不读取输入。 */
 export function sendStatus(_topic: string, _data: Record<string, unknown>): void {}

@@ -31,6 +31,10 @@ const SSE_DELIMITER = '\n\n';
 
 // ─── system_instructions 提取 ─────────────────────────────────────────────
 
+/**
+ * 把 Anthropic 请求的 system 字段转换为标准 parts，并过滤内部计费头。
+ * 返回 null 表示没有可上报内容；原 block 通过展开复制，不修改真实网络请求体。
+ */
 function extractSystemInstructions(systemField) {
   if (systemField == null) return null;
   // 兼容 system 为裸字符串的输入，并包装成规范要求的数组形式。
@@ -59,6 +63,7 @@ function extractSystemInstructions(systemField) {
 
 // ─── 请求头和请求体工具 ─────────────────────────────────────────────────
 
+/** 兼容 Headers 实例与普通对象，并将 key 统一为小写以便大小写无关查找 session header。 */
 function dumpHeaders(h) {
   const out = {};
   if (!h) return out;
@@ -72,6 +77,7 @@ function dumpHeaders(h) {
   return out;
 }
 
+/** 仅观察可无损同步解码的 string/ArrayBuffer/Uint8Array；流式请求体不消费，避免破坏网络请求。 */
 function readBodyAsText(body) {
   if (body == null) return null;
   if (typeof body === 'string') return body;
@@ -97,6 +103,10 @@ function safeParseRequestSystem(body) {
 
 // ─── 截获记录写入 ───────────────────────────────────────────────────────
 
+/**
+ * 每个 response_id 写独立 JSON 文件，供 Stop processor 一次性读取和删除。
+ * sessionId/responseId 均来自 Claude 协议；路径合法性依赖宿主 ID 格式，额外校验待确认。
+ */
 function writeRecord(sessionId, record) {
   try {
     const dir = path.join(INTERCEPT_BASE, sessionId);
@@ -184,6 +194,7 @@ if (typeof origFetch === 'function') {
     const decoder = new TextDecoder();
     let pending = '';
 
+    // 只允许写一次；message_start 先到时会等待 TTFT，流结束仍无 delta 时由 flush 保存部分信息。
     const tryEmit = () => {
       if (recordWritten || !responseId) return;
       writeRecord(sessionId, {
@@ -219,6 +230,7 @@ if (typeof origFetch === 'function') {
     try {
       transform = new TransformStream({
         transform(chunk, controller) {
+          // TransformStream 按下游拉取节奏调用 transform；先 enqueue 同一 chunk，保留原始字节和背压链。
           controller.enqueue(chunk); // 先透传数据；解析仅为尽力而为的旁路操作。
           if (stopParsing) return;
           try {
@@ -248,12 +260,14 @@ if (typeof origFetch === 'function') {
 
     let wrappedBody;
     try {
+      // pipeThrough 返回新的可读流，原 body 仍只被消费一次，不调用 clone/arrayBuffer 造成整流缓存。
       wrappedBody = response.body.pipeThrough(transform);
     } catch (_) {
       return response;
     }
 
     try {
+      // 用相同状态码、状态文本和头构造透明响应；正文仅替换为旁路观察后的等价流。
       return new Response(wrappedBody, {
         status: response.status,
         statusText: response.statusText,

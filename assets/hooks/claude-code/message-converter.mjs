@@ -30,6 +30,7 @@ const STOP_REASON_MAP = {
   error: 'error',
 };
 
+/** 将供应商 stop reason 映射为平台枚举；未知新值原样保留，便于兼容未来协议。 */
 export function mapStopReason(raw) {
   if (!raw) return 'stop';
   return STOP_REASON_MAP[raw] || raw;
@@ -37,6 +38,10 @@ export function mapStopReason(raw) {
 
 // ─── Anthropic content block 与 MessagePart 互转 ───
 
+/**
+ * 把一个 Anthropic content block 转成统一 part。
+ * 图片 base64 只做结构映射、不解码；未知 block 尽量保留 type，避免新协议字段导致整条消息丢失。
+ */
 export function convertAnthropicContentBlock(block) {
   if (!block || typeof block !== 'object') return null;
   switch (block.type) {
@@ -71,6 +76,10 @@ export function convertAnthropicContentBlock(block) {
 
 // ─── input messages 归一化 ───
 
+/**
+ * 按显式 protocol 分派三种消息转换器。
+ * 返回新数组且不修改 transcript；非数组/字符串输入返回空数组，让上层仍可输出无内容的 span。
+ */
 export function convertInputMessages(messages, protocol) {
   if (!messages) return [];
   if (typeof messages === 'string') {
@@ -83,8 +92,10 @@ export function convertInputMessages(messages, protocol) {
     if (!msg || typeof msg !== 'object') continue;
 
     if (protocol === 'openai-chat') {
+      // chat message 总能降级成带 role 的对象，因此直接加入。
       result.push(convertOpenAIChatMessage(msg));
     } else if (protocol === 'openai-responses') {
+      // Responses item 可能是无关控制项，转换器以 null 表示应跳过。
       const converted = convertOpenAIResponsesItem(msg);
       if (converted) result.push(converted);
     } else {
@@ -94,6 +105,7 @@ export function convertInputMessages(messages, protocol) {
   return result;
 }
 
+/** tool_result block 会把整条消息角色提升为 tool，以符合统一 Schema 的角色约束。 */
 function convertAnthropicMessage(msg) {
   const role = msg.role || 'user';
   const content = msg.content;

@@ -14,6 +14,7 @@ if (-not (Test-Path $Processor)) { exit 0 }
 
 $MIN_NODE_MAJOR = 18
 
+# 对每个候选执行轻量版本探测；失败不会抛到 wrapper 顶层。
 function Test-NodeSuitable {
     param([string]$bin)
     if (-not (Test-Path $bin)) { return $false }
@@ -25,6 +26,7 @@ function Test-NodeSuitable {
     } catch { return $false }
 }
 
+# 首选 node-bin pin 保持与安装验证一致，失效时才遍历常见 Windows Node 安装位置。
 function Resolve-NodeBin {
     $pinFile = Join-Path $env:USERPROFILE ".loongsuite-pilot\node-bin"
     if (Test-Path $pinFile) {
@@ -99,6 +101,7 @@ try {
         $psi.RedirectStandardError = $false
         $psi.CreateNoWindow = $true
 
+        # 用重定向的二进制 stdin 传输 payload；子进程关闭输入后才能观察到 EOF 并开始解析。
         $proc = [System.Diagnostics.Process]::Start($psi)
         $proc.StandardInput.BaseStream.Write($rawBytes, 0, $rawBytes.Length)
         $proc.StandardInput.Close()

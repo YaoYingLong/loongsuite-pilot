@@ -15,7 +15,9 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TAG = '[validate-trace]';
+// `--latest` 只搜索 OTLP debug flusher 的默认目录；自定义数据目录需用 `--input` 显式传入。
 const OTLP_DEBUG_DIR = path.join(homedir(), '.loongsuite-pilot', 'logs', 'otlp-debug');
+// 这些集合既用于枚举校验，也集中记录当前校验器接受的兼容值，避免规则散落在循环中。
 const VALID_SPAN_KINDS = ['ENTRY', 'AGENT', 'STEP', 'LLM', 'TOOL', 'CHAIN', 'RETRIEVER', 'RERANKER', 'EMBEDDING', 'TASK'];
 const KNOWN_SUBAGENT_TOOLS = new Set(['Agent']);
 // TODO：所有生产端迁移到单数 `tool_call` 后，删除旧复数别名 `tool_calls`。
@@ -30,6 +32,7 @@ const VALID_PART_TYPES = new Set(['text', 'tool_call', 'tool_call_response', 're
  * 参数不完整或非法时直接以退出码 2 结束，表示使用方式错误而非 Trace 校验失败。
  */
 function parseCli() {
+  // strict=true 会直接拒绝未知参数；下方再处理跨参数约束和枚举值。
   const { values } = parseArgs({
     options: {
       input:      { type: 'string', short: 'i' },
@@ -67,6 +70,7 @@ function parseCli() {
 function findLatestJsonl() {
   let files;
   try {
+    // 只考虑普通命名的 JSONL；目录项是否真为文件会在后续 stat 时验证/抛错。
     files = readdirSync(OTLP_DEBUG_DIR).filter(f => f.endsWith('.jsonl'));
   } catch {
     console.error(`${TAG} error: cannot read ${OTLP_DEBUG_DIR}`);
@@ -76,6 +80,7 @@ function findLatestJsonl() {
     console.error(`${TAG} error: no .jsonl files in ${OTLP_DEBUG_DIR}`);
     process.exit(2);
   }
+  // mtime 比文件名更可靠，因为 debug 文件名格式可能随版本变化。
   files.sort((a, b) => {
     const sa = statSync(path.join(OTLP_DEBUG_DIR, a)).mtimeMs;
     const sb = statSync(path.join(OTLP_DEBUG_DIR, b)).mtimeMs;
@@ -104,6 +109,7 @@ function readSpans(filePath) {
     if (!line.trim()) continue;
     try {
       const obj = JSON.parse(line);
+      // `_error` 行是 debug exporter 自身的失败诊断，不是 OTLP Span，不能进入 Trace 分组。
       if (obj._error) continue;
       spans.push(obj);
     } catch {
@@ -145,6 +151,7 @@ function loadRules(rulesPath) {
 function buildTraces(spans, traceIdFilter) {
   const grouped = new Map();
   for (const span of spans) {
+    // trace-id 过滤在建索引前完成，减少单 Trace 排障时的内存和校验工作量。
     if (traceIdFilter && span.traceId !== traceIdFilter) continue;
     if (!grouped.has(span.traceId)) grouped.set(span.traceId, []);
     grouped.get(span.traceId).push(span);
@@ -152,9 +159,11 @@ function buildTraces(spans, traceIdFilter) {
 
   const traces = [];
   for (const [traceId, traceSpans] of grouped) {
+    // 第一次遍历建立 spanId 索引和空 children 桶；第二次才能 O(1) 关联父子。
     const spanMap = new Map();
     const childrenMap = new Map();
     for (const s of traceSpans) {
+      // `_kind` 是脚本内的便捷缓存，不会调用 writeFileSync 回写输入文件。
       s._kind = s.attributes?.['gen_ai.span.kind'] || 'UNKNOWN';
       spanMap.set(s.spanId, s);
       if (!childrenMap.has(s.spanId)) childrenMap.set(s.spanId, []);
@@ -165,6 +174,7 @@ function buildTraces(spans, traceIdFilter) {
       }
     }
 
+    // 任一 Span 存在消息字段，就说明本 Trace 开启了内容采集，相关规则不再标记 skipped。
     const hasMessageContent = traceSpans.some(s =>
       s.attributes?.['gen_ai.input.messages'] || s.attributes?.['gen_ai.output.messages']
     );
@@ -179,7 +189,8 @@ function buildTraces(spans, traceIdFilter) {
 
 // ─── 检查结果辅助函数 ────────────────────────────────────────────────────────
 
-// 以下四个纯函数统一检查结果结构，便于报告、去重和严重级别过滤共享同一 Schema。
+// 以下四个纯函数统一检查结果结构，便于报告、去重和严重级别过滤共享同一 Schema；
+// pass/warn/error/skipped 是报告状态，不是 JavaScript 异常类型。
 function pass(id, detail) { return { id, status: 'pass', ...(detail ? { detail } : {}) }; }
 function error(id, detail, spanId, spanName) { return { id, status: 'error', detail, ...(spanId ? { spanId } : {}), ...(spanName ? { spanName } : {}) }; }
 function warn(id, detail, spanId, spanName) { return { id, status: 'warn', detail, ...(spanId ? { spanId } : {}), ...(spanName ? { spanName } : {}) }; }
@@ -187,11 +198,16 @@ function skipped(id, reason) { return { id, status: 'skipped', detail: reason ||
 
 // ─── 5a. 结构校验 ────────────────────────────────────────────────────────────
 
-/** 检查 ENTRY/AGENT/STEP/LLM/TOOL 数量、父子层级和允许的子 Span，返回检查结果数组。 */
+/**
+ * 检查 ENTRY/AGENT/STEP/LLM/TOOL 数量、父子层级、时间先后和从根的可达性。
+ * @param {object} trace `buildTraces()` 构建的索引对象。
+ * @returns {object[]} 结构化检查项；函数不会抛出“校验失败”，而是返回 error 状态。
+ */
 function validateStructure(trace) {
   const checks = [];
   const { spans, spanMap, childrenMap } = trace;
 
+  // 数据量主要用于离线诊断，按种类即时 filter 比维护额外索引更直观。
   const byKind = (kind) => spans.filter(s => s._kind === kind);
   const parentKind = (s) => s.parentSpanId && spanMap.has(s.parentSpanId) ? spanMap.get(s.parentSpanId)._kind : null;
 
@@ -207,6 +223,7 @@ function validateStructure(trace) {
 
   if (entries.length === 1) {
     const e = entries[0];
+    // 上游 Trace 链接时 ENTRY 可以带当前文件之外的 parentSpanId，因此“不在本 Trace 索引”也视为根。
     const isRoot = !e.parentSpanId || !spanMap.has(e.parentSpanId);
     checks.push(isRoot
       ? pass('structure.entry_is_root')
@@ -252,6 +269,7 @@ function validateStructure(trace) {
     checks.push(pass('structure.tool_under_step'));
   }
 
+  // 每个 ReAct STEP 必须恰有一个 LLM 子 Span；工具子 Span数量可以为零或多个。
   let allStepsOk = true;
   for (const s of steps) {
     const children = childrenMap.get(s.spanId) || [];
@@ -265,6 +283,7 @@ function validateStructure(trace) {
     checks.push(pass('structure.step_has_one_llm', `${steps.length} STEPs, each with 1 LLM`));
   }
 
+  // 工具由模型输出触发，因此同一 STEP 内 TOOL 的开始时间不能早于 LLM 开始时间。
   let llmOrderOk = true;
   for (const s of steps) {
     const children = childrenMap.get(s.spanId) || [];
@@ -285,6 +304,7 @@ function validateStructure(trace) {
   }
 
   if (entries.length === 1) {
+    // 从唯一 ENTRY 做广度优先遍历；未访问 Span 即为断开父链的孤儿。
     const visited = new Set();
     const queue = [entries[0].spanId];
     while (queue.length > 0) {
@@ -306,7 +326,13 @@ function validateStructure(trace) {
 
 // ─── 5b. 属性校验 ────────────────────────────────────────────────────────────
 
-/** 同步地校验 validateAttributes 对应的规则并返回结构化检查结果，不修改输入记录。 */
+/**
+ * 按规则文件校验 common、各 Span kind 和 Resource 属性。
+ * `must` 缺失产生 error，`should` 缺失产生 warn，内容字段在关闭采集时产生 skipped。
+ * @param {object} trace Trace 索引。
+ * @param {object} rules 已解析的规则文件。
+ * @returns {object[]} 属性检查结果。
+ */
 function validateAttributes(trace, rules) {
   const checks = [];
   const { spans, hasMessageContent } = trace;
@@ -318,6 +344,7 @@ function validateAttributes(trace, rules) {
     const sname = span.name;
 
     for (const attrDef of rules.commonAttributes.must) {
+      // common must 把空字符串也视为缺失；kind must 保持规则文件当前约定，只检查 null/undefined。
       if (attrs[attrDef.key] === undefined || attrs[attrDef.key] === null || attrs[attrDef.key] === '') {
         checks.push(error(`attr.common.must.${attrDef.key}`, `missing ${attrDef.key}`, sid, sname));
       }
@@ -329,6 +356,7 @@ function validateAttributes(trace, rules) {
     }
 
     const kindRules = rules.spanKinds[kind];
+    // UNKNOWN 或规则尚未覆盖的扩展 Span 只接受 common/resource 检查，不擅自套用其他 kind。
     if (!kindRules) continue;
 
     for (const attrDef of kindRules.attributes.must) {
@@ -344,6 +372,7 @@ function validateAttributes(trace, rules) {
 
     for (const attrDef of kindRules.attributes.should) {
       if (attrDef.requiresMessageContent && !hasMessageContent) {
+        // 用户主动关闭内容采集时，缺少敏感字段是预期行为，不能算警告。
         checks.push(skipped(`attr.${kind}.should.${shortKey(attrDef.key)}`));
         continue;
       }
@@ -389,11 +418,15 @@ function shortKey(key) {
 
 // ─── 5c. 时间校验 ────────────────────────────────────────────────────────────
 
-/** 同步地校验 validateTime 对应的规则并返回结构化检查结果，不修改输入记录。 */
+/**
+ * 以纳秒时间戳检查非零时长、STEP 重叠、父子包含、LLM 最大时长和 round 顺序。
+ * 时间戳用 BigInt 比较以避免 64 位纳秒值转换为 Number 后丢失精度。
+ */
 function validateTime(trace, rules) {
   const checks = [];
   const { spans, childrenMap } = trace;
 
+  // 无法转换为 BigInt 的输入会作为脚本错误向上传播；当前规则假定 exporter 已输出整数字符串。
   let allNonZero = true;
   for (const s of spans) {
     const start = BigInt(s.startTimeUnixNano);
@@ -408,6 +441,7 @@ function validateTime(trace, rules) {
   const steps = spans.filter(s => s._kind === 'STEP');
   const agentSpan = spans.find(s => s._kind === 'AGENT');
   if (agentSpan && steps.length > 1) {
+    // 复制后排序，避免改变 trace.spans 的原始调试顺序。
     const sorted = [...steps].sort((a, b) => {
       const d = BigInt(a.startTimeUnixNano) - BigInt(b.startTimeUnixNano);
       return d < 0n ? -1 : d > 0n ? 1 : 0;
@@ -428,6 +462,7 @@ function validateTime(trace, rules) {
     checks.push(pass('time.no_step_overlap'));
   }
 
+  // 父 Span 必须覆盖所有直接子 Span；逐层检查即可间接保证整棵树的时间包络。
   let allContained = true;
   for (const s of spans) {
     const children = childrenMap.get(s.spanId) || [];
@@ -447,6 +482,7 @@ function validateTime(trace, rules) {
   }
   if (allContained) checks.push(pass('time.parent_contains_children'));
 
+  // 规则缺失时使用 10 分钟默认值；超长仅告警，因为真实长推理并非结构错误。
   const maxMs = (rules.timeRules.find(r => r.id === 'time.reasonable_duration')?.maxMs) || 600000;
   let allReasonable = true;
   for (const s of spans.filter(s => s._kind === 'LLM')) {
@@ -488,7 +524,10 @@ function validateTime(trace, rules) {
 
 // ─── 5d. Schema 与格式校验 ──────────────────────────────────────────────────
 
-/** 同步地校验 validateSchema 对应的规则并返回结构化检查结果，不修改输入记录。 */
+/**
+ * 检查 OTLP ID、Span kind、token 数值关系、finish reason 和消息 parts Schema。
+ * @returns {object[]} Schema 检查结果；不修改源 Span。
+ */
 function validateSchema(trace, rules) {
   const checks = [];
   const { spans, hasMessageContent } = trace;
@@ -531,6 +570,7 @@ function validateSchema(trace, rules) {
     const inp = attrs['gen_ai.usage.input_tokens'];
     const out = attrs['gen_ai.usage.output_tokens'];
     const tot = attrs['gen_ai.usage.total_tokens'];
+    // 只有三个字段都存在且都是整数时才检查等式，缺失问题由属性规则单独报告。
     if (inp !== undefined && out !== undefined && tot !== undefined) {
       if (Number.isInteger(inp) && Number.isInteger(out) && Number.isInteger(tot)) {
         if (tot !== inp + out) {
@@ -547,6 +587,7 @@ function validateSchema(trace, rules) {
     const attrs = s.attributes || {};
     const fr = attrs['gen_ai.response.finish_reasons'];
     if (fr !== undefined && fr !== null) {
+      // exporter 可能将数组保持为对象，也可能把它序列化为 JSON 字符串，两种形式都接受。
       try {
         const parsed = typeof fr === 'string' ? JSON.parse(fr) : fr;
         if (!Array.isArray(parsed) || !parsed.every(x => typeof x === 'string')) {
@@ -559,6 +600,7 @@ function validateSchema(trace, rules) {
   }
 
   if (hasMessageContent) {
+    // 消息属于 opt-in 敏感字段；全 Trace 未采集时跳过，而不是制造大量缺失错误。
     for (const s of spans) {
       const attrs = s.attributes || {};
       validateMessageField(attrs, 'gen_ai.input.messages', 'schema.input_messages', s, checks);
@@ -593,6 +635,7 @@ function validateMessageField(attrs, key, ruleId, span, checks) {
         checks.push(error(ruleId, `${key}[${i}] missing role`, span.spanId, span.name));
       }
       if (ruleId === 'schema.output_messages') {
+        // 只有输出消息要求 finish_reason；输入用户消息没有结束原因。
         if (msg.finish_reason === undefined) {
           checks.push(warn(ruleId, `${key}[${i}] missing finish_reason`, span.spanId, span.name));
         } else if (!VALID_FINISH_REASONS.has(msg.finish_reason)) {
@@ -602,6 +645,7 @@ function validateMessageField(attrs, key, ruleId, span, checks) {
         }
       }
       if (msg.parts && Array.isArray(msg.parts)) {
+        // parts 的具体必填字段取决于 type，先验证 discriminator 再进入类型分支。
         for (let j = 0; j < msg.parts.length; j++) {
           const part = msg.parts[j];
           if (!part.type) {
@@ -631,30 +675,35 @@ function validateMessageField(attrs, key, ruleId, span, checks) {
 
 // ─── 5e. 语义校验 ────────────────────────────────────────────────────────────
 
-/** 同步地校验 validateSemantic 对应的规则并返回结构化检查结果，不修改输入记录。 */
+/**
+ * 校验跨 Span 才能判断的语义：标识一致性、operation 映射、token 汇总、工具调用配对和最终输出。
+ * @param {object} trace Trace 索引。
+ * @param {object} rules 规则配置。
+ * @returns {object[]} 语义检查结果。
+ */
 function validateSemantic(trace, rules) {
   const checks = [];
   const { spans, childrenMap, hasMessageContent } = trace;
 
-  // consistent_session_id
+  // 检查 consistent_session_id：同一 Trace 中所有已提供的 session ID 应一致。
   const sessionIds = new Set(spans.map(s => s.attributes?.['gen_ai.session.id']).filter(Boolean));
   checks.push(sessionIds.size <= 1
     ? pass('semantic.consistent_session_id')
     : error('semantic.consistent_session_id', `found ${sessionIds.size} distinct session IDs: ${[...sessionIds].join(', ')}`));
 
-  // consistent_user_id
+  // 检查 consistent_user_id：过滤缺失值后，不允许出现多个用户 ID。
   const userIds = new Set(spans.map(s => s.attributes?.['gen_ai.user.id']).filter(Boolean));
   checks.push(userIds.size <= 1
     ? pass('semantic.consistent_user_id')
     : error('semantic.consistent_user_id', `found ${userIds.size} distinct user IDs`));
 
-  // consistent_agent_name
+  // 检查 consistent_agent_name：多 Agent 名可能源于兼容数据，当前仅作为 warn。
   const agentNames = new Set(spans.map(s => s.attributes?.['gen_ai.agent.name']).filter(Boolean));
   checks.push(agentNames.size <= 1
     ? pass('semantic.consistent_agent_name')
     : warn('semantic.consistent_agent_name', `found ${agentNames.size} distinct agent names: ${[...agentNames].join(', ')}`));
 
-  // operation_kind_mapping
+  // 检查 operation_kind_mapping：规则表把 operation.name 映射到唯一 Span kind。
   const mapping = rules.operationKindMapping || {};
   let allMappingOk = true;
   for (const s of spans) {
@@ -668,7 +717,7 @@ function validateSemantic(trace, rules) {
   }
   if (allMappingOk) checks.push(pass('semantic.operation_kind_mapping'));
 
-  // span_name_pattern
+  // 检查 span_name_pattern：带 `{占位符}` 的动态模式暂不做字面比较。
   let allNamesOk = true;
   for (const s of spans) {
     const kindRules = rules.spanKinds[s._kind];
@@ -683,7 +732,7 @@ function validateSemantic(trace, rules) {
   }
   if (allNamesOk) checks.push(pass('semantic.span_name_pattern'));
 
-  // agent_token_sum
+  // 检查 agent_token_sum：AGENT 聚合 token 应等于所有 LLM 子工作量之和。
   const agentSpan = spans.find(s => s._kind === 'AGENT');
   if (agentSpan) {
     const llmSpans = spans.filter(s => s._kind === 'LLM');
@@ -709,7 +758,7 @@ function validateSemantic(trace, rules) {
     }
   }
 
-  // tool_matches_llm_output
+  // 检查 tool_matches_llm_output：双向验证 LLM 声明和实际 TOOL Span，既不能多也不能漏。
   if (!hasMessageContent) {
     checks.push(skipped('semantic.tool_matches_llm_output'));
   } else {
@@ -738,12 +787,16 @@ function validateSemantic(trace, rules) {
             }
           }
         }
-      } catch { continue; }
+      } catch {
+        // JSON 格式错误会由 Schema 检查报告；本规则无法可靠提取调用时避免重复误报。
+        continue;
+      }
 
       for (const tool of tools) {
         const toolCallId = tool.attributes?.['gen_ai.tool.call.id'];
         const toolName = tool.attributes?.['gen_ai.tool.name'];
         const matched = expectedToolCalls.some(tc =>
+          // call.id 最可靠；某些 Agent 没有稳定 ID 时退回工具名配对。
           (toolCallId && tc.id && tc.id === toolCallId) || (toolName && tc.name && tc.name === toolName)
         );
         if (!matched) {
@@ -760,6 +813,7 @@ function validateSemantic(trace, rules) {
         );
         if (!matched) {
           if (KNOWN_SUBAGENT_TOOLS.has(tc.name)) {
+            // 已知子 Agent 工具尚未生成 TOOL Span，因此降级为警告而非阻断 CI。
             checks.push(warn('semantic.tool_matches_llm_output',
               `LLM declared subagent tool_call ${tc.name} — subagent TOOL span not yet supported`, llm.spanId, llm.name));
           } else {
@@ -773,7 +827,7 @@ function validateSemantic(trace, rules) {
     if (allToolsMatch) checks.push(pass('semantic.tool_matches_llm_output'));
   }
 
-  // entry_input_exists
+  // 检查 entry_input_exists：ENTRY 代表整轮入口，应保留非空用户输入快照。
   if (!hasMessageContent) {
     checks.push(skipped('semantic.entry_input_exists'));
   } else {
@@ -795,13 +849,14 @@ function validateSemantic(trace, rules) {
     }
   }
 
-  // entry_output_matches
+  // 检查 entry_output_matches：ENTRY 的最终输出应与结束时间最晚的 LLM 输出一致。
   if (!hasMessageContent) {
     checks.push(skipped('semantic.entry_output_matches'));
   } else {
     const entry = spans.find(s => s._kind === 'ENTRY');
     const llmSpans = spans.filter(s => s._kind === 'LLM');
     if (entry && llmSpans.length > 0) {
+      // 注意这里会排序局部 llmSpans 数组，不会改变原 trace.spans。
       const lastLlm = llmSpans.sort((a, b) => {
         const d = BigInt(a.endTimeUnixNano) - BigInt(b.endTimeUnixNano);
         return d < 0n ? -1 : d > 0n ? 1 : 0;
@@ -818,7 +873,7 @@ function validateSemantic(trace, rules) {
     }
   }
 
-  // llm_has_input_output
+  // 检查 llm_has_input_output：启用内容采集后，每个模型调用都应形成完整输入/输出对。
   if (!hasMessageContent) {
     checks.push(skipped('semantic.llm_has_input_output'));
   } else {
@@ -858,7 +913,9 @@ function validateSemantic(trace, rules) {
             allRolesOk = false;
           }
         }
-      } catch { /* skip parse errors */ }
+      } catch {
+        // JSON 解析错误已由 validateMessageField 报告，此处只避免重复同一根因。
+      }
     }
     if (allRolesOk) checks.push(pass('semantic.tool_response_role'));
   }
@@ -928,13 +985,21 @@ function validateSemantic(trace, rules) {
 
 // ─── 报告格式化 ──────────────────────────────────────────────────────────────
 
-/** 内部函数同步地构建 buildReport 对应的配置或脚本文本；只有调用方执行返回值时才产生外部副作用。 */
+/**
+ * 对每棵 Trace 执行五组校验，去重、按严重级别过滤并汇总最终 verdict。
+ * @param {object[]} traces `buildTraces()` 结果。
+ * @param {string} inputFile 用于报告 metadata 的输入路径。
+ * @param {object} rules 校验规则。
+ * @param {string} severityFilter CLI 严重级别阈值。
+ * @returns {object} JSON/text formatter 共用的结构化报告。
+ */
 function buildReport(traces, inputFile, rules, severityFilter) {
   const traceReports = [];
   let totalSpans = 0;
   const totalChecks = { total: 0, pass: 0, warn: 0, error: 0, skipped: 0 };
 
   for (const trace of traces) {
+    // 各校验器独立返回结果；展开到同一数组后统一处理重复 pass/逐 Span 错误。
     const allChecks = [
       ...validateStructure(trace),
       ...validateAttributes(trace, rules),
@@ -958,6 +1023,7 @@ function buildReport(traces, inputFile, rules, severityFilter) {
       }
     }
 
+    // warn/skipped 不会令单 Trace 失败，只有过滤后仍存在 error 才是 FAIL。
     const hasError = filtered.some(c => c.status === 'error');
 
     for (const c of filtered) {
@@ -1004,6 +1070,7 @@ function deduplicateChecks(checks) {
   for (const c of checks) {
     const key = `${c.id}:${c.spanId || ''}:${c.status}`;
     if (c.status === 'pass') {
+      // 同一规则的成功只显示一次；失败则按 spanId 保留，便于定位每个问题 Span。
       if (!seen.has(c.id)) {
         seen.set(c.id, true);
         result.push(c);
@@ -1023,6 +1090,7 @@ function filterBySeverity(checks, severity) {
   const levels = { error: 0, warn: 1, info: 2 };
   const statusToLevel = { error: 0, warn: 1, pass: 2, skipped: 2 };
   const minLevel = levels[severity] ?? 1;
+  // pass/skipped 始终保留以展示规则覆盖情况；阈值只隐藏较低级别的问题项。
   return checks.filter(c => (statusToLevel[c.status] ?? 2) <= minLevel || c.status === 'pass' || c.status === 'skipped');
 }
 
@@ -1074,6 +1142,7 @@ function formatSummary(report) {
 
 /** 作为 validate-trace.mjs 的命令入口，编排参数、I/O 和退出码；顶层错误由文件末尾统一处理。 */
 function main() {
+  // 主流程同步执行，适合一次性 CLI；所有输入/用法错误约定退出码 2。
   const opts = parseCli();
 
   const inputFile = opts.latest ? findLatestJsonl() : opts.input;
@@ -1083,6 +1152,7 @@ function main() {
   console.error(`${TAG} loaded ${spans.length} spans`);
 
   const rules = loadRules(opts.rules);
+  // 可选 trace-id 在分组阶段过滤，不影响读取文件中其他行的健壮性处理。
   const traces = buildTraces(spans, opts['trace-id']);
 
   if (traces.length === 0) {
@@ -1106,12 +1176,14 @@ function main() {
   }
 
   if (opts.output) {
+    // 报告正文写目标文件，进度日志走 stderr，便于 CI 分离产物与控制台信息。
     writeFileSync(opts.output, output, 'utf8');
     console.error(`${TAG} report written to ${opts.output}`);
   } else {
     console.log(output);
   }
 
+  // 0=通过（可含 warning），1=Trace 规则错误，2=参数/输入/规则文件错误。
   process.exit(report.summary.verdict === 'FAIL' ? 1 : 0);
 }
 

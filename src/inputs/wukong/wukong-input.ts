@@ -610,16 +610,19 @@ export class WukongInput extends BaseInput {
       // userContent 是 turn 级 prompt，只注入第一个 step，后续 step 使用上一轮工具结果增量。
       const includeUserContent = !!userContent && currentStep.stepIndex === 1;
 
+      // 显式 STEP_FINISHED 路径同样输出成对 LLM 事件；request 先记录 step 层级和可选首轮 prompt。
       entries.push(buildAgentActivityEntry({
         timestamp: requestTimestamp,
         'event.id': hashId([sessionId, msg.id, 'request', String(currentStep.stepIndex)]),
         'event.name': 'llm.request',
+        // common 提供 session/Agent/Provider，当前对象补 turn、step、model 和 trace 关联。
         ...common,
         'gen_ai.turn.id': turnId,
         'gen_ai.step.id': currentStep.stepId,
         'gen_ai.request.model': model,
         'gen_ai.response.id': runId,
         'trace_id': traceId,
+        // 首 step 使用 messages_delta 表示新输入；后续 step 的工具结果会在后处理阶段注入。
         ...(includeUserContent ? {
           'gen_ai.input.messages_delta': [
             { role: 'user', parts: [{ type: 'text', content: userContent }] },
@@ -642,6 +645,7 @@ export class WukongInput extends BaseInput {
         outputParts.push({ type: 'text', content: `[error] ${runError.code}: ${runError.message}` });
       }
 
+      // response 与 request 共用业务身份，并创建挂在当前 step span 下的 LLM span。
       entries.push(buildAgentActivityEntry({
         timestamp: responseTimestamp,
         'event.id': hashId([sessionId, msg.id, 'response', String(currentStep.stepIndex)]),
@@ -656,23 +660,28 @@ export class WukongInput extends BaseInput {
         'trace_id': traceId,
         'span_id': llmSpanId,
         'parent_span_id': currentStep.stepSpanId,
+        // response 的 input.messages 只在首 step 写完整用户输入，避免每个 step 重复同一 prompt。
         ...(includeUserContent ? {
           'gen_ai.input.messages': [
             { role: 'user', parts: [{ type: 'text', content: userContent }] },
           ],
         } : {}),
         ...(outputParts.length > 0 ? {
+          // 文本与 tool_call 声明可以共存于同一 assistant message，保持模型原始响应语义。
           'gen_ai.output.messages': [{ role: 'assistant', parts: outputParts }],
         } : {}),
+        // usageEvent 已在闭包上方转换为安全数值；缺失时为 0，不把其他 step 的 token 借过来。
         'gen_ai.usage.input_tokens': inputTokens,
         'gen_ai.usage.output_tokens': outputTokens,
         'gen_ai.usage.cache_read.input_tokens': cachedTokens,
         'gen_ai.usage.total_tokens': totalTokens,
+        // 只有当前 step 的 RUN_ERROR 才写标准错误字段，flush 后马上清空 runError。
         ...(runError ? { 'error.type': runError.code, 'error.message': runError.message } : {}),
         attributes: {
           source: 'wukong',
           message_id: msg.id,
           conversation_id: msg.conversationId,
+          // 首 token 与完整 run 时间来自不同事件，仅在对应证据完整时输出。
           ...(firstTokenEvent ? {
             ttft_ms: firstTokenEvent.ttft_ms as number,
             e2e_ttft_ms: firstTokenEvent.e2e_ttft_ms as number,
@@ -942,22 +951,26 @@ export class WukongInput extends BaseInput {
       } else {
         responseTimestamp = Math.max(requestTimestamp + 1, runFinishedTs ?? msg.createdAt);
       }
+      // 每个 step 先生成 llm.request。event.id 使用 session/message/step 的稳定组合，重放时保持一致。
       entries.push(buildAgentActivityEntry({
         timestamp: requestTimestamp,
         'event.id': hashId([sessionId, msg.id, 'request', String(currentStep.stepIndex)]),
         'event.name': 'llm.request',
+        // common 提供 session、Agent、Provider 等公共字段；下面补充本 turn/step 的层级身份。
         ...common,
         'gen_ai.turn.id': turnId,
         'gen_ai.step.id': currentStep.stepId,
         'gen_ai.request.model': model,
         'gen_ai.response.id': runId,
         'trace_id': traceId,
+        // 用户 prompt 只属于第一步；工具后的后续 step 依赖上下文，不重复上报同一段正文。
         ...(userContent && currentStep.stepIndex === 1 ? {
           'gen_ai.input.messages_delta': [
             { role: 'user', parts: [{ type: 'text', content: userContent }] },
           ],
         } : {}),
         attributes: {
+          // Wukong 私有定位字段交给 entry-builder 展平为 agent.wukong.*。
           source: 'wukong',
           message_id: msg.id,
           conversation_id: msg.conversationId,
@@ -977,6 +990,7 @@ export class WukongInput extends BaseInput {
         outputParts.push({ type: 'text', content: `[error] ${runError.code}: ${runError.message}` });
       }
 
+      // response 与上面的 request 共用 turn/step/run ID，并创建真正参与 Trace 父子关系的 LLM span。
       const responseEntry = buildAgentActivityEntry({
         timestamp: responseTimestamp,
         'event.id': hashId([sessionId, msg.id, 'response', String(currentStep.stepIndex)]),
@@ -989,31 +1003,38 @@ export class WukongInput extends BaseInput {
         'gen_ai.response.model': model,
         'gen_ai.response.finish_reasons': finishReasons,
         'trace_id': traceId,
+        // LLM span 挂在 agent.step span 下；工具 span 也使用相同步骤父级，形成同一 wave。
         'span_id': llmSpanId,
         'parent_span_id': currentStep.stepSpanId,
         ...(userContent && currentStep.stepIndex === 1 ? {
+          // response 携带完整 input.messages，request 则携带 messages_delta，满足两种消费模式。
           'gen_ai.input.messages': [
             { role: 'user', parts: [{ type: 'text', content: userContent }] },
           ],
         } : {}),
         ...(outputParts.length > 0 ? {
+          // outputParts 可以同时包含文本和 tool_call 声明；空输出时整个字段省略而非写空数组。
           'gen_ai.output.messages': [
             { role: 'assistant', parts: outputParts },
           ],
         } : {}),
+        // Wukong usage 是本次 run 的数值快照；缺失字段在上方已收敛为 0，总量缺失时用输入加输出。
         'gen_ai.usage.input_tokens': inputTokens,
         'gen_ai.usage.output_tokens': outputTokens,
         'gen_ai.usage.cache_read.input_tokens': cachedTokens,
         'gen_ai.usage.total_tokens': totalTokens,
+        // 仅 RUN_ERROR 注入标准错误字段；普通非成功 finish reason 不自动视为异常。
         ...(runError ? { 'error.type': runError.code, 'error.message': runError.message } : {}),
         attributes: {
           source: 'wukong',
           message_id: msg.id,
           conversation_id: msg.conversationId,
+          // FIRST_TOKEN 提供首 token 延迟；没有该事件时不伪造性能值。
           ...(firstTokenEvent ? {
             ttft_ms: firstTokenEvent.ttft_ms as number,
             e2e_ttft_ms: firstTokenEvent.e2e_ttft_ms as number,
           } : {}),
+          // run_duration 只有起止事件都存在才计算，避免用消息时间混入不同口径。
           ...(runStartedTs && runFinishedTs ? {
             run_duration_ms: runFinishedTs - runStartedTs,
           } : {}),
@@ -1038,11 +1059,13 @@ export class WukongInput extends BaseInput {
       }
     }
     for (const [stepId, toolEntries] of stepsWithTools) {
+      // 已有正常 LLM 对的 step 不需要合成；这里只修复 Wukong 源事件缺少模型 wave 的结构空洞。
       if (stepsWithLlm.has(stepId)) continue;
       // 当前 step 有工具但没有 LLM，补一个合成 LLM 对。
       const callEntries = toolEntries.filter(e => e['event.name'] === 'tool.call');
       const synthOutputParts: Array<Record<string, string>> = [];
       for (const ce of callEntries) {
+        // 合成 response 只声明 call ID 和工具名；参数/结果仍留在真实 tool.* entry 中。
         synthOutputParts.push({
           type: 'tool_call',
           id: String(ce['gen_ai.tool.call.id'] ?? ''),
@@ -1051,12 +1074,14 @@ export class WukongInput extends BaseInput {
       }
       // 从工具 entry 推导合成 LLM 的请求/响应时间。
       const toolTimes = toolEntries.map(e => Number(e['time_unix_nano'] ?? 0) / 1e6);
+      // 请求放在最早工具前 1ms、响应放在最晚工具后 1ms，使时间轴包含完整工具波次。
       const synthReqTs = minOf(toolTimes) - 1;
       const synthRespTs = maxOf(toolTimes) + 1;
       const synthLlmSpanId = generateSpanId();
       // 从任一工具 entry 取得共享的 step parent_span_id。
       const stepParentSpanId = (toolEntries[0]['parent_span_id'] as string | undefined) ?? agentSpanId;
 
+      // 合成 request 使用确定性 event.id；没有原始 prompt 时写 continued 占位，满足 Schema 输入约束。
       entries.push(buildAgentActivityEntry({
         timestamp: synthReqTs,
         'event.id': hashId([sessionId, msg.id, 'synth-request', stepId]),
@@ -1072,6 +1097,7 @@ export class WukongInput extends BaseInput {
         ],
         attributes: { source: 'wukong', message_id: msg.id, conversation_id: msg.conversationId },
       }));
+      // 合成 response 创建 LLM span，finish reason 明确表示模型选择了工具而不是输出最终答案。
       entries.push(buildAgentActivityEntry({
         timestamp: synthRespTs,
         'event.id': hashId([sessionId, msg.id, 'synth-response', stepId]),
@@ -1085,6 +1111,7 @@ export class WukongInput extends BaseInput {
         'gen_ai.response.finish_reasons': ['tool_calls'],
         'trace_id': traceId,
         'span_id': synthLlmSpanId,
+        // 父级沿用真实工具 entry 的 step span；缺失时退回 turn 级 agent span。
         'parent_span_id': stepParentSpanId,
         'gen_ai.input.messages': [
           { role: 'user', parts: [{ type: 'text', content: userContent || '(continued)' }] },
@@ -1092,6 +1119,7 @@ export class WukongInput extends BaseInput {
         ...(synthOutputParts.length > 0 ? {
           'gen_ai.output.messages': [{ role: 'assistant', parts: synthOutputParts }],
         } : {}),
+        // 源事件没有这次隐含 LLM wave 的 usage，显式写 0 比借用整个 run 的 token 更不易误导。
         'gen_ai.usage.input_tokens': 0,
         'gen_ai.usage.output_tokens': 0,
         'gen_ai.usage.cache_read.input_tokens': 0,

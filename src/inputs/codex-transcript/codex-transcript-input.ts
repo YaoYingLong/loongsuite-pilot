@@ -746,39 +746,51 @@ export class CodexTranscriptInput extends BaseInput {
   private async baselineFile(filePath: string, key: string): Promise<void> {
     let stat;
     try {
+      // 固定当前文件大小作为 baseline 上界；扫描期间新追加的字节由首次 collect 处理。
       stat = await fs.stat(filePath);
     } catch {
+      // 文件可能在发现后被轮转，等待下一轮重新发现即可，不把暂时缺失视为启动失败。
       return;
     }
+    // baseline 仍需识别最近 meta 和未结束 turn，但不会构建或发送历史 entry。
     let latestSessionMetaOffset: number | null = null;
     let activeTurn: CodexActiveTranscriptTurn | null = null;
+    // 已闭合 turn 写入全局去重集合，防止它在另一个重复/迁移 transcript 中被再次恢复。
     const completedTurnIds: string[] = [];
     const { nextOffset } = await scanJsonLines(filePath, 0, stat.size, line => {
+      // scanJsonLines 已保证每项是完整 JSON 行；payload 仍需运行时验证，因为内容来自 Codex。
       const payload = asRecord(line.record.payload);
       if (!payload) return;
       if (line.record.type === 'session_meta') {
+        // 只记字节位置，后续需要时再回读完整 meta，避免 checkpoint 存储大段 instructions。
         latestSessionMetaOffset = line.startOffset;
         return;
       }
       const turnId = turnIdForStart(line.record, payload);
       if (turnId && (!activeTurn || activeTurn.turnId !== turnId)) {
+        // baseline 标志 true 让 createActiveTurn 知道这是安装前已有内容，不能把历史 prompt 当作新增输出。
         activeTurn = createActiveTurn(turnId, line.startOffset, timestampMs(line.record, Date.now()), true);
       }
       if (turnId && activeTurn?.turnId === turnId) {
+        // 起点记录可能同时携带 model/cwd/developer instructions，保存它们以支持跨重启后的增量尾部。
         updateActiveTurnMetadata(activeTurn, line.record, payload);
         return;
       }
       const terminalTurnId = terminalTurnIdFor(line.record, payload);
       if (terminalTurnId === activeTurn?.turnId) {
+        // 只有与 activeTurn 匹配的 terminal 才能关闭它，避免相邻或重复记录破坏状态机。
         completedTurnIds.push(terminalTurnId);
         activeTurn = null;
       }
     });
     const baselineActiveTurn = activeTurn as CodexActiveTranscriptTurn | null;
     if (baselineActiveTurn) {
+      // 历史前半段已被有意跳过，把恢复起点移到最后完整行；之后只解析新增记录。
       baselineActiveTurn.startOffset = nextOffset;
     }
+    // 全局集合先更新再保存文件 checkpoint，使同一启动周期扫描后续文件时立即生效。
     for (const turnId of completedTurnIds) this.rememberGlobalProcessedTerminalTurnId(turnId);
+    // scanOffset 使用 nextOffset 而非 stat.size：若 EOF 是半行，下次仍会从该半行开头读取。
     this.saveCheckpoint(key, {
       inode: stat.ino,
       scanOffset: nextOffset,

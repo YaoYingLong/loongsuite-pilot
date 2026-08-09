@@ -10,6 +10,7 @@ $EMPTY_RESULT = '{}'
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Processor = Join-Path $ScriptDir "cursor-hook-processor.mjs"
 
+# 最小 JSONL 错误记录器；所有自身异常吞掉，保持遥测旁路语义。
 function Log-Error {
     param([string]$Stage, [string]$Message)
     try {
@@ -40,6 +41,7 @@ if (-not (Test-Path $Processor)) {
 
 $MIN_NODE_MAJOR = 18
 
+# 校验文件存在和 Node 主版本；异常候选只返回 false，不终止候选搜索。
 function Test-NodeSuitable {
     param([string]$bin)
     if (-not (Test-Path $bin)) { return $false }
@@ -51,6 +53,7 @@ function Test-NodeSuitable {
     } catch { return $false }
 }
 
+# 优先使用安装器 pin，再按常见 Windows 版本管理器和 PATH 顺序寻找 Node >=18。
 function Resolve-NodeBin {
     $pinFile = Join-Path $env:USERPROFILE ".loongsuite-pilot\node-bin"
     if (Test-Path $pinFile) {
@@ -112,6 +115,7 @@ try {
         $psi.RedirectStandardError = $false
         $psi.CreateNoWindow = $true
 
+        # 写 BaseStream 可精确保留 stdin 字节，ReadToEnd 在 WaitForExit 前排空 stdout 防止缓冲区塞满。
         $proc = [System.Diagnostics.Process]::Start($psi)
         $proc.StandardInput.BaseStream.Write($rawBytes, 0, $rawBytes.Length)
         $proc.StandardInput.Close()

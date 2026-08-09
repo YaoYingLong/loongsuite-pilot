@@ -41,6 +41,7 @@ export const DEFAULT_E2E_INSTALLER_URL =
  * @param {NodeJS.ProcessEnv} env
  */
 export function rebootAutostartScript(installerUrl, userId, env) {
+  // URL/userId 会嵌入单引号 Bash 变量，先转义内部单引号；SLS flags 已由 helper 逐项引用。
   const u = installerUrl.replace(/'/g, `'\\''`);
   const id = userId.replace(/'/g, `'\\''`);
   const slsFlags = buildRemoteInstallSlsCliQuotedArgs(env);
@@ -122,6 +123,7 @@ exit 0
  * 生成重启后的验证脚本。
  */
 export function postRebootVerificationScript() {
+  // 该脚本设计为重启后单独执行，因此只读取 marker、服务状态和已有日志，不再次安装。
   return `
 set -euo pipefail
 echo "=== Post-Reboot Verification ==="
@@ -261,6 +263,7 @@ echo "=== Multi-account install test completed ==="
  * 生成自动升级测试脚本。
  */
 export function autoUpgradeScript(installerUrl, userId, env) {
+  // 此场景依赖安装器/Updater 的真实版本指针，不在 JavaScript 层伪造升级结果。
   const u = installerUrl.replace(/'/g, `'\\''`);
   const id = userId.replace(/'/g, `'\\''`);
   const slsFlags = buildRemoteInstallSlsCliQuotedArgs(env);
@@ -368,6 +371,7 @@ export function resolveVersionMatrixN(env) {
   const raw = (env?.E2E_AGENT_VERSIONS_N ?? '3').toString().trim();
   const n = Number.parseInt(raw, 10);
   if (!Number.isFinite(n) || n <= 0) return 3;
+  // 20 是资源保护上限：矩阵会为每个 Agent 安装 N 个历史版本并执行 probe。
   return Math.min(n, 20);
 }
 
@@ -391,6 +395,7 @@ export function resolveVersionMatrixFilter(env) {
  */
 export function resolveVersionMatrixAgents(matrix, env = process.env) {
   const filter = resolveVersionMatrixFilter(env);
+  // 只有声明 npmPackage 的矩阵项才能枚举 npm 历史版本；非 npm Agent 在这里自然排除。
   const agents = (matrix?.agents ?? []).filter(a => {
     const pkg = typeof a.npmPackage === 'string' ? a.npmPackage.trim() : '';
     if (!pkg) return false;
@@ -412,6 +417,7 @@ export function resolveVersionMatrixAgents(matrix, env = process.env) {
  * @returns {string}
  */
 export function buildVersionMatrixPrologueSh(env = process.env) {
+  // 各 helper 都可能返回空串；trimEnd 后用换行拼接，避免多个 export/config 命令粘连。
   const chunks = [];
   const secrets = buildRemoteSecretExportsSh(env);
   if (secrets) chunks.push(secrets.trimEnd());
@@ -434,6 +440,7 @@ export function buildVersionMatrixPrologueSh(env = process.env) {
  */
 export function buildVersionMatrixInstallPreludeSh(env = process.env) {
   const userId = (env?.E2E_USER_ID ?? '').trim();
+  // 没有 userId 时版本矩阵只测 Agent CLI，不隐式安装 Pilot。
   if (!userId) return '';
   const installerUrl = (env?.E2E_INSTALLER_URL ?? DEFAULT_E2E_INSTALLER_URL).replace(/'/g, `'\\''`);
   const slsFlags = buildRemoteInstallSlsCliQuotedArgs(env);
@@ -462,6 +469,7 @@ export function versionMatrixScript(matrix, env = process.env) {
   const prologue = buildVersionMatrixPrologueSh(env);
   const installPrelude = buildVersionMatrixInstallPreludeSh(env);
 
+  // 过滤后没有目标属于配置错误，返回显式失败脚本，让 runner 仍按统一方式收集 artifact。
   if (agents.length === 0) {
     return `
 set +e
@@ -741,6 +749,8 @@ exit 0
  * 是否满足 AgentActivityEntry (src/types/events.ts) 的必填字段 schema。
  * 独立导出便于单元测试。
  */
+// 下方字符串是会在目标机执行的 CommonJS 校验器：先 base64 传输，再读取 JSONL 并输出覆盖率；
+// 它只是字符串常量，导入本 ESM 模块时不会执行其中的文件读取或 process.exit。
 export const JSONL_VALIDATOR_JS = `'use strict';
 const fs = require('fs');
 const path = require('path');
@@ -890,6 +900,7 @@ process.exit(0);
  */
 export function buildJsonlValidationSh(env = process.env) {
   if ((env?.E2E_JSONL_VALIDATE ?? '1').toString().trim() === '0') return '';
+  // base64 避免嵌套 JavaScript 中的引号、模板字符被外层 Bash 提前解释。
   const b64 = Buffer.from(JSONL_VALIDATOR_JS, 'utf8').toString('base64');
   return `
 # === [jsonl-validate] AgentActivityEntry schema 校验（src/types/events.ts）===
@@ -925,6 +936,7 @@ fi
  * 构建 Bash 脚本：创建文件采集配置和测试日志，等待 Pilot 发现，并验证管道已经处理这些文件。
  */
 export function buildFileCollectionValidationSh() {
+  // 返回的是完整破坏性 E2E 脚本：会改测试用户 config、重启服务、创建/轮转日志，最后清理测试配置。
   return `
 set -euo pipefail
 echo ""
@@ -1305,6 +1317,7 @@ echo "Running inside Docker container"
 export function localBuildInstallScript(userId, env) {
   const id = (userId || '').replace(/'/g, `'\\''`);
 
+  // flags 作为独立 shell token 构建，避免可选 SLS 参数缺失时留下空占位。
   const installerFlags = [`--user.id '${id}'`];
 
   if (shouldPropagateSlsToRemoteInstall(env)) {
@@ -1440,6 +1453,7 @@ echo "uninstall: script finished"
  * @param {string} requiredAgentsCsv 逗号分隔的 Agent 前缀，例如 `claude-code,codex,qoder`。
  */
 export function buildJsonlAgentCoverageCheck(requiredAgentsCsv) {
+  // 将 Agent 名映射为合法 shell 变量后，为每个前缀生成独立文件存在性循环。
   const agents = requiredAgentsCsv.split(',').map(s => s.trim()).filter(Boolean);
   const checks = agents.map(agent => [
     `_found_${agent.replace(/[^a-zA-Z0-9]/g, '_')}=0`,
@@ -1493,6 +1507,7 @@ export function buildAgentConfigSetupScript(env) {
 
 /** 内部函数同步地判断 shouldEnsureAgentClis 的条件，不产生文件、网络或进程副作用。 */
 function shouldEnsureAgentClis(env, useMatrixProbe) {
+  // 显式布尔字符串优先；未设置时仅矩阵 probe 默认需要 ensure。
   const v = env.E2E_ENSURE_AGENT_CLIS?.trim().toLowerCase();
   if (v === '0' || v === 'false' || v === 'no') return false;
   if (v === '1' || v === 'true' || v === 'yes') return true;
@@ -1503,6 +1518,7 @@ function shouldEnsureAgentClis(env, useMatrixProbe) {
 export function buildAgentEnsureOnlyScript(env) {
   const useMatrix = env.E2E_USE_MATRIX_PROBE?.trim() === '1';
   if (!shouldEnsureAgentClis(env, useMatrix)) return '';
+  // loadAgentMatrix 可能抛出文件/JSON 错误，交由顶层 runner 统一失败处理。
   const matrix = loadAgentMatrix(env);
   console.log('[e2e-docker] Ensuring agent-matrix CLIs');
   return buildEnsureAgentClisScript(matrix, env);
@@ -1520,6 +1536,7 @@ export function buildAgentProbeOnlyScript(env) {
   const matrix = loadAgentMatrix(env);
   const ensure = shouldEnsureAgentClis(env, useMatrix);
 
+  // ensure 和 probe 保持可分离，install-smoke 可先安装 CLI、重启 Pilot 完成发现，再生成真实会话。
   let body = '';
   if (ensure) {
     console.log('[e2e-docker] Ensuring agent-matrix CLIs');
@@ -1538,6 +1555,7 @@ export function buildAgentProbeOnlyScript(env) {
 
 /** 导出函数同步地构建 buildProbeEnvInjections 对应的配置或脚本文本；只有调用方执行返回值时才产生外部副作用。 */
 export function buildProbeEnvInjections(env) {
+  // secrets 块位于 probe 命令之前；日志只打印 token 长度，不打印凭据值。
   const chunks = [buildRemoteSecretExportsSh(env)];
   const tok = normalizeE2eQoderPersonalAccessToken(env.E2E_QODER_PERSONAL_ACCESS_TOKEN);
   if (tok) {

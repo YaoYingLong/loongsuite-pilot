@@ -2,7 +2,7 @@
  * plugin-migration.ts — 清理老 Claude/Codex plugin 残留。
  *
  * 在 DeploymentManager.deployAll() 入口最先运行（阶段 0）。Q15 决策：每次启动扫描，
- * 不写 marker 文件;若 cache 目录不存在则快速跳过(纳秒级 fs.exists 调用)。
+ * 不写 marker 文件；若 cache 目录不存在则通过一次同步存在性检查快速跳过。
  *
  * 完全 fail-open:任何一步失败 logger.warn + 继续,不阻断 deployAll。
  *
@@ -27,26 +27,39 @@
  *   5. rm -rf ~/.cache/opentelemetry.instrumentation.codex/
  */
 
+// 同步 fs 只用于低成本存在性门控；真正的读写/删除使用 Promise API，避免长操作阻塞事件循环。
 import * as fs from 'node:fs';
 import * as fsp from 'node:fs/promises';
+// 所有目标路径都通过 path.join 生成，兼容 Windows 与 Unix 分隔符。
 import * as path from 'node:path';
+// `os.homedir()` 是 HOME 未设置时的跨平台兜底。
 import * as os from 'node:os';
 import { createLogger } from '../utils/logger.js';
 
 const logger = createLogger('PluginMigration');
 
+/** 一项迁移动作的可诊断结果；失败步骤不会阻断后续动作。 */
 export interface PluginMigrationStepReport {
+  /** 稳定阶段名，调用方/日志可据此定位 settings、alias、cache 等步骤。 */
   stage: string;
+  /** 当前动作是否成功；目标不存在也按幂等成功处理。 */
   ok: boolean;
+  /** 面向日志的英文细节，可能包含目标路径、删除数量或错误消息。 */
   detail?: string;
 }
 
+/** Claude 与 Codex 两条迁移链的完整结果。 */
 export interface PluginMigrationReport {
+  /** Claude 旧插件是否命中 cache 门槛，以及执行过的各步骤。 */
   claude: { migrated: boolean; steps: PluginMigrationStepReport[] };
+  /** Codex 旧插件是否命中 cache 门槛，以及执行过的各步骤。 */
   codex: { migrated: boolean; steps: PluginMigrationStepReport[] };
 }
 
-/** 解析要清理的用户 HOME。 */
+/**
+ * 解析要清理的用户 HOME。
+ * 安装脚本可显式注入 HOME；否则使用 Node 的平台 API。函数不验证目录是否存在。
+ */
 function home(): string { return process.env.HOME || os.homedir(); }
 
 /** 容错同步存在性检查；权限等异常按不存在处理。 */
@@ -58,12 +71,14 @@ function safeExistsSync(p: string): boolean {
 async function safeRmRf(p: string, steps: PluginMigrationStepReport[], stage: string): Promise<void> {
   try {
     if (safeExistsSync(p)) {
+      // force 允许并发清理导致目标在 rm 前消失；recursive 负责 cache 的完整目录树。
       await fsp.rm(p, { recursive: true, force: true });
       steps.push({ stage, ok: true, detail: `removed ${p}` });
     } else {
       steps.push({ stage, ok: true, detail: `not present ${p}` });
     }
   } catch (err) {
+    // 报告与结构化日志同时保留失败，但函数正常兑现以继续执行剩余迁移步骤。
     steps.push({ stage, ok: false, detail: `${p}: ${(err as Error).message}` });
     logger.warn('rm -rf failed', { path: p, error: String(err) });
   }
@@ -73,6 +88,7 @@ async function safeRmRf(p: string, steps: PluginMigrationStepReport[], stage: st
 async function safeUnlink(p: string, steps: PluginMigrationStepReport[], stage: string): Promise<void> {
   try {
     if (safeExistsSync(p)) {
+      // 此处目标约定为单文件，故意不用 recursive rm，避免路径配置异常时扩大删除范围。
       await fsp.unlink(p);
       steps.push({ stage, ok: true, detail: `removed ${p}` });
     } else {
@@ -94,12 +110,14 @@ function isClaudeOldPath(s: string): boolean {
 
 /** 读取 Claude settings，删除 nested/flat 历史 Hook，保留第三方条目。 */
 async function cleanClaudeSettings(steps: PluginMigrationStepReport[]): Promise<void> {
+  // 只操作当前 HOME 下 Claude 的用户级 settings，不扫描项目级配置。
   const settingsPath = path.join(home(), '.claude', 'settings.json');
   if (!safeExistsSync(settingsPath)) {
     steps.push({ stage: 'claude_settings', ok: true, detail: 'settings.json not present' });
     return;
   }
   try {
+    // 先读完整 UTF-8 文本再 parse；迁移不会尝试修复损坏 JSON。
     const raw = await fsp.readFile(settingsPath, 'utf-8');
     let data: any;
     try { data = JSON.parse(raw); } catch {
@@ -111,6 +129,7 @@ async function cleanClaudeSettings(steps: PluginMigrationStepReport[]): Promise<
       return;
     }
     let removed = 0;
+    // hooks 的 key 是事件名；每个事件数组独立过滤，未知事件和非数组值原样保留。
     for (const event of Object.keys(data.hooks)) {
       const arr = data.hooks[event];
       if (!Array.isArray(arr)) continue;
@@ -119,8 +138,10 @@ async function cleanClaudeSettings(steps: PluginMigrationStepReport[]): Promise<
           // 嵌套格式：{hooks: [{command}]}。
           if (Array.isArray(entry?.hooks)) {
             const subFiltered = entry.hooks.filter((h: any) => !isClaudeOldPath(h?.command));
+            // 子数组完全未变化时返回原对象，避免无意义重写其余未知字段。
             if (subFiltered.length === entry.hooks.length) return entry;
             removed += entry.hooks.length - subFiltered.length;
+            // 嵌套 hooks 被清空时移除整个 wrapper；否则浅拷贝并保留 matcher 等第三方字段。
             return subFiltered.length === 0 ? null : { ...entry, hooks: subFiltered };
           }
           // 扁平格式：{command}。
@@ -132,15 +153,18 @@ async function cleanClaudeSettings(steps: PluginMigrationStepReport[]): Promise<
         })
         .filter((e: any) => e !== null);
       if (filtered.length === 0) {
+        // 事件已无任何 Hook 时删除 key；保留空事件数组没有部署意义。
         delete data.hooks[event];
       } else {
         data.hooks[event] = filtered;
       }
     }
     if (removed === 0) {
+      // 没命中旧条目时不重写 JSON，避免仅因格式化造成用户配置 churn。
       steps.push({ stage: 'claude_settings', ok: true, detail: 'no otel-claude-hook entries' });
       return;
     }
+    // 命中后以两空格格式化覆盖原文件；该迁移没有临时文件/rename 原子写保护。
     await fsp.writeFile(settingsPath, JSON.stringify(data, null, 2) + '\n', 'utf-8');
     steps.push({ stage: 'claude_settings', ok: true, detail: `removed ${removed} entries` });
   } catch (err) {
@@ -151,13 +175,16 @@ async function cleanClaudeSettings(steps: PluginMigrationStepReport[]): Promise<
 
 /** 从常见 shell rc 删除旧 Claude marker 区块。 */
 async function cleanClaudeShellAliases(steps: PluginMigrationStepReport[]): Promise<void> {
+  // 当前只覆盖三种常见用户启动文件，不处理 fish/profile.d 等其他 shell 配置。
   const targets = ['.bashrc', '.zshrc', '.bash_profile'];
+  // [\s\S]*? 以非贪婪方式跨行匹配每一对 marker，前后换行也一并收敛。
   const re = /\n?# BEGIN otel-claude-hook\n[\s\S]*?# END otel-claude-hook\n?/g;
   for (const f of targets) {
     const p = path.join(home(), f);
     if (!safeExistsSync(p)) continue;
     try {
       const content = await fsp.readFile(p, 'utf-8');
+      // 快速字符串门控可避免没有 marker 的 rc 文件被无意义重写。
       if (!content.includes('# BEGIN otel-claude-hook')) continue;
       const replaced = content.replace(re, '\n');
       await fsp.writeFile(p, replaced, 'utf-8');
@@ -174,9 +201,11 @@ async function migrateClaude(): Promise<{ migrated: boolean; steps: PluginMigrat
   const cacheDir = path.join(home(), '.cache', 'opentelemetry.instrumentation.claude');
   const steps: PluginMigrationStepReport[] = [];
   if (!safeExistsSync(cacheDir)) {
+    // cache 是整条迁移链的检测门槛：只有 settings/rc 残留但 cache 已不存在时不会在此清理。
     return { migrated: false, steps: [{ stage: 'detect', ok: true, detail: 'no claude plugin residue' }] };
   }
   logger.info('cleaning up old claude plugin residue');
+  // 各 helper 自己捕获错误，所以后一步不会因前一步失败而被跳过。
   await cleanClaudeSettings(steps);
   await safeUnlink(path.join(home(), '.claude', 'otel-config.json'), steps, 'claude_otel_config');
   await cleanClaudeShellAliases(steps);
@@ -194,6 +223,7 @@ function isCodexOldPath(s: string): boolean {
 
 /** 从 Codex hooks.json 删除 nested/flat 历史 Hook，保留第三方条目。 */
 async function cleanCodexHooksJson(steps: PluginMigrationStepReport[]): Promise<void> {
+  // 与 Claude 类似，只清理用户级 hooks.json 中明确指向 Pilot 旧 OTel 插件的命令。
   const hooksPath = path.join(home(), '.codex', 'hooks.json');
   if (!safeExistsSync(hooksPath)) {
     steps.push({ stage: 'codex_hooks_json', ok: true, detail: 'hooks.json not present' });
@@ -211,6 +241,7 @@ async function cleanCodexHooksJson(steps: PluginMigrationStepReport[]): Promise<
       return;
     }
     let removed = 0;
+    // 同时兼容 `{hooks:[...]}` wrapper 和直接 `{command}` 两种历史 JSON shape。
     for (const event of Object.keys(data.hooks)) {
       const arr = data.hooks[event];
       if (!Array.isArray(arr)) continue;
@@ -236,11 +267,13 @@ async function cleanCodexHooksJson(steps: PluginMigrationStepReport[]): Promise<
       }
     }
     if (Object.keys(data.hooks).length === 0) {
+      // 这里按整个 hooks 对象为空删除文件，即使原文件本来就是空 hooks 也会执行删除。
       await fsp.unlink(hooksPath);
       steps.push({ stage: 'codex_hooks_json', ok: true, detail: 'hooks.json removed (empty)' });
       return;
     }
     if (removed === 0) {
+      // 保留所有非 Pilot Hook 和原有 JSON 排版。
       steps.push({ stage: 'codex_hooks_json', ok: true, detail: 'no otel-codex-hook entries' });
       return;
     }
@@ -268,6 +301,7 @@ async function cleanCodexConfigToml(steps: PluginMigrationStepReport[]): Promise
     return;
   }
   try {
+    // 迁移采用受限行扫描而非完整 TOML parser，只处理已知旧插件生成格式。
     let content = await fsp.readFile(configPath, 'utf-8');
     const before = content;
 
@@ -281,6 +315,7 @@ async function cleanCodexConfigToml(steps: PluginMigrationStepReport[]): Promise
       steps.push({ stage: 'codex_config_toml', ok: true, detail: 'no legacy hook entries' });
       return;
     }
+    // 删除区段后最多保留一个空行，并保证文件以单个换行结尾。
     content = content.replace(/\n{3,}/g, '\n\n').trimEnd() + '\n';
     await fsp.writeFile(configPath, content, 'utf-8');
     steps.push({ stage: 'codex_config_toml', ok: true, detail: 'cleaned legacy hooks' });
@@ -302,6 +337,7 @@ function removeLegacyMarkerHooks(content: string): string {
   const marker = '# OpenTelemetry instrumentation hooks';
   if (!content.includes(marker) && !content.includes('otel-codex-hook')) return content;
 
+  // 保留未命中行的原始文本；split/join 只在实际调用者确认变化后才写回文件。
   const lines = content.split('\n');
   const out: string[] = [];
   const hooksArrayHeader = /^\s*\[\[hooks\.[A-Za-z][A-Za-z0-9_]*\]\]\s*$/;
@@ -310,12 +346,15 @@ function removeLegacyMarkerHooks(content: string): string {
   let i = 0;
   while (i < lines.length) {
     if (lines[i]!.trim() === marker) {
+      // 丢弃 marker 本身，再消费其后连续的旧 hooks 数组 section。
       i++;
       while (i < lines.length) {
         const line = lines[i]!;
         const trimmed = line.trim();
+        // section 之间的空行属于旧生成块，也随之删除。
         if (trimmed === '') { i++; continue; }
         if (hooksArrayHeader.test(line)) {
+          // 先跳过 [[hooks.X]] 头，再跳过直到空行或下一个 TOML section 的字段行。
           i++;
           while (i < lines.length) {
             const t = lines[i]!.trim();
@@ -328,7 +367,7 @@ function removeLegacyMarkerHooks(content: string): string {
       }
       continue;
     }
-    // 流浪的 otel-codex-hook 行(在 marker 块外)
+    // 清理 marker 块外的孤立旧命令行，但保留同名 BEGIN/END trust marker。
     if (
       lines[i]!.includes('otel-codex-hook')
       && !lines[i]!.includes('# BEGIN otel-codex-hook')
@@ -345,7 +384,9 @@ function removeLegacyMarkerHooks(content: string): string {
 
 /** 删除 `[features]` 中旧 codex_hooks alias，并移除清空后的 section。 */
 function removeCodexHooksAlias(content: string): string {
+  // 没有目标文本时原样返回，避免不必要的数组分配。
   if (!content.includes('codex_hooks')) return content;
+  // 仅删除行首字段赋值，不删除注释或值中偶然出现的同名文本。
   const lines = content.split('\n').filter((l) => !/^\s*codex_hooks\s*=/.test(l));
   // 如果 [features] 段下没有任何字段了,顺带删 [features] 行
   const out: string[] = [];
@@ -353,6 +394,7 @@ function removeCodexHooksAlias(content: string): string {
     const line = lines[i]!;
     if (/^\[features\]\s*$/.test(line)) {
       let j = i + 1;
+      // 越过空行寻找本 section 的下一项；遇到新 section/EOF 才判定为空。
       while (j < lines.length && lines[j]!.trim() === '') j++;
       if (j >= lines.length || /^\[/.test(lines[j]!)) {
         i = j - 1; // 跳过已处理的 [features] 区段。
@@ -369,6 +411,7 @@ async function migrateCodex(): Promise<{ migrated: boolean; steps: PluginMigrati
   const cacheDir = path.join(home(), '.cache', 'opentelemetry.instrumentation.codex');
   const steps: PluginMigrationStepReport[] = [];
   if (!safeExistsSync(cacheDir)) {
+    // 与 Claude 一致，以旧 cache 目录存在作为执行配置清理的唯一门槛。
     return { migrated: false, steps: [{ stage: 'detect', ok: true, detail: 'no codex plugin residue' }] };
   }
   logger.info('cleaning up old codex plugin residue');
@@ -385,6 +428,7 @@ async function migrateCodex(): Promise<{ migrated: boolean; steps: PluginMigrati
  * 顺序运行 Claude 与 Codex 迁移并返回逐步骤报告；子步骤均 fail-open。
  */
 export async function runPluginMigration(): Promise<PluginMigrationReport> {
+  // 顺序执行可避免两条链同时改写同一用户 HOME；当前目标文件不同，但报告顺序因此稳定。
   const claude = await migrateClaude();
   const codex = await migrateCodex();
   if (claude.migrated || codex.migrated) {

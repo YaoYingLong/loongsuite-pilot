@@ -27,6 +27,7 @@ PROCESSOR="$HOOKS_DIR/qoderwork-hook-processor.mjs"
 
 MIN_NODE_MAJOR=18
 
+# 单个候选不可用时返回非零，外层 for 会继续搜索下一条路径。
 node_is_suitable() {
   local bin="$1"
   [[ -x "$bin" ]] || return 1
@@ -39,6 +40,7 @@ node_is_suitable() {
   return 0
 }
 
+# 应用包自带 Node 可能绑定宿主动态库，作为独立 processor runtime 风险较高，故排除。
 node_is_app_bundle() {
   local resolved
   resolved="$(realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || echo "$1")"
@@ -92,4 +94,5 @@ if [[ -z "$NODE_BIN" ]]; then
   exit 0
 fi
 
+# exec 将当前 PID 交给 Node，并原样继承标准输入、输出和错误流。
 exec "$NODE_BIN" "$PROCESSOR" --agent-id "$AGENT_ID"

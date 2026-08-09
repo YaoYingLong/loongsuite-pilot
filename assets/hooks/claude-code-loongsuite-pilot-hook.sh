@@ -28,6 +28,7 @@ case "$SUBCOMMAND" in
     ;;
 esac
 
+# 错误消息先经 Python JSON 编码，防止引号或换行破坏诊断 JSONL；Python 缺失时回退空字符串。
 log_error() {
   local stage="$1"
   local message="$2"
@@ -61,6 +62,7 @@ fi
 
 MIN_NODE_MAJOR=18
 
+# 排除 macOS .app 内随应用分发的 Node，它可能无法作为独立 Hook runtime 使用。
 node_is_app_bundle() {
   local resolved
   resolved="$(realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || echo "$1")"
@@ -72,6 +74,7 @@ node_is_app_bundle() {
   return 1
 }
 
+# 同时检查可执行权限、来源和主版本；任何探测失败均返回非零供候选循环继续。
 node_is_suitable() {
   local bin="$1"
   [[ -x "$bin" ]] || return 1
@@ -128,6 +131,7 @@ if [[ -z "$NODE_BIN" ]]; then
 fi
 
 # 不显式读取 stdin，让 processor 直接继承同一管道，避免一次额外编码转换。
+# 处理器继承 stdin；其非零退出仅写诊断并返回 `{}`，wrapper 最终仍 exit 0。
 if ! "$NODE_BIN" "$PROCESSOR" "$SUBCOMMAND"; then
   echo "[claude-code-hook] processor failed (subcommand=$SUBCOMMAND)" >&2
   log_error "processor_failed" "hook processor exited non-zero (subcommand=$SUBCOMMAND)"

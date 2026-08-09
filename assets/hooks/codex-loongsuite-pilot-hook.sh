@@ -18,6 +18,7 @@ PROCESSOR="$SCRIPT_DIR/codex-hook-processor.mjs"
 EMPTY_RESULT='{}'
 SUBCOMMAND="${1:-unknown}"
 
+# 将包装层故障写成 JSONL。函数内部所有可能失败的命令都被兜底，返回码不会触发严格模式退出。
 log_error() {
   local stage="$1"
   local message="$2"
@@ -50,6 +51,7 @@ fi
 
 MIN_NODE_MAJOR=18
 
+# macOS 应用包内的 Node 可能依赖宿主 Framework，脱离该应用启动会失败，因此显式拒绝。
 node_is_app_bundle() {
   local resolved
   resolved="$(realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || echo "$1")"
@@ -61,6 +63,7 @@ node_is_app_bundle() {
   return 1
 }
 
+# Shell 函数以 0 表示“可用”、非 0 表示“不可用”；调用方可直接放在 if 条件中。
 node_is_suitable() {
   local bin="$1"
   [[ -x "$bin" ]] || return 1
@@ -76,6 +79,7 @@ node_is_suitable() {
 NODE_PIN_FILE="$HOME/.loongsuite-pilot/node-bin"
 NODE_BIN=""
 
+# 先尝试安装器写入的固定路径；读取时删除所有空白，避免末尾换行进入可执行文件名。
 if [[ -f "$NODE_PIN_FILE" ]]; then
   pinned="$(cat "$NODE_PIN_FILE" 2>/dev/null | tr -d '[:space:]')"
   if [[ -n "$pinned" ]] && node_is_suitable "$pinned"; then
@@ -83,6 +87,7 @@ if [[ -f "$NODE_PIN_FILE" ]]; then
   fi
 fi
 
+# pin 不可用时按 nvm 新版本到旧版本、常见管理器路径、最后 PATH 的顺序只读搜索。
 if [[ -z "$NODE_BIN" ]]; then
   nvm_candidates=("$HOME/.nvm/versions/node"/*/bin/node)
   candidates=()
@@ -114,6 +119,7 @@ if [[ -z "$NODE_BIN" ]]; then
   exit 0
 fi
 
+# 不捕获 stdin，Node 进程直接继承原管道；`if !` 把非零退出转换为可记录的 fail-open 分支。
 if ! "$NODE_BIN" "$PROCESSOR" "$SUBCOMMAND"; then
   echo "[codex-hook] processor failed (subcommand=$SUBCOMMAND)" >&2
   log_error "processor_failed" "hook processor exited non-zero (subcommand=$SUBCOMMAND)"

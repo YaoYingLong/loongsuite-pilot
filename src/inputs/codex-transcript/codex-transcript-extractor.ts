@@ -136,7 +136,9 @@ function extractCodexTurn(
     developerInstructions?: string;
   },
 ): CodexPartialTurnExtraction | null {
+  // 完整提取必须先看到目标 turn 起点；增量提取由 checkpoint 已确认 turn，因此可直接打开状态机。
   let currentTurnId = opts.requireTerminal ? '' : expectedTurnId;
+  // 0 表示尚无可靠时间。终态、模型和上下文会在扫描对应记录时逐步覆盖。
   let startedAtMs = opts.startedAtMs ?? 0;
   let terminalAtMs = 0;
   let status: CodexTerminalStatus | null = null;
@@ -145,15 +147,19 @@ function extractCodexTurn(
   let model = opts.model ?? 'unknown';
   let cwd = opts.cwd;
   let developerInstructions = opts.developerInstructions;
+  // prompt 保存便于直接读取的拼接文本，promptParts/inputMessages 则保留构建标准消息所需的分片。
   let prompt: string | undefined;
   const promptParts: string[] = [];
   const inputMessages: JsonValue[] = [];
+  // stepEnvelopes 是按 response wave 排列的最终序列；Map 用 call ID 将异步工具结果定位回所属 step。
   const stepEnvelopes: StepEnvelope[] = [];
   const unmatchedTokenUsages: CodexTranscriptUsage[] = [];
   const toolSteps = new Map<string, StepEnvelope>();
+  // Web Search 的 start/end 可能先于或后于 response_item 到达，两个 Map 暂存精确边界供会合。
   const webSearchStarts = new Map<string, number>();
   const webSearchEnds = new Map<string, number>();
   let currentStep: StepEnvelope | null = null;
+  // lastUsage 用于过滤累计 token 重复快照；lastActivityAtMs 为缺少显式 request 的 wave 提供起点。
   let lastUsage: CodexTranscriptUsage | undefined;
   let lastActivityAtMs = 0;
 
@@ -161,8 +167,10 @@ function extractCodexTurn(
   const beginStep = (timestamp: number, source: CodexTranscriptSourceRecord): StepEnvelope => {
     if (!currentStep) {
       const previous = stepEnvelopes.at(-1);
+      // 已闭合 LLM 后又出现新 wave，说明 previous 不是 turn 最终响应，builder 应把它视作中间步骤。
       if (previous?.llmClosed) previous.followedByAnotherWave = true;
       currentStep = {
+        // 新 step 初始时 request/response/completed 共用当前时刻；后续证据会分别校正这些边界。
         step: {
           startedAtMs: timestamp,
           responseAtMs: timestamp,
@@ -172,6 +180,7 @@ function extractCodexTurn(
           tools: [],
         },
         sourceRange: {
+          // 字节范围决定 Input 成功发送后可把 checkpoint 安全推进到哪里。
           startOffset: source.startOffset,
           endOffset: source.endOffset,
         },
@@ -548,12 +557,14 @@ function transcriptToolCall(
   timestamp: number,
 ): CodexTranscriptTool | null {
   if (itemType === 'web_search_call') {
+    // Web Search 旧协议可能没有 call ID，使用时间派生 ID，确保同一记录内调用与合成结果可配对。
     const callId = stringValue(payload.call_id) ?? stringValue(payload.id) ?? `web_search:${timestamp}`;
     return {
       callId,
       name: 'web_search',
       input: toJsonValue(parseMaybeJson(payload.action)),
       startedAtMs: timestamp,
+      // web_search_call 本身同时带 action/status，且通常没有独立 output，因此立即闭合工具结构。
       output: toJsonValue({
         ...(payload.status !== undefined ? { status: payload.status } : {}),
         ...(payload.action !== undefined ? { action: parseMaybeJson(payload.action) } : {}),
@@ -561,10 +572,13 @@ function transcriptToolCall(
       completedAtMs: timestamp,
     };
   }
+  // 仅三种调用类型进入普通工具分支；message、reasoning 等 response_item 由主状态机处理。
   if (itemType !== 'function_call' && itemType !== 'custom_tool_call' && itemType !== 'tool_search_call') return null;
+  // 不同 Codex 版本分别使用 call_id 和 id；两者都缺失时无法与 output 配对。
   const callId = stringValue(payload.call_id) ?? stringValue(payload.id);
   if (!callId) return null;
   const name = stringValue(payload.name) ?? (itemType === 'tool_search_call' ? 'tool_search' : 'unknown');
+  // custom_tool_call 把参数放在 input，其他调用放在 arguments；normalizeToolInput 再做稳定字段裁剪。
   const rawInput = itemType === 'custom_tool_call' ? payload.input : payload.arguments;
   return {
     callId,
@@ -579,10 +593,12 @@ function transcriptToolOutput(
   itemType: string | undefined,
   payload: Record<string, unknown>,
 ): { callId: string; output?: JsonValue } | null {
+  // 调用记录和输出记录是不同 itemType，先限制到输出集合，避免误解析普通 message。
   if (itemType !== 'function_call_output' && itemType !== 'custom_tool_call_output' && itemType !== 'tool_search_output') return null;
   const callId = stringValue(payload.call_id) ?? stringValue(payload.id);
   if (!callId) return null;
   if (itemType === 'tool_search_output') {
+    // 搜索输出是复合结构，保留执行状态、执行摘要和工具列表，字段缺失时分别省略。
     return {
       callId,
       output: toJsonValue({
@@ -592,6 +608,7 @@ function transcriptToolOutput(
       }),
     };
   }
+  // 普通函数/custom tool 的 output 可能是 JSON 字符串；解析失败时 parseMaybeJson 会保留原文本。
   return { callId, output: toJsonValue(parseMaybeJson(payload.output)) };
 }
 

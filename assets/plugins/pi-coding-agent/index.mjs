@@ -31,6 +31,7 @@ const pluginDir = path.dirname(fileURLToPath(import.meta.url));
 // 安装后布局为 `$PILOT_DATA/plugins/pi-coding-agent/index.mjs`，向上两级即数据目录。
 const installedDataDir = path.resolve(pluginDir, '..', '..');
 
+/** 优先采用安装器注入的数据目录；缺少环境变量时按插件实际安装位置反推。 */
 function resolveDataDir() {
   return process.env.LOONGSUITE_PILOT_DATA_DIR || installedDataDir;
 }
@@ -39,6 +40,7 @@ function resolveLogDir() {
   return path.join(resolveDataDir(), 'logs', AGENT_TYPE);
 }
 
+/** 使用本地日期而非 UTC 日期分卷，和 Collector 按本地“今天”扫描日志的规则一致。 */
 function todayStamp() {
   const d = new Date();
   return [
@@ -48,10 +50,12 @@ function todayStamp() {
   ].join('-');
 }
 
+/** 把宿主时间收敛为整数毫秒；NaN/Infinity 会回退到插件实际观察时间。 */
 function timestampMillis(timestamp = Date.now()) {
   return Number.isFinite(timestamp) ? Math.trunc(timestamp) : Date.now();
 }
 
+/** 纳秒时间用字符串承载，避免超过 JavaScript Number 的 53 位安全整数范围。 */
 function timestampNanos(timestamp = Date.now()) {
   const millis = timestampMillis(timestamp);
   return String(BigInt(millis) * 1_000_000n);
@@ -76,6 +80,13 @@ function truncate(value, max = MAX_STRING_LENGTH) {
   return `${value.slice(0, max)}...[truncated]`;
 }
 
+/**
+ * 把宿主对象裁剪成可 JSON 序列化的有限结构。
+ *
+ * Pi 事件可能含函数、BigInt、循环引用或很深的工具参数；直接 JSON.stringify 会抛错或生成
+ * 巨型日志。本递归转换限制深度、键数、数组长度和字符串长度，同时在离开对象时移除 seen，
+ * 因而“两个字段引用同一对象”不会被误判为环，只有当前递归路径上的回边才标记 Circular。
+ */
 function toSerializable(value, depth = 0, seen = new WeakSet()) {
   if (value === undefined) return undefined;
   if (value === null || typeof value === 'boolean' || typeof value === 'number') return value;
@@ -112,6 +123,7 @@ function safeStringify(value) {
 
 let logDirReady = false;
 
+/** 首次写入时创建目录；成功后用进程内布尔值省掉每条事件一次 stat/mkdir。 */
 function ensureLogDir() {
   if (logDirReady) return;
   const dir = resolveLogDir();
@@ -120,6 +132,11 @@ function ensureLogDir() {
   logDirReady = true;
 }
 
+/**
+ * 同步追加一段 UTF-8 文本并保证文件权限。
+ * 同步 I/O 会短暂占用 Pi 的 JavaScript 线程，但单条记录已受大小限制，且可确保 Hook 返回前数据落盘。
+ * 若目录被外部清理，ENOENT 分支会清除缓存并重建一次；其他错误交给 safeHandler 记录后吞掉。
+ */
 function appendLogFile(fileName, content) {
   const filePath = path.join(resolveLogDir(), fileName);
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -162,6 +179,10 @@ function writeRecord(record) {
   }
 }
 
+/**
+ * 给 Pi 的异步监听器增加统一异常边界。
+ * `await` 会捕获同步异常和 Promise rejection；包装器自身不再抛出，从而保持遥测 fail-open。
+ */
 function safeHandler(name, handler) {
   return async (event, ctx) => {
     try {
@@ -172,6 +193,7 @@ function safeHandler(name, handler) {
   };
 }
 
+/** 每次 session/agent 开始时重新读配置，使用户无需重启 Pi 也能更新 userId/内容采集开关。 */
 function loadPilotConfig() {
   try {
     return JSON.parse(fs.readFileSync(path.join(resolveDataDir(), 'config.json'), 'utf8'));
@@ -214,6 +236,7 @@ function normalizeFinishReason(reason) {
   return reason || 'stop';
 }
 
+/** 把 Pi 自有 content block 转成统一 message parts；图片只保留类型信息，不复制二进制正文。 */
 function contentParts(content) {
   if (typeof content === 'string') {
     return [{ type: 'text', content: truncate(content) }];
@@ -254,6 +277,10 @@ function toolResultResponse(content) {
   return truncate(safeStringify(parts));
 }
 
+/**
+ * 将 Pi 的 user/assistant/toolResult/custom/bashExecution 角色映射为统一消息结构。
+ * 返回 null 表示该角色没有可靠映射，调用方随后过滤；函数不修改宿主 message。
+ */
 function canonicalMessage(message) {
   if (!message || typeof message !== 'object') return null;
 
@@ -294,6 +321,7 @@ function canonicalMessage(message) {
   return null;
 }
 
+/** 只保留最近 MAX_MESSAGES 条上下文，限制 llm.request 单条 JSONL 的体积。 */
 function canonicalMessages(messages) {
   if (!Array.isArray(messages)) return [];
   return messages
@@ -312,6 +340,7 @@ function canonicalOutputMessage(message) {
   }];
 }
 
+/** 仅上报当前启用的工具定义，避免把安装但不可供本轮模型调用的工具误记为请求上下文。 */
 function activeToolDefinitions(pi) {
   const active = new Set(pi.getActiveTools());
   return pi.getAllTools()
@@ -324,6 +353,10 @@ function activeToolDefinitions(pi) {
     }));
 }
 
+/**
+ * 构造同一 turn 内所有事件共享的身份字段，并在缺失时惰性创建 traceId/turnId。
+ * state 会被原地补齐，因此后续 request/response/tool 记录能够关联到相同 trace 与 turn。
+ */
 function turnFields(ctx, state, timestamp = Date.now()) {
   const sessionId = ctx.sessionManager.getSessionId();
   const eventTime = timestampMillis(timestamp);
@@ -345,6 +378,7 @@ function turnFields(ctx, state, timestamp = Date.now()) {
   };
 }
 
+/** 在 turn 公共字段上补 step 与模型信息；stepId 在 turn_start 未到达时也有防御性默认值。 */
 function commonFields(ctx, state, timestamp = Date.now()) {
   const model = ctx.model;
   state.turnId ||= crypto.randomUUID();
@@ -386,6 +420,9 @@ function trailingUserInputMessages(messages) {
  * @returns {void} 监听器随 Pi session 生命周期运行，由宿主负责调度。
  */
 export default function loongSuitePilotPiCodingAgent(pi) {
+  // 这是插件唯一的可变全局状态，闭包与本次 Pi Extension 实例同生命周期。
+  // requestEmitted/userInputEmitted 防止同一 step 的重复 context 回调产生重复记录；
+  // toolStarts 按 toolCallId 保存开始时刻，供 tool_execution_end 计算成对时长。
   const state = {
     userId: 'unknown',
     captureContent: true,
@@ -401,12 +438,14 @@ export default function loongSuitePilotPiCodingAgent(pi) {
     toolStarts: new Map(),
   };
 
+  // 只刷新可配置字段，不在这里重置 turn；调用它的生命周期回调各自负责自己的状态边界。
   const resetSessionConfig = () => {
     const config = loadPilotConfig();
     state.userId = resolveUserId(config);
     state.captureContent = shouldCaptureContent(config);
   };
 
+  // session_start 可能先于任何模型调用：清除上一个 session 遗留的 ID 和未完成工具。
   pi.on('session_start', safeHandler('session_start', async () => {
     resetSessionConfig();
     state.traceId = null;
@@ -420,6 +459,7 @@ export default function loongSuitePilotPiCodingAgent(pi) {
     state.toolStarts.clear();
   }));
 
+  // before_agent_start 对应一次新的用户请求/Agent 运行，也是新 trace 与 turn 的真实起点。
   pi.on('before_agent_start', safeHandler('before_agent_start', async (event) => {
     resetSessionConfig();
     state.traceId = traceId();
@@ -434,6 +474,7 @@ export default function loongSuitePilotPiCodingAgent(pi) {
     state.toolStarts.clear();
   }));
 
+  // 一个 Agent 运行中可以有多个模型 step；turnIndex 用于生成稳定、可读的 step 序号。
   pi.on('turn_start', safeHandler('turn_start', async (event) => {
     state.turnId ||= crypto.randomUUID();
     state.stepId = `${state.turnId}:s${event.turnIndex + 1}`;
@@ -443,6 +484,7 @@ export default function loongSuitePilotPiCodingAgent(pi) {
     state.userInputEmitted = false;
   }));
 
+  // context 可能重复触发，因此“判断 -> 标记 -> 写入”由同一同步函数完成，防止单线程内重复发射。
   const emitUserInput = (event, ctx) => {
     if (state.userInputEmitted || !state.captureContent) return;
     const messages = trailingUserInputMessages(event.messages);
@@ -457,6 +499,7 @@ export default function loongSuitePilotPiCodingAgent(pi) {
     });
   };
 
+  // request 必须在 response 之前存在；若 Pi 没给 context，message_end 会用空 messages 补发一次。
   const emitLlmRequest = (event, ctx) => {
     if (state.requestEmitted) return;
     state.requestEmitted = true;
@@ -480,6 +523,7 @@ export default function loongSuitePilotPiCodingAgent(pi) {
     writeRecord(record);
   };
 
+  // context 是模型真正消费上下文前的最后时机，因此先发用户增量，再发包含完整上下文的 request。
   pi.on('context', safeHandler('context', async (event, ctx) => {
     emitUserInput(event, ctx);
     emitLlmRequest(event, ctx);
@@ -495,6 +539,8 @@ export default function loongSuitePilotPiCodingAgent(pi) {
     // Pi 的 AssistantMessage.timestamp 是流开始时间；处理器收到事件的时刻最接近完成时间。
     const responseAt = timestampStrictlyAfter(Date.now(), state.requestStartedAt);
 
+    // Pi 的 usage.input 不含缓存读写，而平台 input_tokens 采用总输入口径，故在此显式相加；
+    // 各缓存分量仍单独保留，便于下游计算成本。缺失字段按 0 处理，不会产生 NaN。
     const usage = message.usage || {};
     const cacheRead = Number(usage.cacheRead) || 0;
     const cacheWrite = Number(usage.cacheWrite) || 0;
@@ -533,6 +579,7 @@ export default function loongSuitePilotPiCodingAgent(pi) {
     writeRecord(record);
   }));
 
+  // 工具开始事件先保存本地毫秒时间，再写 tool.call；Map 键使用宿主提供的 toolCallId 完成配对。
   pi.on('tool_execution_start', safeHandler('tool_execution_start', async (event, ctx) => {
     const startedAt = timestampMillis();
     state.toolStarts.set(event.toolCallId, startedAt);
@@ -548,6 +595,7 @@ export default function loongSuitePilotPiCodingAgent(pi) {
     writeRecord(record);
   }));
 
+  // 即使缺失开始事件也保留 tool.result，只是不输出 duration；这比丢弃孤立结果更利于诊断。
   pi.on('tool_execution_end', safeHandler('tool_execution_end', async (event, ctx) => {
     const startedAt = state.toolStarts.get(event.toolCallId);
     const endedAt = timestampStrictlyAfter(Date.now(), startedAt);
@@ -569,6 +617,7 @@ export default function loongSuitePilotPiCodingAgent(pi) {
     writeRecord(record);
   }));
 
+  // 关闭时不删除已落盘日志，只释放闭包中可能引用大对象的队列和未完成工具状态。
   pi.on('session_shutdown', safeHandler('session_shutdown', async () => {
     state.pendingUserInput = [];
     state.toolStarts.clear();

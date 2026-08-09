@@ -265,6 +265,8 @@ export class Orchestrator extends EventEmitter {
     await this.localWorkerActivationService.start();
 
     // 6. 注册具体 Input 并构造发现条目。
+    // 此阶段创建实例并绑定 entries 处理链，但不直接启动采集；Discovery 会根据路径、配置和准入
+    // 状态调用各 Input 的 start()/stop()，从而避免未安装或被禁用的 Agent 占用资源。
     const detectionEntries = await this.registerAllInputs();
 
     // 7. 为运行期新安装的 Agent 构造动态部署条目。
@@ -1060,6 +1062,7 @@ export class Orchestrator extends EventEmitter {
       stateStore: this.stateStore,
       logDir: claudeCodeLogDir,
     });
+    // 注册后只建立统一 entries 处理链；Claude 日志目录命中时才由 Discovery 启动轮询。
     this.inputManager.registerInput(claudeCodeLogInput);
     entries.push(
       this.inputManager.buildDetectionEntry(claudeCodeLogInput, {
@@ -1127,6 +1130,7 @@ export class Orchestrator extends EventEmitter {
     const codexTranscriptInput = new CodexTranscriptInput({
       stateStore: this.stateStore,
     });
+    // Codex 当前生产主链统一处理正常和中断 turn；注册完成后仍由 Discovery 根据 session 目录启停。
     this.inputManager.registerInput(codexTranscriptInput);
     entries.push(
       this.inputManager.buildDetectionEntry(codexTranscriptInput, {

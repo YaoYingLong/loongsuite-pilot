@@ -30,6 +30,7 @@ PROCESSOR="$HOOKS_DIR/qoder-hook-processor.mjs"
 
 MIN_NODE_MAJOR=18
 
+# 候选探针只通过退出码表达结果，不向 stdout 写内容，以免污染 Hook 的输出协议。
 node_is_suitable() {
   local bin="$1"
   [[ -x "$bin" ]] || return 1
@@ -42,6 +43,7 @@ node_is_suitable() {
   return 0
 }
 
+# realpath/readlink 解析软链接后再识别 .app，防止 PATH 中的链接绕过私有 runtime 检查。
 node_is_app_bundle() {
   local resolved
   resolved="$(realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || echo "$1")"
@@ -95,4 +97,5 @@ if [[ -z "$NODE_BIN" ]]; then
   exit 0
 fi
 
+# exec 用 Node 替换当前 Shell：stdin、stdout 和最终退出码直接属于 processor，不残留额外父进程。
 exec "$NODE_BIN" "$PROCESSOR" --agent-id "$AGENT_ID"

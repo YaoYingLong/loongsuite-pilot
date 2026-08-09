@@ -28,6 +28,7 @@ case "$SUBCOMMAND" in
     ;;
 esac
 
+# 旁路写包装层错误；重定向和 `|| true` 保证日志目录不可写时也不会触发 `set -e`。
 log_error() {
   local stage="$1"
   local message="$2"
@@ -61,6 +62,7 @@ fi
 
 MIN_NODE_MAJOR=18
 
+# 拒绝 macOS 应用私有 Node，避免缺少宿主动态库时 Hook 启动失败。
 node_is_app_bundle() {
   local resolved
   resolved="$(realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || echo "$1")"
@@ -72,6 +74,7 @@ node_is_app_bundle() {
   return 1
 }
 
+# 返回状态码而非打印布尔值，符合 Bash 条件函数惯例。
 node_is_suitable() {
   local bin="$1"
   [[ -x "$bin" ]] || return 1
@@ -128,6 +131,7 @@ if [[ -z "$NODE_BIN" ]]; then
 fi
 
 # processor 直接继承 Hook 的 stdin 管道，避免 Shell 解码/重编码 JSON。
+# stdin 不经过变量或管道重编码，直接由 Node 读取宿主发送的 UTF-8 JSON。
 if ! "$NODE_BIN" "$PROCESSOR" "$SUBCOMMAND"; then
   echo "[qwen-code-cli-hook] processor failed (subcommand=$SUBCOMMAND)" >&2
   log_error "processor_failed" "hook processor exited non-zero (subcommand=$SUBCOMMAND)"

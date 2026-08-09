@@ -45,23 +45,31 @@ const ARTIFACT_DIR = process.env.E2E_ARTIFACT_DIR?.trim() || '/opt/artifacts';
 
 /** 按 E2E 保活开关等待，便于失败后进入容器排障；默认立即返回原退出码。 */
 async function keepAliveIfRequested(code) {
+  // L1 使用同一个变量控制成功/失败后的保活；未启用时该函数不会改变退出路径。
   const keepAlive = process.env.E2E_KEEP_ALIVE === '1';
   if (code === 0 && !keepAlive) return;
   if (code !== 0 && !keepAlive) return;
   const status = code === 0 ? 'PASSED' : 'FAILED';
   console.log(`[e2e-l1] Test ${status} (exit ${code}). Container kept alive.`);
   console.log('[e2e-l1] Attach: docker exec -it loongsuite-pilot-e2e-l1 bash');
+  // 永不 resolve 的 Promise 配合长周期定时器维持 Node 事件循环，供开发者 docker exec 进入现场。
   await new Promise(() => { setInterval(() => {}, 1 << 30); });
 }
 
 /** 按 E2E 保活开关等待，便于失败后进入容器排障；默认立即返回原退出码。 */
 async function keepAliveOnFailure(code) {
+  // 保活启用时 await 永不返回；否则立即以原始子场景退出码结束进程。
   await keepAliveIfRequested(code);
   process.exit(code);
 }
 
-/** 内部函数异步地执行 waitForPilotReady 流程，可能启动子进程、等待状态或受超时控制。 */
+/**
+ * 生成并执行轮询服务日志的 Bash，等待全部必需 Agent 完成 Hook/插件部署。
+ * @param {string[]} requiredAgents 声明文件中的 Agent ID。
+ * @returns {Promise<{code:number,stdout:string,stderr:string}>} `runLocalScript` 的子进程结果。
+ */
 async function waitForPilotReady(requiredAgents) {
+  // 此数组中的每一项都是容器 Bash 源码；Node 只负责拼接并交给 runner。
   const waitScript = [
     'set -euo pipefail',
     'LOG_GLOB="$HOME/.loongsuite-pilot/logs/loongsuite-pilot-service.log*"',
@@ -70,12 +78,14 @@ async function waitForPilotReady(requiredAgents) {
     `REQUIRED="${requiredAgents.join(' ')}"`,
     'agent_ready() {',
     '  _agent="$1"',
+    // 兼容动态发现、Hook 部署、插件注入三种就绪日志；任一证据命中即返回成功。
     '  grep -q "\\\"id\\\":\\\"deploy:${_agent}\\\".*agent detected and started" $LOG_GLOB 2>/dev/null && return 0',
     '  grep -q "\\\"agentId\\\":\\\"${_agent}\\\".*\\\"msg\\\":\\\"hooks deployed\\\"" $LOG_GLOB 2>/dev/null && return 0',
     '  grep -q "\\\"agentId\\\":\\\"${_agent}\\\".*\\\"msg\\\":\\\"plugin injected\\\"" $LOG_GLOB 2>/dev/null && return 0',
     '  return 1',
     '}',
     'while [ $ELAPSED -lt $TIMEOUT ]; do',
+    // 每轮从乐观值 1 开始，只要一个 Agent 未就绪就置 0 并提前进入下一次 sleep。
     '  ALL_FOUND=1',
     '  for agent in $REQUIRED; do',
     '    if ! agent_ready "$agent"; then',
@@ -90,6 +100,7 @@ async function waitForPilotReady(requiredAgents) {
     '  sleep 3',
     '  ELAPSED=$((ELAPSED + 3))',
     'done',
+    // 超时分支只输出诊断、没有显式 `exit 1`；当前调用方因此把“未就绪”视为可观察告警。
     'echo "[pilot-ready] WARNING: timed out (${TIMEOUT}s). Agent deployment status:"',
     'for agent in $REQUIRED; do',
     '  if agent_ready "$agent"; then',
@@ -111,6 +122,7 @@ async function waitForPilotReady(requiredAgents) {
 
 /** 执行本地包安装、服务就绪、Agent 探测及 JSONL/SLS 断言，并把各阶段日志写入 artifacts。 */
 async function installSmokeScenario(env) {
+  // 每个 phase 单独启动 Bash，便于 artifacts 精确对应失败阶段；失败会保留原退出码。
   console.log('[e2e-l1] install-smoke: phase 1 = installer with local package');
   const install = await runLocalScript({
     script: localBuildInstallScript(env.E2E_USER_ID, env),
@@ -124,6 +136,7 @@ async function installSmokeScenario(env) {
 
   const configScript = buildAgentConfigSetupScript(env);
   if (configScript) {
+    // 配置生成器返回空串代表对应开关未启用，不需要启动空子进程。
     console.log('[e2e-l1] phase 2 = agent configs (codex/claude/proxy)');
     await runLocalScript({
       script: configScript,
@@ -146,6 +159,7 @@ async function installSmokeScenario(env) {
     }
 
     console.log('[e2e-l1] phase 2.5b = enable ensured CLI agents and restart pilot');
+    // 下一段生成的 Bash 通过 Node heredoc 合并 agents.enabled，并准备各 Agent 的发现目录。
     const restart = await runLocalScript({
       script: `set -euo pipefail
 node - <<'NODE'
@@ -222,6 +236,7 @@ loongsuite-pilot status`,
     await keepAliveOnFailure(ready.code ?? 1);
   }
 
+  // CLI 已在前一阶段 ensure；显式关闭二次 ensure，probe 阶段只产生 Agent 会话数据。
   const probeBody = buildAgentProbeOnlyScript({ ...env, E2E_ENSURE_AGENT_CLIS: '0' });
   if (probeBody) {
     console.log('[e2e-l1] phase 4 = agent probes');
@@ -238,6 +253,7 @@ loongsuite-pilot status`,
   }
 
   console.log('[e2e-l1] phase 5 = 60s wait for pilot flush');
+  // setTimeout 让事件循环异步等待，不占用 CPU；窗口用于 Input 轮询、批处理和 JsonlFlusher 落盘。
   await new Promise(r => setTimeout(r, 60_000));
 
   const jsonlSh = buildJsonlValidationSh(env);
@@ -296,6 +312,7 @@ async function uninstallScenario(env) {
   }
 
   console.log('[e2e-l1] uninstall scenario: phase 2 = uninstall + verify');
+  // purge 卸载后同时检查数据目录、稳定命令入口和 systemd user unit 三类残留。
   const verifyScript = `
 ${uninstallScript(installerUrl)}
 
@@ -321,6 +338,7 @@ exit $fail
 
 /** 按可跳过阶段串行验证动态发现、自动升级/回滚、双发和脱敏，累计失败并支持 fail-fast。 */
 async function expandFeaturesScenario(env) {
+  // skipPhases 接受逗号分隔编号；failFast=false 时会尽量跑完，最后汇总失败数。
   const skipPhases = (env.E2E_EXPAND_SKIP_PHASES || '').split(',').map(s => s.trim()).filter(Boolean);
   const failFast = env.E2E_EXPAND_FAIL_FAST === '1';
   const portBase = Number(env.E2E_EXPAND_MOCK_PORT_BASE || '19100');
@@ -363,6 +381,7 @@ async function expandFeaturesScenario(env) {
     const manifest = { version: '99.0.0', git_commit: 'e2e-fake', package_url: `http://127.0.0.1:${manifestPort}/pkg.tar.gz` };
     let manifestServer;
     try {
+      // Mock server 在当前 Node 进程监听本机端口，子 Bash 通过 HTTP 获取伪 manifest/package。
       manifestServer = await createManifestServer(manifestPort, { manifest, packagePath: pkgPath });
       const r = await runLocalScript({
         script: buildAutoUpgradePhaseScript(env, manifestPort),
@@ -379,6 +398,7 @@ async function expandFeaturesScenario(env) {
       failures++;
       if (failFast) await keepAliveOnFailure(1);
     } finally {
+      // 无论场景断言或子进程是否失败，都关闭监听 socket，避免后续 phase 端口占用。
       if (manifestServer) await manifestServer.close();
     }
   } else {
@@ -427,6 +447,7 @@ async function expandFeaturesScenario(env) {
     const portB = portBase + 3;
     let collectorA, collectorB;
     try {
+      // 两个独立接收器用于证明 dual-send 两个目标都收到请求，而不只验证配置已写入。
       collectorA = await createWebtrackingCollector(portA);
       collectorB = await createWebtrackingCollector(portB);
       const r = await runLocalScript({
@@ -499,6 +520,7 @@ async function main() {
 
   let missing;
   try {
+    // assertL1Env 校验场景名并返回缺失变量；抛错/缺失都属于用法错误，采用退出码 2。
     missing = assertL1Env(scenario, env);
   } catch (e) {
     console.error(`[e2e-l1] ${e.message}`);
@@ -512,10 +534,12 @@ async function main() {
     process.exit(2);
   }
 
+  // 默认值直接补入当前 process.env，后续所有脚本生成器看到同一份确定配置。
   applyL1Defaults(env);
 
   console.log(`[e2e-l1] scenario=${scenario}`);
   try {
+    // 场景互斥，只执行一个分支；各分支内部负责细分 phase 和断言。
     if (scenario === 'preflight') {
       const r = await runLocalScript({
         script: preflightScript(),
@@ -541,6 +565,7 @@ async function main() {
 }
 
 main().catch(async err => {
+  // 捕获 main Promise 未处理异常，确保 CI 不会因 unhandled rejection 得到含糊退出状态。
   console.error(err);
   await keepAliveOnFailure(1);
 });

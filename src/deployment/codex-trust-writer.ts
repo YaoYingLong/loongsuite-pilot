@@ -342,18 +342,24 @@ export function removeTrustBlock(
 }
 
 export interface VerifyTrustHashesOpts {
+  /** Codex 用户配置文件；函数只读取其中由 Pilot 管理的 trust block。 */
   configPath: string;
+  /** 参与 trust key 计算的 hooks.json 绝对路径。 */
   hooksJsonAbsPath: string;
+  /** 需要逐项核验的 Hook 事件名，顺序不影响结果。 */
   hookEvents: readonly string[];
   /** event → 实际写入 hooks.json 的完整 command 字符串(与 writeTrustedHashes 一致)。 */
   eventToCommand: Record<string, string>;
   /** event → hooks.json 中实际的 group index(与 writeTrustedHashes 一致)。 */
   eventToGroupIndex: Record<string, number>;
+  /** BEGIN/END 管理块标记，用来隔离用户自行维护的 trust 条目。 */
   marker: string;
 }
 
 export interface VerifyResult {
+  /** 所有目标事件都存在且 hash 一致时为 true。 */
   valid: boolean;
+  /** 面向日志的缺失映射、缺失 key 或 hash 不一致说明。 */
   mismatches: string[];
 }
 
@@ -367,25 +373,30 @@ export interface VerifyResult {
 /** 重读并逐事件比较 expected/actual，返回报告而不因不一致抛错。 */
 export function verifyTrustHashes(opts: VerifyTrustHashesOpts): VerifyResult {
   const { configPath, hooksJsonAbsPath, hookEvents, eventToCommand, eventToGroupIndex, marker } = opts;
+  // 配置文件不存在属于核验失败而非异常，让部署调用方仍可按既定 fail-open 策略继续。
   if (!fs.existsSync(configPath)) {
     return { valid: false, mismatches: ['config.toml missing'] };
   }
+  // parseTrustBlock 只返回 marker 管理范围内的 key/hash，避免把用户条目误判为 Pilot 输出。
   const content = fs.readFileSync(configPath, 'utf-8');
   const parsed = parseTrustBlock(content, marker);
   const parsedMap = new Map(parsed.map((p) => [p.key, p.hash]));
 
   const mismatches: string[] = [];
   for (const event of hookEvents) {
+    // command 必须与 hooks.json 实际写入文本逐字一致，否则重算 hash 没有意义。
     const command = eventToCommand[event];
     if (!command) {
       mismatches.push(`event=${event} missing command mapping`);
       continue;
     }
+    // groupIndex 缺失时沿用 writer 的默认组 0，确保生成相同 trust state key。
     const groupIndex = eventToGroupIndex[event] ?? 0;
     const expectedKey = hookStateKey(hooksJsonAbsPath, event, groupIndex);
     const expectedHash = computeHookTrustHash(event, command);
     const actualHash = parsedMap.get(expectedKey);
     if (!actualHash) {
+      // 分开报告“没有 key”和“有 key 但 hash 不同”，便于判断是拼接位置还是 command 内容错误。
       mismatches.push(`event=${event} missing key=${expectedKey}`);
     } else if (actualHash !== expectedHash) {
       mismatches.push(`event=${event} hash mismatch (expected=${expectedHash}, got=${actualHash})`);

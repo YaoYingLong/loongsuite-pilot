@@ -189,17 +189,20 @@ export class QoderWorkInput extends BaseHookInput {
 
     // 各事件只填充与其语义匹配的标准字段，entry-builder 负责最终规范化。
     if (eventName === 'llm.request' && typeof partText === 'string') {
+      // user 文本表示本轮新增输入，因此使用 messages_delta 而不是伪造完整会话上下文。
       standard['gen_ai.input.messages_delta'] = [
         { role: 'user', parts: [{ type: 'text', content: partText }] },
       ];
     } else if (eventName === 'llm.response') {
       const parts: JsonValue[] = [];
       if (partType === 'thinking' && typeof partThinking === 'string') {
+        // thinking 与用户可见文本采用不同 part type，便于下游选择是否展示推理内容。
         parts.push({ type: 'reasoning', content: partThinking });
       } else if (typeof partText === 'string') {
         parts.push({ type: 'text', content: partText });
       }
       if (parts.length > 0) {
+        // finish_reason 同时放在消息和事件级数组，兼容消息消费者与指标消费者。
         const msg: { [key: string]: JsonValue } = { role: 'assistant', parts };
         if (typeof message.stop_reason === 'string' && message.stop_reason.length > 0) {
           msg.finish_reason = message.stop_reason;
@@ -213,10 +216,12 @@ export class QoderWorkInput extends BaseHookInput {
         standard['gen_ai.response.id'] = message.id;
       }
     } else if (eventName === 'tool.call') {
+      // tool_use 记录提供名称、调用 ID 和参数；缺失字段分别省略，不生成占位值。
       if (toolName) standard['gen_ai.tool.name'] = toolName;
       if (toolCallId) standard['gen_ai.tool.call.id'] = toolCallId;
       if (toolArgs !== undefined) standard['gen_ai.tool.call.arguments'] = toolArgs;
     } else if (eventName === 'tool.result') {
+      // tool_result 通过 toolUseId 回连调用；工具名通常只存在于 call，因此这里不猜测。
       if (toolUseId) standard['gen_ai.tool.call.id'] = toolUseId;
       if (toolResult !== undefined) standard['gen_ai.tool.call.result'] = toolResult;
     }

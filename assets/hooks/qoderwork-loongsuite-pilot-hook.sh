@@ -27,6 +27,7 @@ PROCESSOR="$HOOKS_DIR/qoderwork-hook-processor.mjs"
 
 MIN_NODE_MAJOR=18
 
+# 检查文件权限、私有 bundle 来源和主版本；函数不打印内容，只返回 Bash 状态码。
 node_is_suitable() {
   local bin="$1"
   [[ -x "$bin" ]] || return 1
@@ -39,6 +40,7 @@ node_is_suitable() {
   return 0
 }
 
+# 软链接解析失败时回退原路径，随后按 macOS 应用目录模式排除私有 Node。
 node_is_app_bundle() {
   local resolved
   resolved="$(realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || echo "$1")"
@@ -92,4 +94,5 @@ if [[ -z "$NODE_BIN" ]]; then
   exit 0
 fi
 
+# 用 exec 消除多余 Shell 层，processor 直接消费 Hook stdin 并决定输出。
 exec "$NODE_BIN" "$PROCESSOR" --agent-id "$AGENT_ID"

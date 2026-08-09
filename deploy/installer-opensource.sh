@@ -83,6 +83,7 @@ fi
 
 # $# 是尚未解析的参数个数；循环每次用 shift 消费一个或两个参数。
 while [[ $# -gt 0 ]]; do
+    # 同时接受 `--key value` 与 `--key=value`；前者假定下一参数存在，缺失时会被 `set -u` 终止。
     case "$1" in
         --sls-endpoint)       SLS_ENDPOINT="$2"; shift 2 ;;
         --sls-endpoint=*)     SLS_ENDPOINT="${1#*=}"; shift ;;
@@ -176,6 +177,7 @@ validate_install_user() {
 
 # 未通过命令行或环境变量指定 URL 时，根据版本号拼出 OSS 地址。
 if [ -z "$PACKAGE_URL" ]; then
+    # 指定版本走固定版本目录；未指定时走 latest，实际版本仍以包内 VERSION 为准。
     if [ -n "$INSTALL_VERSION" ]; then
         PACKAGE_URL="${_OSS_BASE_URL}/${INSTALL_VERSION}/${PACKAGE_NAME}.tar.gz"
     else
@@ -189,6 +191,7 @@ fi
 detect_lang() {
     # 优先尊重显式语言；否则依次检查常见 locale 环境变量和 macOS 系统语言。
     if [ -n "${LOONGSUITE_PILOT_LANG:-}" ]; then echo "$LOONGSUITE_PILOT_LANG"; return; fi
+    # `${name:-}` 在变量未设置时展开为空，避免严格模式的未定义变量错误。
     for v in "${LANGUAGE:-}" "${LC_ALL:-}" "${LC_MESSAGES:-}" "${LANG:-}"; do
         if echo "$v" | grep -qi "zh"; then echo "zh"; return; fi
     done
@@ -307,9 +310,11 @@ check_deps() {
 
     # 固化 Node 路径，后续 daemon 不必依赖用户登录 shell 中的 PATH。
     mkdir -p "$DATA_DIR" 2>/dev/null || true
+    # pin 文件是服务环境与交互 Shell 之间的运行时契约；后台启动以后优先读取它而不是 PATH。
     echo "$NODE_BIN" > "$DATA_DIR/node-bin"
 
     # 优先选择同一套 Node 安装目录中的 npm，避免 Node/npm 版本错配。
+    # 与 Node 同目录的 npm 优先，防止 nvm/volta 多版本环境中 node 与全局 npm 不配套。
     NPM_BIN="$(dirname "$NODE_BIN")/npm"
     # 如果npm文件不存在或不是一个可执行文件
     if [ ! -x "$NPM_BIN" ]; then
@@ -363,6 +368,7 @@ download_and_extract() {
 
     # command -v 只探测命令是否存在；&>/dev/null 同时丢弃标准输出和错误输出。
     # 将包通过crul或wget下载到创建好的临时目录中
+    # curl: -f 令 HTTP 4xx/5xx 失败，-sS 静默进度但显示错误，-L 跟随重定向。
     if command -v curl &>/dev/null; then
         curl -fsSL "$PACKAGE_URL" -o "$TMP_DIR/package.tar.gz"
     else
@@ -374,6 +380,7 @@ download_and_extract() {
     msg "==> 解压安装包..." "==> Extracting..."
     # GNU tar 支持 --warning；BSD tar 可能不支持，所以失败后用通用参数重试。
     # 将下载到TMP_DIR临时目录的package.tar.gz解压到TMP_DIR临时目录
+    # `-xzf` 分别表示解压、gzip、指定文件；`-C` 让内容只落到临时目录。
     if tar --warning=no-unknown-keyword -xzf "$TMP_DIR/package.tar.gz" -C "$TMP_DIR" 2>/dev/null; then
         :
     else
@@ -387,6 +394,7 @@ download_and_extract() {
         INSTALL_SRC="$TMP_DIR"
     else
         # 通过find命令找到TMP_DIR目录下package.json文件所在的第一个目录作为INSTALL_SRC
+        # 管道只取首个 package.json 所在目录；`|| true` 允许“未找到”进入下面的明确错误分支。
         INSTALL_SRC=$(find "$TMP_DIR" -name "package.json" -maxdepth 2 -exec dirname {} \; | head -1 || true)
         # 如果没有找到异常退出
         if [ -z "$INSTALL_SRC" ]; then
@@ -409,6 +417,7 @@ probe_agents() {
     # 探测失败属于可降级错误：保留空数组并继续安装，而不是让严格模式终止脚本。
     msg "==> 探测 AI Agent..." "==> Probing AI Agents..."
     # 执行src/cli-probe.ts脚本，探测已安装的Agent
+    # 命令替换只捕获 stdout JSON；stderr 被隐藏，失败通过右侧处理块恢复为空数组。
     PROBE_RESULT=$("$NODE_BIN" "$INSTALL_SRC/dist/cli-probe.cjs" 2>/dev/null) || {
         msg "    ⚠️  Agent 探测失败，将跳过选择" "    ⚠️  Agent probe failed, skipping selection"
         PROBE_RESULT="[]"
@@ -440,6 +449,7 @@ select_agents() {
     fi
 
     # stdin 不是终端时无法询问用户，自动选择 detected=true 的 Agent。
+    # `-t 0` 检查标准输入是否连接终端；curl 管道安装通常为非交互模式。
     if [ ! -t 0 ]; then
         SELECTED_AGENTS=$("$NODE_BIN" -e "
 const r = JSON.parse(process.argv[1]);
@@ -478,6 +488,7 @@ if (lang === 'zh') {
     # Node readline 负责读取 UTF-8 输入，并把中文逗号/顿号/分号归一化为英文逗号。
     # 提示符写 stderr，避免被命令替换 $(...) 捕获到 select_input 中。
     local select_input
+    # readline 异步等待一行；Node 进程退出后命令替换才把 stdout 赋给 select_input。
     select_input=$("$NODE_BIN" -e "
 const readline = require('readline');
 const rl = readline.createInterface({ input: process.stdin, output: process.stderr });
@@ -607,6 +618,7 @@ for (const c of changed) {
     # 把 $diffs 里的多行文本内容逐行读取，每一行前面统一添加 4 个空格缩进后再打印输出，实现日志格式化美化展示
     # IFS=：清空默认分隔符，保留行首、行尾的空格，不会自动裁切前后空白
     # read -r：原样读取文本，反斜杠 \ 不会被当作转义字符处理，是读取文件行的标准安全写法
+    # 管道右侧 while 在多数 Bash 中运行于子 Shell，但这里只打印，不依赖循环内状态带回父 Shell。
     echo "$diffs" | while IFS= read -r line; do
         echo "    $line"
     done
@@ -642,6 +654,7 @@ deploy_bootstrap_scripts() {
     # 创建$HOME/.loongsuite-pilot/bin目录
     mkdir -p "$boot_dir"
     # 将$HOME/.loongsuite-pilot/versions/1.0.0_d066770/scripts/collector-daemon.js脚本拷贝到$HOME/.loongsuite-pilot/bin目录
+    # 稳定目录不带版本号，systemd/launchd 始终指向它；daemon 启动时再读取 current。
     cp -f "$src_dir/collector-daemon.js" "$boot_dir/"
     # 判断若$HOME/.loongsuite-pilot/versions/1.0.0_d066770/scripts/updater-daemon.js文件存在，就拷贝到$HOME/.loongsuite-pilot/bin目录
     [ -f "$src_dir/updater-daemon.js" ] && cp -f "$src_dir/updater-daemon.js" "$boot_dir/" || true
@@ -675,6 +688,7 @@ deploy_package() {
 
         # 切换版本前把旧 current 保存为 previous，供 rollback 使用。
         # 判断$HOME/.loongsuite-pilot/current文件是否存在
+        # previous 在复制新包前更新；后续任一步失败时 install 不自动恢复，upgrade 会在健康检查阶段 rollback。
         if [ -f "$current_file" ]; then
             local old_dir
             # 存在的话，读取$HOME/.loongsuite-pilot/current文件内容，且替换所有空格或换行符
@@ -689,6 +703,7 @@ deploy_package() {
         # 创建$HOME/.loongsuite-pilot/versions目录
         mkdir -p "$versions_dir"
         # 删除$HOME/.loongsuite-pilot/versions/1.0.0_d066770目录
+        # 同版本+commit 重装会先删除旧目标；若随后复制失败，该目标版本不完整，但旧 previous 目录仍保留。
         rm -rf "$target"
         # 拷贝解压安装包后的TMP_DIR/loongsuite-pilot目录内容到$HOME/.loongsuite-pilot/versions/1.0.0_d066770目录中
         cp -r "$src" "$target"
@@ -714,18 +729,22 @@ deploy_package() {
     msg "    ✅ 部署完成" "    ✅ Deployed"
     echo ""
     # 把当前版本所需的稳定启动脚本collector-daemon.js和updater-daemon.js复制到版本目录之外的$HOME/.loongsuite-pilot/bin目录
+    # 注意：此时 current 已切换；下面 npm/postinstall 失败会让严格模式退出，首次 install 没有自动指针回滚。
     deploy_bootstrap_scripts
 
     msg "==> 安装依赖..." "==> Installing dependencies..."
     # 子 shell 中切换工作目录；pipefail 保证 npm 失败不会被 tail 的成功掩盖。
     # 首先进入到$HOME/.loongsuite-pilot/versions/1.0.0_d066770目录
     # 然后调用npm执行生产环境依赖安装，只安装dependencies正式依赖，自动跳过开发依赖、可选依赖，精简部署包体积
+    # 圆括号创建子 Shell，内部 cd 不改变安装器后续工作目录；只显示 npm 最后一行以减少安装输出。
     (cd "$PERMANENT_DIR" && "$NPM_BIN" install --production --no-optional 2>&1 | tail -1)
     msg "    ✅ 依赖安装完成" "    ✅ Dependencies installed"
     echo ""
 
     msg "==> 部署 hook 脚本..." "==> Deploying hook scripts..."
     # 注意：这里判断的是安装器进程当前目录$HOME/.loongsuite-pilot/versions/1.0.0_d066770下的scripts/postinstall.js。
+    # 待确认：这里按安装器“当前工作目录”查找，而不是 `$PERMANENT_DIR/scripts/postinstall.js`；
+    # 从任意目录执行在线安装器时可能跳过资产部署，现有行为先如实保留。
     if [ -f scripts/postinstall.js ]; then
         # 当前安装器的 DATA_DIR Shell 变量不会自动成为子进程的 LOONGSUITE_PILOT_DATA_DIR。
         # 因此使用自定义 --data-dir 时，postinstall 的 Hook/Plugin/Skill 实际落点需后续核实；
@@ -777,6 +796,7 @@ migrate_legacy_layout() {
     # 创建$HOME/.loongsuite-pilot/package/version目录
     mkdir -p "$versions_dir"
     # 拷贝$HOME/.loongsuite-pilot/package目录中的内容到$HOME/.loongsuite-pilot/package/version/${ver}_${commit}
+    # 只复制而不删除 package，旧版入口仍可回退；迁移失败受严格模式阻断 current 写入。
     cp -r "$legacy_dir" "$target"
     # 将版本号${ver}_${commit}写入到$HOME/.loongsuite-pilot/current文件中
     echo "$dir_name" > "$current_file"
@@ -796,6 +816,9 @@ write_config() {
         "==> Writing config to $config_file ..."
     mkdir -p "$DATA_DIR"
 
+    # 注意：Shell 值被直接插入 JavaScript 单引号字面量，含单引号/反斜杠的参数可能导致脚本解析失败；
+    # 当前实现没有统一转义，不能在注释中声称它支持任意字符。
+    # 内嵌逻辑只把精确字符串 `true` 写为布尔 true，并直接覆写 config.json（不是原子 rename）。
     "$NODE_BIN" -e "
 const fs = require('fs');
 const path = '$config_file';
@@ -1650,6 +1673,7 @@ cmd_install() {
     fi
 
     # 注册一个退出钩子，无论正常结束还是中途失败，退出时都删除临时目录；:- 防止未定义变量触发 set -u。
+    # EXIT trap 在正常返回、显式 exit 或严格模式中断时都会执行；只清理下载临时目录，不回滚已部署文件。
     trap 'rm -rf "${TMP_DIR:-}"' EXIT
     # 下载安装包并解压；输出全局INSTALL_SRC和TMP_DIR, INSTALL_SRC一般默认为TMP_DIR/loongsuite-pilot
     download_and_extract
@@ -1687,6 +1711,7 @@ cmd_install() {
 
     msg "==> 启动服务..." "==> Starting service..."
     # 这里其实就是执行loongsuite-pilot.sh start命令
+    # `if` 条件中的非零返回不触发 set -e；安装器选择告警并继续打印完成摘要。
     if loongsuite-pilot start; then
         sleep 2
         local _status_out
@@ -1740,6 +1765,7 @@ cmd_upgrade() {
     local new_commit; new_commit=$(get_commit_from_dir "$INSTALL_SRC")
     local old_commit; old_commit=$(get_commit_from_dir "$PERMANENT_DIR")
 
+    # 版本号和 commit 都相同才短路；相同版本的新 commit 仍允许部署。
     if [ -n "$new_ver" ] && [ "$new_ver" = "$old_ver" ] && [ "$new_commit" = "$old_commit" ]; then
         msg "✅ 已是最新版本 v${new_ver} (${new_commit})，无需升级" \
             "✅ Already at latest version v${new_ver} (${new_commit}), nothing to do"
@@ -1765,6 +1791,7 @@ cmd_upgrade() {
 
     # 启动后不仅检查 start 返回码，还要求 status 输出包含固定文本 "is running"。
     msg "==> 启动新版本..." "==> Starting new version..."
+    # 健康检查依赖 CLI 英文固定片段 `is running`，与安装器当前中英文输出模式无关。
     if loongsuite-pilot start; then
         sleep 2
         local _status_out
@@ -1789,6 +1816,7 @@ cmd_upgrade() {
     loongsuite-pilot stop 2>/dev/null || true
 
     if command -v loongsuite-pilot &>/dev/null; then
+        # rollback 本身失败被 best-effort 吞掉；随后仍会打印“已回滚”，真实状态需通过 status/info 复核。
         loongsuite-pilot rollback 2>/dev/null || true
     else
         "$HOME/.local/bin/loongsuite-pilot" rollback 2>/dev/null || true
@@ -1827,6 +1855,7 @@ gc_old_versions() {
         if [ "$name" = "$keep_current" ] || [ "$name" = "$keep_previous" ]; then
             continue
         fi
+        # d 来自受控 versions_dir glob 且已通过 -d；仍保留 current/previous 两个名称后才递归删除。
         rm -rf "$d"
     done
 }
@@ -1854,6 +1883,7 @@ remove_hook_configs() {
 
         local ok=0
         if command -v node &>/dev/null; then
+            # 用结构化 JSON 解析保留非 Pilot Hook；内嵌 Node 非零时 Shell 仅把本文件标为需手工清理。
             node -e "
 const fs = require('fs');
 const cfg = process.argv[1];
@@ -2082,6 +2112,8 @@ cmd_uninstall() {
 
     # 无条件删除默认安装根目录；这也会删除默认 DATA_DIR 中的配置和日志。
     msg "==> 删除安装目录..." "==> Removing installation..."
+    # 当前代码无论是否传 --purge 都删除默认根目录；这与“非 purge 保留默认数据”的用户文档不一致。
+    # 这里只记录真实行为，不在注释任务中改变卸载语义。
     rm -rf "$HOME/.loongsuite-pilot"
     msg "    ✅ 已删除 $HOME/.loongsuite-pilot" \
         "    ✅ Removed $HOME/.loongsuite-pilot"
@@ -2116,6 +2148,7 @@ cmd_uninstall() {
     echo ""
 
     # 自定义 DATA_DIR 仅在 --purge 时删除；默认目录此前已被无条件删除。
+    # 自定义 DATA_DIR 位于默认根目录外时，这个分支才体现 purge 与非 purge 的实际差异。
     if [ "$PURGE" -eq 1 ]; then
         msg "==> 删除数据目录 (--purge)..." "==> Removing data directory (--purge)..."
         rm -rf "$DATA_DIR"

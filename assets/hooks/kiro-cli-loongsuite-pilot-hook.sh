@@ -26,6 +26,7 @@ EMPTY_RESULT='{}'
 
 EVENT="${1:-unknown}"
 
+# 将 Shell 启动层故障单独落盘；命令均有回退，不能让诊断失败覆盖原始故障。
 log_error() {
   local stage="$1"
   local message="$2"
@@ -54,6 +55,7 @@ PROCESSOR="$HOOKS_DIR/kiro-cli-hook-processor.mjs"
 
 MIN_NODE_MAJOR=18
 
+# 排除 macOS 应用包中的私有 Node，避免离开宿主 bundle 后动态依赖不完整。
 node_is_app_bundle() {
   local resolved
   resolved="$(realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || echo "$1")"
@@ -64,6 +66,7 @@ node_is_app_bundle() {
   return 1
 }
 
+# 只有可执行、非应用私有且主版本 >= 18 的候选才返回成功状态码。
 node_is_suitable() {
   local bin="$1"
   [[ -x "$bin" ]] || return 1
@@ -79,6 +82,7 @@ node_is_suitable() {
 NODE_PIN_FILE="${LOONGSUITE_PILOT_DATA_DIR:-$HOME/.loongsuite-pilot}/node-bin"
 NODE_BIN=""
 
+# Kiro 尊重自定义数据目录，因此 node-bin pin 也从同一根目录读取。
 if [[ -f "$NODE_PIN_FILE" ]]; then
   pinned="$(cat "$NODE_PIN_FILE" 2>/dev/null | tr -d '[:space:]')"
   if [[ -n "$pinned" ]] && node_is_suitable "$pinned"; then

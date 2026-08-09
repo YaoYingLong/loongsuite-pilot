@@ -19,6 +19,7 @@ const MIN_SYSTEM_PROMPT_LENGTH = 100;
 
 try { fs.mkdirSync(INTERCEPT_DIR, { recursive: true }); } catch {}
 
+// 安装包装前保存原始引用；包装内部序列化诊断记录时必须调用 origStringify，避免递归进入自身。
 const origParse = JSON.parse;
 const origStringify = JSON.stringify;
 let lastId = null;
@@ -31,6 +32,7 @@ JSON.parse = function (text, reviver) {
     if (result && typeof result === "object"
         && result.usage && result.choices !== undefined
         && result.id !== lastId) {
+      // response id 是跨多次 JSON.parse 的去重键；同一 SSE 响应重复出现 usage 时只落一条。
       lastId = result.id;
       const u = result.usage;
       const rec = {
@@ -58,6 +60,7 @@ JSON.stringify = function (value, replacer, space) {
         && value.messages && Array.isArray(value.messages)) {
       const sys = value.messages.find(function (m) { return m.role === "system"; });
       if (sys && typeof sys.content === "string" && sys.content.length > MIN_SYSTEM_PROMPT_LENGTH) {
+        // 先置位再写文件：即使落盘失败，也不会让每次 stringify 都重复执行大消息扫描。
         systemPromptCaptured = true;
         const rec = {
           type: "system_prompt",

@@ -125,6 +125,7 @@ function sessionLineRecordFile(agentId, sessionId) {
   return path.join(sessionLineRecordDir(agentId), `${sessionHash}.json`);
 }
 
+/** 读取状态 JSON；不存在、损坏或顶层不是普通对象时返回 null，调用方据此走初始化/迁移路径。 */
 function readJsonObject(file) {
   try {
     if (!fs.existsSync(file)) return null;
@@ -135,6 +136,10 @@ function readJsonObject(file) {
   }
 }
 
+/**
+ * 通过“同目录临时文件 + rename”原子替换状态，避免进程崩溃时留下半截 JSON。
+ * 返回布尔值而非抛错；失败时尽力删除本进程的临时文件。
+ */
 function saveJsonObject(file, value) {
   let tmp = '';
   try {
@@ -156,6 +161,10 @@ function saveSessionLineRecord(agentId, sessionId, record) {
   return saveJsonObject(sessionLineRecordFile(agentId, sessionId), record);
 }
 
+/**
+ * 把旧版按 Agent 聚合的游标按需迁移为按 session 单文件状态。
+ * 只迁移当前请求的 session，且通过 isLineRecordNewer 保证不会用旧游标覆盖新版进度。
+ */
 function reconcileAggregateLineRecord(agentId, requestedSessionId) {
   // 新版按 session 拆文件；这两个来源是旧版按 Agent 聚合的状态文件。
   const sources = [
@@ -202,6 +211,10 @@ function isLineRecordNewer(candidate, existing) {
 // `Atomics.wait` 需要共享数组作为等待地址；这里只借它同步休眠 10ms，不存放业务数据。
 const LOCK_WAIT_ARRAY = new Int32Array(new SharedArrayBuffer(4));
 
+/**
+ * 更新供旧版本读取的聚合影子文件。
+ * `wx` 锁把多个短命 Hook 的读改写串行化；等待最多 1 秒，30 秒以上锁视为崩溃残留。
+ */
 function updateAggregateShadow(file, transcriptPath, record) {
   // 多个 Hook 子进程可能同时更新兼容影子文件，使用 `wx` 独占创建锁文件串行化写入。
   const lockFile = `${file}.lock`;

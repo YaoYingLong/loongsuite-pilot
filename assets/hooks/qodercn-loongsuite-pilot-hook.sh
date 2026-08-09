@@ -28,6 +28,7 @@ PROCESSOR="$HOOKS_DIR/qoder-hook-processor.mjs"
 
 MIN_NODE_MAJOR=18
 
+# 候选验证失败只让搜索继续，不能因为一个陈旧版本管理器目录终止整个 Hook。
 node_is_suitable() {
   local bin="$1"
   [[ -x "$bin" ]] || return 1
@@ -40,6 +41,7 @@ node_is_suitable() {
   return 0
 }
 
+# 解析真实路径后排除 macOS 应用私有 Node，避免其 Framework 依赖在 Hook 环境中缺失。
 node_is_app_bundle() {
   local resolved
   resolved="$(realpath "$1" 2>/dev/null || readlink -f "$1" 2>/dev/null || echo "$1")"
@@ -93,4 +95,5 @@ if [[ -z "$NODE_BIN" ]]; then
   exit 0
 fi
 
+# exec 保留宿主 stdin 的原始字节，并把 Shell 进程替换为真正处理器。
 exec "$NODE_BIN" "$PROCESSOR" --agent-id "$AGENT_ID"

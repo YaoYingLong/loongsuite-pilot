@@ -58,11 +58,15 @@ const SPAN_ATTRIBUTES = parseSpanAttributesFromEnv(process.env, { agentId: 'qode
 export const RETRY_LOCK_DIR = path.join(HOOKS_DIR, '.retry-locks');
 export const RETRY_LOCK_MAX_AGE_MS = 60_000;
 
+/** 用 transcript 绝对路径的 SHA-1 生成定长锁名，避免原路径中的斜杠或超长名称进入文件名。 */
 export function retryLockPath(transcriptPath, dir = RETRY_LOCK_DIR) {
   const hash = crypto.createHash('sha1').update(transcriptPath).digest('hex');
   return path.join(dir, `${hash}.lock`);
 }
 
+/**
+ * 通过信号 0 探测 PID：它不会真的发送信号；EPERM 表示进程存在但当前用户无权操作，仍算存活。
+ */
 export function pidAlive(pid) {
   if (!pid || typeof pid !== 'number') return false;
   try {
@@ -73,6 +77,7 @@ export function pidAlive(pid) {
   }
 }
 
+/** 读取锁元数据；文件不存在、JSON 损坏或字段形态异常都按“没有有效锁”处理。 */
 export function readRetryLock(lockPath) {
   try {
     const raw = fs.readFileSync(lockPath, 'utf-8');
@@ -82,6 +87,7 @@ export function readRetryLock(lockPath) {
   return null;
 }
 
+/** 锁超过一分钟或持有进程消失即视为陈旧，防止 Hook 崩溃后永久阻塞该 transcript。 */
 export function isRetryLockStale(lock) {
   if (!lock) return true;
   const age = Date.now() - (Number(lock.startedAt) || 0);
@@ -89,6 +95,10 @@ export function isRetryLockStale(lock) {
   return !pidAlive(lock.pid);
 }
 
+/**
+ * 使用 `openSync(..., 'wx')` 原子创建独占锁。
+ * 多进程同时竞争时只有一个能成功；发现陈旧锁后仅重试一次，整个函数故障时返回 false 而不抛出。
+ */
 export function tryAcquireRetryLock(transcriptPath, sessionId, dir = RETRY_LOCK_DIR) {
   try {
     fs.mkdirSync(dir, { recursive: true });
@@ -164,6 +174,12 @@ function computeDurationMs(startNanos, endNanos) {
 
 // --- 主流程 ----------------------------------------------------------------
 
+/**
+ * 处理器入口，同时支持宿主 Stop 模式和内部 `--retry` 子进程模式。
+ *
+ * 正常模式异步读取 stdin JSON；重试模式完全依赖 argv，避免后台进程等待已不存在的 stdin。
+ * 所有真正落盘工作委托给 processTranscript，入口只负责选择范围、完整性检查和并发锁。
+ */
 async function main() {
   const args = process.argv.slice(2);
   const isRetry = args.includes('--retry');
@@ -230,6 +246,7 @@ async function main() {
   const lines = readTranscriptLines(transcriptPath, startLine, endLine);
   logDebug(agentId, `Read ${lines.length} lines (range: ${startLine}-${endLine})`);
   if (!lines.length) {
+    // 范围存在但没有可读行时仍确认到 endLine，避免永久重复检查同一个空区间。
     updateLineRecord(agentId, transcriptPath, sessionId, endLine);
     return;
   }
@@ -285,6 +302,10 @@ async function main() {
 
 // 非交互 `--print` 每 session 只触发一次 Stop，正常 Hook 与重试通常不竞争；即使意外并发，
 // getLineRangeInfo 的 offset 检查也会阻止重复处理。
+/**
+ * 启动与父 Hook 脱离的 Node 子进程，5 秒后重新检查同一 transcript。
+ * detached + unref + stdio:ignore 使 wrapper 可以立即返回；子进程不继承 stdin/stdout，也不会拖住宿主。
+ */
 function spawnDelayedRetry(agentId, transcriptPath, sessionId, logPrefix, cwd) {
   const nodebin = process.argv[0];
   const script = fileURLToPath(import.meta.url);
@@ -306,6 +327,20 @@ function spawnDelayedRetry(agentId, transcriptPath, sessionId, logPrefix, cwd) {
   logDebug(agentId, `Spawned retry subprocess (PID ${child.pid})`);
 }
 
+/**
+ * 解析指定行区间、按 progress 边界组装标准事件，并在 history 写入成功后推进 checkpoint。
+ *
+ * @param {string} agentId Qoder 变体 ID，影响锁、重读和事件属性。
+ * @param {string} logPrefix history 文件名前缀。
+ * @param {string} transcriptPath 当前 JSONL transcript。
+ * @param {string} sessionId 用于隔离每个会话的行号状态。
+ * @param {number} startLine 首个待处理行（调用方采用的行号约定由 shared base 统一维护）。
+ * @param {number} initialEndLine 进入函数时看到的 EOF 行号；延迟后可能继续增长。
+ * @param {object} runtimeConfig 内容采集与 userId 等运行配置。
+ * @param {string|undefined} cwd Hook 上报的工作目录。
+ * @param {object} opts 重试延迟及 range reason 等内部选项。
+ * @returns {Promise<void>} 仅在计时等待处让出事件循环；文件解析与写入本身为同步操作。
+ */
 async function processTranscript(agentId, logPrefix, transcriptPath, sessionId, startLine, initialEndLine, runtimeConfig, cwd, opts) {
   // 重试子进程先按参数等待，让宿主有时间继续完成 transcript 写入。
   const delayApplied = !!(opts && opts.delayApplied);

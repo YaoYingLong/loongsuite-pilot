@@ -31,6 +31,7 @@ import {
  * @returns {{records: object[], consumedConversationIds: Set<string>}} 标准记录及可清理会话集合。
  */
 export function assembleTurn(journalEvents, options = {}) {
+  // 本函数只基于传入快照计算结果；唯一额外 I/O 是读取主/子 transcript 辅助恢复文本和子会话 ID。
   const runtimeConfig = options.runtimeConfig || {};
   const stopConversationId = options.stopConversationId;
   const transcriptPath = options.transcriptPath;
@@ -238,6 +239,10 @@ export function assembleTurn(journalEvents, options = {}) {
 
 // ─── Transcript 子目录扫描 ───
 
+/**
+ * Cursor 把子 Agent transcript 命名为 `<conversationId>.jsonl`，因此文件基本名即可作为关联 ID。
+ * 目录缺失或扫描失败返回空数组，让父 turn 仍能正常输出。
+ */
 function scanSubagentDir(transcriptPath) {
   if (!transcriptPath || String(transcriptPath) === 'None') return [];
   try {
@@ -254,6 +259,10 @@ function scanSubagentDir(transcriptPath) {
 
 // ─── Step 构造 ───
 
+/**
+ * 将一个会话的时序 Hook 事件切成 ReAct step，并生成 request/response/tool 记录。
+ * 函数同时用于父会话与子会话；ctx.baseFields/stepPrefix 决定作用域，返回值不负责写盘。
+ */
 function buildParentSteps(events, ctx) {
   const records = [];
   let stepRound = 0;

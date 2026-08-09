@@ -19,7 +19,9 @@ export function defaultAgentMatrixPath() {
 
 /** 导出函数同步地读取 loadAgentMatrix 所需的本地数据；读取失败按该脚本的 fail-open/退出码约定处理。 */
 export function loadAgentMatrix(env = process.env) {
+  // 自定义路径用于不同机器/Agent 组合；缺省时读取仓库随附的标准矩阵。
   const p = env.E2E_AGENT_MATRIX_PATH?.trim() || defaultAgentMatrixPath();
+  // 同步读取发生在 runner 初始化阶段，解析失败应立即阻止生成不完整的远端脚本。
   const raw = readFileSync(p, 'utf8');
   const j = JSON.parse(raw);
   if (!Array.isArray(j.agents)) throw new Error(`agent-matrix.json missing agents[] (${p})`);
@@ -45,11 +47,13 @@ export function resolveE2eCursorInstallStrategy(env = process.env) {
 export function resolveEnsureInstallSh(agent, env = process.env) {
   const bin = String(agent.binary ?? '').trim();
   if (bin === 'cursor') {
+    // 完整自定义命令的优先级最高，便于内网镜像或预装环境替换公开下载逻辑。
     if (env.E2E_CURSOR_ENSURE_INSTALL_SH?.trim()) {
       return env.E2E_CURSOR_ENSURE_INSTALL_SH.trim();
     }
     const strategy = resolveE2eCursorInstallStrategy(env);
     if (strategy === 'watzon') {
+      // 用户可能传仓库根 URL，也可能误传到 install.sh；统一剥去文件名再拼三个依赖文件。
       const stripInstallPath = u => String(u).trim().replace(/\/install\.sh\/?$/i, '');
       const jsdelivrBase = env.E2E_CURSOR_JSDELIVR_BASE?.trim()
         ? env.E2E_CURSOR_JSDELIVR_BASE.trim()
@@ -64,6 +68,7 @@ export function resolveEnsureInstallSh(agent, env = process.env) {
       const failMsg =
         "echo '[e2e-ensure] Cursor (watzon) failed — try E2E_CURSOR_INSTALL_STRATEGY=official or E2E_CURSOR_ENSURE_INSTALL_SH'";
       return (
+        // 子 shell `( ... )` 隔离临时 cd；`_dl` 先试 jsDelivr，失败再试 raw GitHub。
         `( _d="$HOME/.cache/loongsuite-e2e-cursor-install"; mkdir -p "$_d" && cd "$_d" || exit 1; ` +
         `_b="${jsdelivrBase}"; _f="${rawBase}"; ` +
         `_dl() { o="$1"; a="$2"; b="$3"; curl -fsSL --connect-timeout 25 --max-time 120 --retry 2 --retry-delay 2 "$a" -o "$o" || curl -fsSL --connect-timeout 25 --max-time 120 --retry 2 --retry-delay 2 "$b" -o "$o"; }; ` +
@@ -74,6 +79,7 @@ export function resolveEnsureInstallSh(agent, env = process.env) {
     const failOfficial =
       "echo '[e2e-ensure] Cursor official installer failed — set E2E_CURSOR_ENSURE_INSTALL_SH or E2E_CURSOR_INSTALL_STRATEGY=watzon'";
     return (
+      // 官方安装器经管道交给 Bash；外层 `||` 将下载/安装失败降级为诊断信息，让其余 Agent 继续。
       `( set +e; export NO_COLOR=1; mkdir -p "$HOME/.local/bin"; ` +
       `curl -fsSL --connect-timeout 25 --max-time 300 --retry 2 --retry-delay 2 https://cursor.com/install | bash ) ` +
       `|| ${failOfficial}`
@@ -84,6 +90,7 @@ export function resolveEnsureInstallSh(agent, env = process.env) {
 
 /** 内部函数同步地构建 buildCodexEnsureInstallSh 对应的配置或脚本文本；只有调用方执行返回值时才产生外部副作用。 */
 function buildCodexEnsureInstallSh(bin, env) {
+  // 该覆盖只作用于 Codex，其他 Agent 继续使用矩阵中的 ensureInstallSh。
   if (bin !== 'codex') return null;
   const spec = env.E2E_CODEX_NPM_SPEC?.trim() || '@openai/codex';
   return `npm install -g ${shellSingleQuoteBash(spec)} || echo '[e2e-ensure] npm install codex failed'`;
@@ -97,6 +104,7 @@ function buildEnsureSummaryScript(matrix) {
   const seen = new Set();
   for (const a of matrix.agents ?? []) {
     const bin = String(a.binary ?? '').trim();
+    // 同一个可执行文件可能对应多个矩阵项，摘要只探测一次以减少噪声。
     if (!bin || seen.has(bin)) continue;
     seen.add(bin);
     const label = String(a.id ?? a.name ?? bin).replace(/'/g, `'\''`);
@@ -132,6 +140,7 @@ function buildEnsureSummaryScript(matrix) {
 
 /** 生成远端 ensure 脚本：npm 安装缺失 CLI，cursor 改用 --version 真实探测。 */
 export function buildEnsureAgentClisScript(matrix, env = process.env) {
+  // `lines` 是待执行的 Bash 源码，不是当前 Node 进程执行的命令。
   const cursorStrat = resolveE2eCursorInstallStrategy(env);
   const cursorSkipIfIncompat = (env.E2E_CURSOR_SKIP_IF_INCOMPAT ?? '1').trim() === '0' ? '0' : '1';
   const lines = [
@@ -157,6 +166,7 @@ export function buildEnsureAgentClisScript(matrix, env = process.env) {
 
   const extra = env.E2E_EXTRA_ENSURE_BASH?.trim();
   if (extra) {
+    // 这是有意提供的任意 Bash 扩展点；长度告警只能发现误粘贴，不能构成安全边界。
     if (extra.length > 10_000) {
       console.warn('[e2e] E2E_EXTRA_ENSURE_BASH exceeds 10 000 chars — verify no accidental injection');
     }
@@ -171,6 +181,7 @@ export function buildEnsureAgentClisScript(matrix, env = process.env) {
   lines.push('  if [ -n "$_npfx" ] && [ -d "$_npfx/bin" ]; then export PATH="$_npfx/bin:$PATH"; fi');
 
   const forceCodex = env.E2E_CODEX_FORCE_ENSURE?.trim() === '1';
+  // probe 跳过列表也同步影响 ensure，避免用户明确跳过的 Agent 仍被安装。
   const skipAgents = resolveProbeSkipAgents(env);
 
   for (const a of matrix.agents) {
@@ -179,12 +190,14 @@ export function buildEnsureAgentClisScript(matrix, env = process.env) {
     if (skipAgents.has(bin.toLowerCase())) continue;
     const label = String(a.name ?? bin);
     let install = resolveEnsureInstallSh(a, env);
+    // Codex npm spec 是运行环境常用覆盖项，优先于 JSON 矩阵中的固定命令。
     const codexSh = buildCodexEnsureInstallSh(bin, env);
     if (codexSh) install = codexSh;
 
     lines.push(`  echo "[e2e-ensure] binary: ${bin} (${label})"`);
 
     if (bin === 'cursor') {
+      // 只靠 `command -v` 可能命中旧 AppImage shim，因此 Cursor 必须实际运行 `--version`。
       lines.push('  _e2e_have_cf=0');
       lines.push('  _e2e_cf_probe() {');
       lines.push('    _cand="$1"');
@@ -245,6 +258,7 @@ export function buildEnsureAgentClisScript(matrix, env = process.env) {
     }
 
     if (bin === 'codex' && forceCodex) {
+      // 强制模式即使 PATH 已有 Codex 也重装，主要用于验证指定版本或 npm spec。
       lines.push(`  echo "[e2e-ensure] E2E_CODEX_FORCE_ENSURE=1: reinstalling ${label}"`);
       if (install) {
         lines.push(`  ${install}`);
@@ -275,6 +289,7 @@ export function buildEnsureAgentClisScript(matrix, env = process.env) {
     '  echo "[e2e-ensure] cursor-installer present but cursor shim missing; trying cursor-installer --extract --update stable"',
     '  cursor-installer --extract --update stable || echo "[e2e-ensure] cursor-installer --extract --update failed (non-fatal if extract already done)"',
     'fi',
+    // 下面的英文行是生成到远端 Bash 的运行时注释；其含义是 official 模式优先建立 Agent CLI 链接。
     '# official: always put Agent CLI first as `~/.local/bin/cursor` (PATH may still have legacy AppImage earlier)',
     'if [ "$_E2E_CURSOR_STRAT" != "watzon" ] && command -v agent >/dev/null 2>&1; then',
     '  mkdir -p "$HOME/.local/bin"',
@@ -283,6 +298,7 @@ export function buildEnsureAgentClisScript(matrix, env = process.env) {
     '  mkdir -p "$HOME/.local/bin"',
     '  ln -sf "$(command -v agent)" "$HOME/.local/bin/cursor" && echo "[e2e-ensure] linked ~/.local/bin/cursor -> agent (Agent CLI)"',
     'fi',
+    // 下面的运行时注释说明：兼容修复 watzon/旧版解压后层级过深的 cursor 路径。
     '# Always fix wrong-depth path .../cursor/cursor/cursor when extract exists (watzon / legacy)',
     '_e2e_cursor_bin=""',
     'for _p in "$HOME/.local/share/cursor/cursor/usr/bin/cursor" "$HOME/.cursor/cursor/usr/bin/cursor"; do',
@@ -336,6 +352,7 @@ export function buildMatrixProbeScript(matrix, env = process.env) {
   const cursorSkipIfIncompat = (env.E2E_CURSOR_SKIP_IF_INCOMPAT ?? '1').trim() === '0' ? '0' : '1';
   const skipAgents = resolveProbeSkipAgents(env);
   const lines = [
+    // probe 失败要继续执行下一个 Agent，所以关闭 `-e`；pipefail 仍保留管道真实失败状态。
     'set +e -o pipefail',
     'export PATH="$HOME/.local/bin:$PATH"',
     `export _E2E_CURSOR_SKIP_IF_INCOMPAT=${shellSingleQuoteBash(cursorSkipIfIncompat)}`,
@@ -344,6 +361,7 @@ export function buildMatrixProbeScript(matrix, env = process.env) {
   ];
 
   for (const a of matrix.agents) {
+    // defaultProbeSh 是矩阵中的完整 Bash 块；空块表示该 Agent 没有会话探测步骤。
     const block = String(a.defaultProbeSh ?? '').trim();
     if (!block) continue;
     const bin = String(a.binary ?? '').trim();
@@ -353,11 +371,13 @@ export function buildMatrixProbeScript(matrix, env = process.env) {
       lines.push(`echo "[e2e-probe] >>> SKIP: ${label} (binary=${binEsc}) — E2E_PROBE_SKIP_AGENTS"`);
       continue;
     }
+    // base64 避免 probe 中的引号、变量和换行被外层生成脚本提前解释。
     const b64 = Buffer.from(`${block}\n`, 'utf8').toString('base64');
     lines.push(`echo "[e2e-probe] >>> start: ${label} (binary=${binEsc})"`);
     lines.push(`echo "[e2e-probe] command:"; printf '%s' '${b64}' | base64 -d | sed 's/^/  /'`);
     lines.push(`echo ""`);
     lines.push(
+      // 每个块在不读取 profile/rc 的独立 Bash 中运行；保存退出码后只记录，不终止整个矩阵。
       `printf '%s' '${b64}' | base64 -d | bash --norc --noprofile -s; _st=$?; ` +
         `if [ "$_st" -eq 0 ]; then echo "[e2e-probe] <<< end: ${label} (exit 0)"; ` +
         `else echo "[e2e-probe] <<< end: ${label} (exit \${_st}, non-fatal)"; fi`,

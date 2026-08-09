@@ -307,19 +307,24 @@ export function buildSlsFailureLogRecord(
   input: SlsFailureLogInput,
   now = new Date(),
 ): SlsFailureLogRecord {
+  // 先把 Error、SDK 错误对象或原始值折叠为统一结构，避免下面直接访问 unknown。
   const errorObject = asErrorObject(input.error);
   return {
+    // schema/version 与毫秒时间用于后续迁移和排序。
     schema_version: SLS_FAILURE_LOG_SCHEMA_VERSION,
     ts: now.getTime(),
     endpoint: boundedString(input.endpoint, 256),
+    // endpoint 路由字段分别限制长度，防止异常响应把失败日志自身撑大。
     mode: boundedString(input.mode, 64),
     project: boundedString(input.project, 256),
     logstore: boundedString(input.logstore, 256),
     kind: boundedString(input.kind, 128),
+    // 类型/code/status 保持低基数，适合聚合；高变摘要另行脱敏并按 UTF-8 字节截断。
     error_type: boundedString(errorObject.type, 128),
     error_code: boundedString(errorObject.code, 128),
     http_status: errorObject.httpStatus,
     error_summary: truncateUtf8(redactErrorSummary(errorObject.summary), SLS_FAILURE_ERROR_SUMMARY_MAX_BYTES),
+    // 批次规模只接受有界非负整数，避免 NaN、负数或极大值污染诊断统计。
     batch_count: boundedNonNegativeInteger(input.batchCount),
     batch_bytes: boundedNonNegativeInteger(input.batchBytes),
   };

@@ -240,16 +240,19 @@ function transformRow(
     if (!content) return out;
     out.push(
       buildAgentActivityEntry({
+        // 使用 session + message row ID 生成稳定事件 ID，重复查询同一 SQLite 行不会改变身份。
         timestamp: tsMs,
         'event.id': hashId([sessionId, row.id, 'user']),
         'event.name': 'llm.request',
         'gen_ai.session.id': sessionId,
         'gen_ai.agent.type': agentType,
         'gen_ai.request.model': model,
+        // SQLite 已保存完整 user 文本，但在标准事件中作为当前 step 新增消息 delta 输出。
         'gen_ai.input.messages_delta': [
           { role: 'user', content },
         ],
         attributes: {
+          // 数据源特有字段进入 agent.* attributes，不污染跨 Agent 公共 Schema。
           source: SOURCE,
           event_kind: 'user_prompt',
           message_id: row.id,
@@ -287,6 +290,7 @@ function transformRow(
     const resultPayload: JsonValue = typeof rawResult === 'string'
       ? rawResult
       : toJsonValue(rawResult) ?? '';
+    // emittedToolResultIds 在同一采集周期跨消息共享，防止数据库重复 part 产生相同 tool.result。
 
     // 结果内容也参与 ID，允许同一 call ID 的实际结果修订形成新事件。
     const eventId = hashId([sessionId, row.id, 'tool_result', callId, toolName, hashJson(resultPayload)]);

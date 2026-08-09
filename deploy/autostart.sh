@@ -38,9 +38,11 @@ LOONGSUITE_PILOT_UPDATER_LOG_FILE="${LOONGSUITE_PILOT_UPDATER_LOG_FILE:-$LOONGSU
 
 # 按操作系统和 systemctl 会话可用性返回 launchd、systemd-user 或 none。
 _detect_init_system() {
+    # 命令替换调用本函数，因此 stdout 必须只包含机器可解析的类型值，诊断信息不能写 stdout。
     case "$(uname -s)" in
         Darwin) echo "launchd" ;;
         Linux)
+            # systemctl 可执行文件存在还不够；必须确认当前用户的 systemd/DBus 会话可访问。
             if command -v systemctl &>/dev/null && systemctl --user status &>/dev/null 2>&1; then
                 echo "systemd"
             else
@@ -51,7 +53,8 @@ _detect_init_system() {
     esac
 }
 
-# 生成或原子写入 _write_launchd_plist 对应的配置文件，供服务/后续进程读取。
+# 用 heredoc 直接覆盖 Collector plist；变量在写入时展开，因此配置保存的是当前路径快照。
+# 此处不是临时文件+rename，调用方会先 unload 旧 job 后再写。
 _write_launchd_plist() {
     mkdir -p "$(dirname "$_LOONGSUITE_PILOT_LAUNCHD_PLIST")"
     mkdir -p "$(dirname "$LOONGSUITE_PILOT_LOG_FILE")"
@@ -90,7 +93,7 @@ _write_launchd_plist() {
 PLISTEOF
 }
 
-# 生成或原子写入 _write_launchd_updater_plist 对应的配置文件，供服务/后续进程读取。
+# 直接写 Updater plist，日志和配置路径与 Collector 分开，便于独立启停与排障。
 _write_launchd_updater_plist() {
     mkdir -p "$(dirname "$_LOONGSUITE_PILOT_UPDATER_PLIST")"
     mkdir -p "$(dirname "$LOONGSUITE_PILOT_UPDATER_LOG_FILE")"
@@ -129,7 +132,7 @@ _write_launchd_updater_plist() {
 PLISTEOF
 }
 
-# 生成或原子写入 _write_systemd_unit 对应的配置文件，供服务/后续进程读取。
+# 写 systemd user Collector unit；Type=simple 要求 `loongsuite-pilot run` 保持前台且使用 exec。
 _write_systemd_unit() {
     mkdir -p "$_LOONGSUITE_PILOT_SYSTEMD_UNIT_DIR"
     mkdir -p "$(dirname "$LOONGSUITE_PILOT_LOG_FILE")"
@@ -150,7 +153,7 @@ WantedBy=default.target
 UNITEOF
 }
 
-# 生成或原子写入 _write_systemd_updater_unit 对应的配置文件，供服务/后续进程读取。
+# 写 systemd user Updater unit；60 秒重启间隔避免更新端点持续失败时形成紧密重启循环。
 _write_systemd_updater_unit() {
     mkdir -p "$_LOONGSUITE_PILOT_SYSTEMD_UNIT_DIR"
     mkdir -p "$(dirname "$LOONGSUITE_PILOT_UPDATER_LOG_FILE")"
@@ -178,10 +181,12 @@ UNITEOF
 # 为检测到的服务管理器生成配置、加载并启动 Collector/Updater。
 autostart_install() {
     local init_system
+    # 捕获探测结果后只执行一个平台分支；任一未处理命令失败会受严格模式约束。
     init_system=$(_detect_init_system)
 
     case "$init_system" in
         launchd)
+            # unload 失败允许继续，常见原因是首次安装尚未加载；随后生成并 load 新配置。
             launchctl unload -w "$_LOONGSUITE_PILOT_LAUNCHD_PLIST" 2>/dev/null || true
             launchctl unload -w "$_LOONGSUITE_PILOT_UPDATER_PLIST" 2>/dev/null || true
             _write_launchd_plist
@@ -195,12 +200,14 @@ autostart_install() {
         systemd)
             _write_systemd_unit
             _write_systemd_updater_unit
+            # 写 unit 后 daemon-reload 让 systemd 重读文件，enable --now 同时注册自启并立即启动。
             systemctl --user daemon-reload
             systemctl --user enable --now "$_LOONGSUITE_PILOT_SYSTEMD_UNIT"
             systemctl --user enable --now "$_LOONGSUITE_PILOT_UPDATER_UNIT"
             echo "✅ Autostart enabled and services started (systemd user units)"
             echo "   Collector: $_LOONGSUITE_PILOT_SYSTEMD_UNIT_PATH"
             echo "   Updater:   $_LOONGSUITE_PILOT_UPDATER_UNIT_PATH"
+            # linger 是增强项：失败不改变服务已注册的事实，只影响用户注销后是否继续运行。
             if command -v loginctl &>/dev/null; then
                 if loginctl enable-linger "$(whoami)" 2>/dev/null; then
                     echo "   Linger enabled (services start at boot without login)"
@@ -210,6 +217,7 @@ autostart_install() {
             fi
             ;;
         *)
+            # 本参考库本身没有实现输出所述的 nohup fallback，只返回 1；调用者若需要必须自行启动。
             echo "⚠️  No supported init system detected (need launchd or systemd)"
             echo "   Service will run via nohup but won't auto-start on boot"
             return 1
@@ -231,6 +239,7 @@ autostart_remove() {
             echo "✅ Autostart disabled (launchd plists removed)"
             ;;
         systemd)
+            # 先 disable --now 再删 unit，避免删除文件后 systemd 仍按内存中的旧配置运行。
             systemctl --user disable --now "$_LOONGSUITE_PILOT_UPDATER_UNIT" 2>/dev/null || true
             rm -f "$_LOONGSUITE_PILOT_UPDATER_UNIT_PATH"
             systemctl --user disable --now "$_LOONGSUITE_PILOT_SYSTEMD_UNIT" 2>/dev/null || true
@@ -252,6 +261,7 @@ autostart_status() {
     case "$init_system" in
         launchd)
             if [ -f "$_LOONGSUITE_PILOT_LAUNCHD_PLIST" ]; then
+                # plist 存在仅表示已生成；launchctl/systemctl 查询用于区分“文件存在”与“已加载/启用”。
                 if launchctl list 2>/dev/null | grep -q "$_LOONGSUITE_PILOT_SERVICE_LABEL$"; then
                     echo "✅ Collector autostart: enabled (launchd, loaded)"
                 else

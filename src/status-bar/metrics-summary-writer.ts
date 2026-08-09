@@ -315,6 +315,7 @@ export class MetricsSummaryWriter {
   private ensureDayStats(map: Map<string, DayStats>, day: string): DayStats {
     let stats = map.get(day);
     if (!stats) {
+      // 数字计数器从 0 开始；需要去重的 session 使用 Set，需要按维度累加的项使用 Map。
       stats = {
         tokens: 0,
         inputTokens: 0,
@@ -325,6 +326,7 @@ export class MetricsSummaryWriter {
         requests: 0,
         toolCalls: 0,
         events: 0,
+        // model/agent/provider/repo 都按需建子项，避免无数据维度出现在最终 summary。
         modelTokens: new Map(),
         agentStats: new Map(),
         providerTokens: new Map(),
@@ -339,19 +341,24 @@ export class MetricsSummaryWriter {
    * 从字节 offset 建流、按行解析 JSON 并应用记录，返回扫描后的文件 size 作为新 offset。
    */
   private async scanFile(filePath: string, startOffset: number, stats: DayStats): Promise<number> {
+    // readline 是事件式 API，因此手动包装 Promise，让调用方可以 await 到 close 或 error。
     return new Promise<number>((resolve, reject) => {
+      // offset 按 UTF-8 字节而非 JavaScript 字符计数，才能直接用于下一次 createReadStream.start。
       let currentOffset = startOffset;
       const stream = createReadStream(filePath, {
         start: startOffset,
         encoding: 'utf8',
       });
+      // crlfDelay=Infinity 把 CRLF 当作一个换行边界，避免 Windows 文件产生额外空行。
       const rl = createInterface({ input: stream, crlfDelay: Infinity });
 
       rl.on('line', (line) => {
+        // JSONL writer 使用单字节 LF；中文字符必须通过 Buffer.byteLength 计算实际 UTF-8 长度。
         currentOffset += Buffer.byteLength(line, 'utf8') + 1; // 额外的 1 字节用于换行符。
         if (!line.trim()) return;
 
         try {
+          // 输出 Flusher 已把所有值字符串化，因此这里读取字符串宽表并直接累计。
           const record = JSON.parse(line) as Record<string, string>;
           this.applyRecord(record, stats);
         } catch {
@@ -359,7 +366,9 @@ export class MetricsSummaryWriter {
         }
       });
 
+      // close 表示输入流已消费到本轮 EOF，此时 offset 才能作为完整扫描结果提交。
       rl.on('close', () => resolve(currentOffset));
+      // 流或 readline 错误向 await 调用方传播，由上层决定是否保留旧 checkpoint 重试。
       rl.on('error', reject);
     });
   }

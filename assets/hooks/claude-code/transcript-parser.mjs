@@ -26,14 +26,17 @@ import crypto from 'node:crypto';
 export const MAX_TRANSCRIPT_BYTES = 50 * 1024 * 1024; // 50 MB 安全读取上限。
 const MISSING_PROMPT_ID = '__missing_prompt_id__';
 
+/** Claude 会把内部命令/系统注入标记为 meta；这些记录不应成为用户 prompt。 */
 function isMetaRecord(record) {
   return record?.isMeta === true || record?.isMeta === 'true';
 }
 
+/** `<synthetic>` 是 Claude Code 自己补的占位消息，不代表一次真实模型响应。 */
 function isSyntheticAssistantRecord(record) {
   return record?.type === 'assistant' && record?.message?.model === '<synthetic>';
 }
 
+/** 将缺少 promptId 的兼容记录集中到显式哨兵桶，避免 Map 的 undefined key 难以诊断。 */
 function promptMapKey(promptId) {
   return promptId || MISSING_PROMPT_ID;
 }
@@ -55,6 +58,7 @@ function parseTimestampMs(ts) {
   return Number.isFinite(ms) ? ms : null;
 }
 
+/** 比较两个 ISO 时间并返回较晚者；无法解析的一方让位给可解析值。 */
 function laterTimestamp(a, b) {
   if (!a) return b || null;
   if (!b) return a;
@@ -103,6 +107,7 @@ export function parseClaudeTranscript(transcriptPath, byteOffset = 0) {
     const readLen = fileSize - readFrom;
 
     if (readLen > MAX_TRANSCRIPT_BYTES) {
+      // 积压超过上限时只保留文件尾部，并丢掉从中间切开的第一条 JSONL；早期 turn 会被明确舍弃。
       const fd = fs.openSync(transcriptPath, 'r');
       try {
         const tailOffset = fileSize - MAX_TRANSCRIPT_BYTES;
@@ -119,6 +124,7 @@ export function parseClaudeTranscript(transcriptPath, byteOffset = 0) {
         fs.closeSync(fd);
       }
     } else if (readFrom > 0) {
+      // offset 是字节位置，必须用 fd/readSync 定位；对 UTF-8 字符串直接 slice 会错位。
       const fd = fs.openSync(transcriptPath, 'r');
       try {
         const buf = Buffer.alloc(readLen);
@@ -142,6 +148,7 @@ export function parseClaudeTranscript(transcriptPath, byteOffset = 0) {
   const toolResultErrors = new Map(); // tool_use_id -> 是否错误的布尔值（is_error）。
   let currentPromptId = null; // 当前 turn 的 promptId(从 user record 提取)
 
+  // 每行独立容错：尾部半行或单条坏 JSON 跳过，但 nextOffset 仍由调用方在整体成功后决定是否提交。
   for (const line of content.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed) continue;
@@ -164,7 +171,7 @@ export function parseClaudeTranscript(transcriptPath, byteOffset = 0) {
       const msg = record.message;
       if (!msg) continue;
 
-      // 支持 msg.id 缺失: 生成合成 ID
+      // 支持 msg.id 缺失：生成合成 ID。此类记录不会与别的 chunk 合并，但仍可保留最终回答。
       const msgId = msg.id || `_syn_${crypto.randomUUID()}`;
       const recordTs = record.timestamp || null;
 

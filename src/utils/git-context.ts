@@ -20,16 +20,23 @@ const MAX_CACHE_ENTRIES = 256;
 
 /** Git enrich 的公开结果；每个字段都可能因源数据不可用而缺失。 */
 export interface GitContextResult {
+  /** 去掉协议、host 和 `.git` 后缀的 `owner/repo` 路径。 */
   repo?: string;
+  /** 当前分支；detached HEAD 时缺失。 */
   branch?: string;
+  /** `git rev-parse --show-toplevel` 返回的仓库根目录。 */
   root?: string;
+  /** remote.origin.url 提取并规范化后的托管域名。 */
   domain?: string;
 }
 
+/** 对外结果加绝对过期毫秒，供进程内 Map 惰性淘汰。 */
 interface GitContextCacheEntry extends GitContextResult {
+  /** Date.now() 达到该值后缓存失效。 */
   expiresAt: number;
 }
 
+/** 以调用方原始 probeDir 为 key；同一目录字符串复用一次 Git 探测结果。 */
 const gitContextCache = new Map<string, GitContextCacheEntry>();
 
 /** 超限时先清过期项，仍超限则按最早到期顺序淘汰旧项。 */
@@ -64,6 +71,7 @@ export async function inferGitContext(probeDir: string): Promise<GitContextResul
   }
 
   // 先定位仓库根；后续命令尽量在根目录执行。
+  // root 查询失败时仍在原 probeDir 尝试 branch/remote，让部分 Git 环境有机会返回可用信息。
   const root = await runGit(probeDir, ['rev-parse', '--show-toplevel']);
   const gitRoot = root?.trim() || undefined;
   const branch = normalizeBranch(await runGit(gitRoot ?? probeDir, ['rev-parse', '--abbrev-ref', 'HEAD']));
@@ -72,6 +80,7 @@ export async function inferGitContext(probeDir: string): Promise<GitContextResul
   const domain = normalizeDomain(remote);
 
   // 写新条目前执行容量保护，再为本轮结果设置统一过期时间。
+  // 清理发生在 set 前；Map 恰好已达上限时本轮可能暂时多一项，下一次写入会再执行淘汰。
   evictStaleEntries(gitContextCache);
   gitContextCache.set(probeDir, {
     expiresAt: now + GIT_CONTEXT_TTL_MS,
@@ -87,6 +96,7 @@ export async function inferGitContext(probeDir: string): Promise<GitContextResul
 async function runGit(root: string, args: string[]): Promise<string | undefined> {
   try {
     // 1.5 秒超时和 64 KiB 缓冲避免异常仓库拖慢整个采集批次。
+    // 参数数组直接交给 execFile，不通过 shell，因此 root 中的空格不需要调用方手工加引号。
     const { stdout } = await execFile('git', ['-C', root, ...args], {
       timeout: 1500,
       maxBuffer: 64 * 1024,
@@ -116,6 +126,7 @@ export function normalizeRepo(raw: string | undefined): string | undefined {
   if (!raw) return undefined;
   const trimmed = raw.trim();
   if (!trimmed) return undefined;
+  // 匹配 `git@host:owner/repo.git`；`ssh://host/path` 不命中并会走普通字符串清理路径。
   const sshMatch = trimmed.match(/^[^@]+@[^:]+:(.+)$/);
   // scp 风格取冒号后内容；HTTPS 风格由后续正则去掉协议和 host。
   const source = sshMatch ? sshMatch[1] : trimmed;
@@ -131,7 +142,9 @@ export function normalizeRepo(raw: string | undefined): string | undefined {
  * 值自带 `expiresAt`，本类不创建定时器，而是在 get/set 时惰性清理。
  */
 export class BoundedTtlCache<V extends { expiresAt: number }> {
+  /** 实际缓存容器；key 语义由具体调用方决定。 */
   private readonly map = new Map<string, V>();
+  /** 触发惰性淘汰的软上限。 */
   private readonly maxEntries: number;
 
   /** @param maxEntries 最大条目数，默认与 Git 上下文缓存一致。 */
@@ -152,6 +165,7 @@ export class BoundedTtlCache<V extends { expiresAt: number }> {
 
   /** 写入条目；超容量时触发统一淘汰。 */
   set(key: string, value: V): void {
+    // Map.set 对已有 key 原位覆盖，不增加 size；新 key 才可能触发容量处理。
     this.map.set(key, value);
     if (this.map.size > this.maxEntries) {
       evictStaleEntries(this.map);

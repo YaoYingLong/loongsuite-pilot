@@ -11,6 +11,7 @@ import { shellSingleQuoteBash } from './propagate-sls-install.mjs';
  * @param {NodeJS.ProcessEnv} env
  */
 export function isE2eClaudeBailianEnabled(env = process.env) {
+  // 只把明确的真值字符串视为启用；未设置或其他拼写都保持关闭。
   const v = env.E2E_CLAUDE_BAILIAN?.trim().toLowerCase();
   return v === '1' || v === 'true' || v === 'yes';
 }
@@ -20,6 +21,7 @@ export function isE2eClaudeBailianEnabled(env = process.env) {
  * @returns {string}
  */
 export function buildRemoteClaudeBailianExportsSh(env = process.env) {
+  // 返回空串表示调用方无需向远端脚本拼接任何配置。
   if (!isE2eClaudeBailianEnabled(env)) return '';
   const apiKey = env.E2E_CLAUDE_BAILIAN_API_KEY?.trim();
   if (!apiKey) {
@@ -36,6 +38,7 @@ export function buildRemoteClaudeBailianExportsSh(env = process.env) {
     `[e2e] Injecting Claude 百炼 env: ANTHROPIC_BASE_URL + ANTHROPIC_API_KEY + ANTHROPIC_MODEL (${model})`,
   );
   return (
+    // 每个值都用 Bash 单引号转义，防止 key 或 URL 中的 `$`、空格等被远端 Shell 再展开。
     `export ANTHROPIC_BASE_URL=${shellSingleQuoteBash(baseUrl)}\n` +
     `export ANTHROPIC_API_KEY=${shellSingleQuoteBash(apiKey)}\n` +
     `export ANTHROPIC_MODEL=${shellSingleQuoteBash(model)}\n`
@@ -51,7 +54,9 @@ export function buildRemoteClaudeBailianExportsSh(env = process.env) {
  * @returns {string}
  */
 export function buildRemoteSecretExportsSh(env = process.env) {
+  // lines 保存最终要送入 SSH 远端 shell 的 export 语句；本函数本身不会修改 process.env。
   const lines = [];
+  // 专用 Codex key 优先，旧的通用 key 仅用于兼容已有 E2E 环境。
   const codexOpenai = env.E2E_CODEX_OPENAI_API_KEY?.trim() || env.E2E_OPENAI_API_KEY?.trim();
   if (codexOpenai) {
     if (env.E2E_CODEX_OPENAI_API_KEY?.trim()) {
@@ -68,6 +73,7 @@ export function buildRemoteSecretExportsSh(env = process.env) {
   const anthropicLegacy =
     env.E2E_ANTHROPIC_API_KEY?.trim() || env.E2E_CLAUDE_API_KEY?.trim();
   if (bailianBlock) {
+    // 百炼模式必须整块覆盖原生 Anthropic key，避免 base URL 与凭据来自两套配置。
     if (anthropicLegacy) {
       console.warn(
         '[e2e] Claude: E2E_CLAUDE_BAILIAN=1 wins over E2E_ANTHROPIC_API_KEY / E2E_CLAUDE_API_KEY for remote ANTHROPIC_* (omit legacy keys if unintended).',
@@ -88,6 +94,7 @@ export function buildRemoteSecretExportsSh(env = process.env) {
 
   const qwenKey = env.E2E_QWEN_API_KEY?.trim() || env.E2E_DASHSCOPE_API_KEY?.trim() || codexOpenai;
   if (qwenKey) {
+    // Qwen CLI 兼容两种 key 变量名，因此同时导出；base URL/model 仍允许专项覆盖。
     const qwenBaseUrl = env.E2E_QWEN_BASE_URL?.trim() || env.E2E_CODEX_BASE_URL?.trim() || 'https://dashscope.aliyuncs.com/compatible-mode/v1';
     const qwenModel = env.E2E_QWEN_MODEL?.trim() || env.E2E_CODEX_MODEL?.trim() || 'qwen3-coder-plus';
     console.log('[e2e] Injecting QWEN_API_KEY / DASHSCOPE_API_KEY for Qwen Code CLI probe');
@@ -116,11 +123,13 @@ export function buildRemoteSecretExportsSh(env = process.env) {
     ['E2E_QWEN_NPM_SPEC', 'E2E_QWEN_NPM_SPEC'],
     ['E2E_OPENCODE_NPM_SPEC', 'E2E_OPENCODE_NPM_SPEC'],
   ]) {
+    // probe 命令和 npm spec 也需显式转发，因为普通 SSH 不继承发起端进程环境。
     const value = env[source]?.trim();
     if (value) lines.push(`export ${target}=${shellSingleQuoteBash(value)}`);
   }
 
   if (!lines.length) return '';
+  // 末尾换行使此片段与后续生成的 Bash 命令自然分隔。
   return `${lines.join('\n')}\n`;
 }
 
@@ -143,6 +152,7 @@ export function buildRemoteCodexConfigSh(env = process.env) {
   const envKey = env.E2E_CODEX_ENV_KEY?.trim() || 'CODEX_OPENAI_API_KEY';
   const wireApi = env.E2E_CODEX_WIRE_API?.trim() || 'responses';
 
+  // TOML 双引号字符串至少需要转义反斜杠和双引号，防止用户配置破坏模板结构。
   const esc = s => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
   const toml = `model_provider = "${esc(provider)}"
 model = "${esc(model)}"
@@ -158,10 +168,12 @@ hooks = true
 shell_snapshot = false
 `;
   const b64 = Buffer.from(`${toml}\n`, 'utf8').toString('base64');
+  // 默认执行“保留 Hook 的合并”；只有显式置 1 才允许完全覆盖旧 config.toml。
   const forceReplace = env.E2E_WRITE_REMOTE_CODEX_CONFIG_REPLACE?.trim() === '1' ? '1' : '0';
 
   /** 在远端运行；存在 OTel Codex Hook 时合并 Dashscope 配置块，避免覆盖 SLS 相关配置。 */
   const mergeNode = [
+    // 这段 Node 源码会在远端执行。使用字符串数组可避免外层模板字符串误展开其中的字符。
     "'use strict';",
     "const fs = require('fs');",
     "const os = require('os');",
@@ -225,12 +237,15 @@ shell_snapshot = false
   const mergeNodeB64 = Buffer.from(mergeNode, 'utf8').toString('base64');
 
   return (
+    // 先落一份临时新配置，再让远端 Node 判断合并/替换；每一步用 `&&` 串联，失败即停止后续步骤。
     `mkdir -p "$HOME/.codex" && ` +
       `printf '%s' '${b64}' | base64 -d > /tmp/e2e-loongsuite-codex-fresh.toml && ` +
       `export E2E_WRITE_REMOTE_CODEX_REPLACE='${forceReplace}' && ` +
       `if command -v node >/dev/null 2>&1; then ` +
+      // Node 可用时执行结构化合并，并在成功后清理临时文件。
       `printf '%s' '${mergeNodeB64}' | base64 -d | node && rm -f /tmp/e2e-loongsuite-codex-fresh.toml; ` +
       `else ` +
+      // 无 Node 的远端无法可靠合并 TOML，只能覆盖并输出清晰警告；这是 E2E 的兼容降级路径。
       `printf '%s' '${b64}' | base64 -d > "$HOME/.codex/config.toml" && rm -f /tmp/e2e-loongsuite-codex-fresh.toml && ` +
       `echo "[e2e-ensure] WARN: node missing — wrote ~/.codex/config.toml without merge (may drop OTel blocks; install node or set hooks before E2E)"; ` +
       `fi && ` +
@@ -259,6 +274,7 @@ export function resolveE2eClaudeProxyApiKey(env = process.env) {
 export function buildRemoteClaudeOnboardingSkipSh(env = process.env) {
   if (env.E2E_WRITE_REMOTE_CLAUDE_ONBOARDING_SKIP?.trim() !== '1') return '';
   const json = `${JSON.stringify({ hasCompletedOnboarding: true }, null, 2)}\n`;
+  // base64 让 JSON 跨模板字符串和 SSH 时不受引号、换行影响；远端再解码为原文件。
   const b64 = Buffer.from(json, 'utf8').toString('base64');
   return (
     `printf '%s' '${b64}' | base64 -d > "$HOME/.claude.json" && ` +
@@ -285,6 +301,7 @@ export function buildRemoteClaudeProxyConfigSh(env = process.env) {
     'https://dashscope.aliyuncs.com/compatible-mode/v1';
   const model = env.E2E_CLAUDE_PROXY_MODEL?.trim() || 'qwen3-coder-plus';
   const cfg = {
+    // 此对象包含 secret，只编码后嵌入返回脚本；调用方不得把完整脚本文本写入日志。
     apiKey,
     baseURL,
     modelMapping: {

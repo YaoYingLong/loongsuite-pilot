@@ -28,7 +28,8 @@ if (PROPRIETARY_BUILD) {
   _sendRunningStatus = s.sendRunningStatus;
 }
 
-// 导出固定引用，调用方使用普通同步函数，不需要再次 await 动态模块。
+// 顶层 await 会让依赖本模块的 ESM 初始化等待分支 import 完成；初始化后导出固定引用，
+// 调用方使用普通同步函数，不需要在每次指标周期重复动态 import 或 await。
 export const sendAlarm = _sendAlarm;
 export const sendStatus = _sendStatus;
 export const sendRunningStatus = _sendRunningStatus;

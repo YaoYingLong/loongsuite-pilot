@@ -19,6 +19,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { isQoderIdeaSession } from './shared/qoder-db-utils.mjs';
 
+// 这些是“标准记录”里可能承载原始对话内容的字段。关闭 captureMessageContent 时，
+// applyHookContentPolicy 会统一删除它们；集中列举可避免每个 Agent 各自实现一套脱敏规则。
 const MESSAGE_CONTENT_FIELDS = new Set([
   'gen_ai.input.messages',
   'gen_ai.input.messages_delta',
@@ -36,6 +38,8 @@ const MESSAGE_CONTENT_FIELDS = new Set([
   'agent.inline_diff_message',
 ]);
 
+// 原始 Hook payload 中也可能残留内容字段。即使某字段尚未映射到标准 Schema，
+// addSourceAttributes 复制扩展字段时也必须跳过这些 key，否则会绕过上面的内容策略。
 const MESSAGE_CONTENT_SOURCE_KEYS = new Set([
   'attachments',
   'content',
@@ -55,6 +59,8 @@ const MESSAGE_CONTENT_SOURCE_KEYS = new Set([
   'tool_results',
 ]);
 
+// 已被 Cursor 标准字段消费的源 key 不再以 `agent.cursor.*` 重复保存。
+// 这样既控制记录体积，也避免同一事实存在两个值而让下游不知道应相信哪一个。
 const CURSOR_MAPPED_SOURCE_KEYS = new Set([
   'cache_read_tokens',
   'cache_write_tokens',
@@ -115,6 +121,7 @@ const CURSOR_MAPPED_SOURCE_KEYS = new Set([
   'user_id',
 ]);
 
+// Qoder 采用同一规则：只有未被标准 Schema 消费、且不含消息正文的扩展字段才会保留。
 const QODER_MAPPED_SOURCE_KEYS = new Set([
   'conversation_id',
   'cwd',
@@ -143,13 +150,24 @@ const QODER_MAPPED_SOURCE_KEYS = new Set([
   'uuid',
 ]);
 
+/**
+ * 递归删除 undefined、空数组和空对象，生成适合 JSONL 落盘的紧凑对象。
+ *
+ * 注意：`false`、`0` 与空字符串都有业务含义，因此不会按 JavaScript 的“假值”规则删除。
+ * 本函数会新建数组/对象，不修改调用方传入的 payload。
+ *
+ * @param {unknown} obj 待清理的任意 JSON 候选值。
+ * @returns {unknown|undefined} 清理后的值；容器完全为空时返回 undefined，供父级删除该字段。
+ */
 export function sanitizeObject(obj) {
   if (obj === null || obj === undefined) return undefined;
   if (Array.isArray(obj)) {
+    // 子元素先递归清理，再过滤真正“缺失”的 undefined；数组顺序保持不变。
     const list = obj.map(item => sanitizeObject(item)).filter(item => item !== undefined);
     return list.length > 0 ? list : undefined;
   }
   if (typeof obj !== 'object') return obj;
+  // 普通对象逐键复制，避免直接 delete 原始 Hook payload 上的属性。
   const out = {};
   for (const [key, value] of Object.entries(obj)) {
     const cleaned = sanitizeObject(value);

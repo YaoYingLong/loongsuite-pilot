@@ -20,6 +20,7 @@ if ($Subcommand -notin @("stop", "subagent-start", "subagent-stop")) {
     exit 0
 }
 
+# 诊断记录与正常采集分目录；空 catch 保证磁盘/权限错误不会改变宿主命令结果。
 function Log-Error {
     param([string]$Stage, [string]$Message)
     try {
@@ -45,6 +46,7 @@ if (-not (Test-Path $Processor)) {
 
 $MIN_NODE_MAJOR = 18
 
+# 单个候选失败返回 false，外层解析函数仍会继续检查其他安装位置。
 function Test-NodeSuitable {
     param([string]$bin)
     if (-not (Test-Path $bin)) { return $false }
@@ -56,6 +58,7 @@ function Test-NodeSuitable {
     } catch { return $false }
 }
 
+# 只读搜索可用 Node，不回写 node-bin，避免多个并发 Hook 竞争修改配置。
 function Resolve-NodeBin {
     $pinFile = Join-Path $env:USERPROFILE ".loongsuite-pilot\node-bin"
     if (Test-Path $pinFile) {
@@ -139,6 +142,7 @@ try {
         $psi.RedirectStandardError = $false
         $psi.CreateNoWindow = $true
 
+        # 子进程隐藏窗口并重定向 stdin/stdout；stderr 不重定向，避免 ReadToEnd 双流死锁。
         $proc = [System.Diagnostics.Process]::Start($psi)
         $proc.StandardInput.BaseStream.Write($rawBytes, 0, $rawBytes.Length)
         $proc.StandardInput.Close()

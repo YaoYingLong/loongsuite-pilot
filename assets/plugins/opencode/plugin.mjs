@@ -45,6 +45,10 @@ const SPAN_ATTR_MAX_VALUE_LENGTH = 512;
 const SPAN_ATTR_SENSITIVE_RE =
   /(^|[_.-])(TOKEN|SECRET|PASSWORD|CREDENTIAL|COOKIE)([_.-]|$)|^(API_KEY|API_HEADER)$/i;
 
+/**
+ * 解析用户附加的 span 属性，同时拒绝平台保留前缀、敏感 key 和超长 value。
+ * `indexOf('=')` 只切第一个等号，因此值本身可以继续包含 `=`；重复 key 以后出现的值覆盖前值。
+ */
 function parseSpanAttributesFromEnv(env = process.env) {
   const out = {};
   const raw = env.LOONGSUITE_PILOT_SPAN_ATTRIBUTES;
@@ -121,6 +125,10 @@ function msToNanos(ms) {
 // 安全 JSON 序列化
 // ---------------------------------------------------------------------------
 
+/**
+ * 处理循环引用、函数和 BigInt 后序列化。replacer 的 WeakSet 不会删除已遍历对象，
+ * 因而重复引用也会显示为 Circular；这是日志防御性降级，不用于还原宿主对象图。
+ */
 function safeStringify(obj) {
   const seen = new WeakSet();
   return JSON.stringify(obj, function (_key, value) {
@@ -139,6 +147,10 @@ function truncate(str, max) {
   return str.length > max ? str.slice(0, max) + "...[truncated]" : str;
 }
 
+/**
+ * 只裁剪标准消息最常见的 content/response 文本，保留数组与 part 的其余结构。
+ * 该函数返回浅拷贝，避免为了采集而直接改写 OpenCode 交给插件的事件对象。
+ */
 function truncateContent(val) {
   if (typeof val === "string") return truncate(val, MAX_CONTENT_SIZE);
   if (Array.isArray(val)) {
@@ -193,6 +205,7 @@ let _logDirReady = false;
 // 写为 agent.opencode.cwd，供后续管道丰富 git.repo/workspace.current_root。
 let agentCwd;
 
+/** 同步追加单条 JSONL；写入失败转到错误日志，任何异常都不会从插件边界抛回 OpenCode。 */
 function writeRecord(record) {
   try {
     if (!_logDirReady) {
@@ -227,6 +240,10 @@ function writeError(source, err) {
 const sessions = new Map();
 const sessionTurnSeqs = new Map();
 
+/**
+ * 获取或创建 session 状态。状态跨不同 Hook 回调保存，用于把分散到多个 EventV2 事件中的
+ * request、流式 part、token 和工具结果重新配对。Map 超限后淘汰最早插入项，并非 LRU。
+ */
 function getSession(sessionID) {
   if (!sessionID) return null;
   let s = sessions.get(sessionID);
@@ -254,6 +271,9 @@ function getSession(sessionID) {
   return s;
 }
 
+/**
+ * 释放完整会话状态，但短暂保留 turnSeq，使同一 sessionID 清理后再次出现时不会复用 turn 编号。
+ */
 function clearSession(sessionID) {
   const s = sessions.get(sessionID);
   if (s) {
@@ -271,6 +291,10 @@ function clearSession(sessionID) {
 // 标准记录公共字段
 // ---------------------------------------------------------------------------
 
+/**
+ * 构造每条标准事件共享的关联字段。正常路径使用 currentTurn.traceId；若事件次序异常尚无 turn，
+ * 会生成临时 traceId 以保持字段合法，但这类孤立记录无法与后续 turn 自动关联。
+ */
 function buildCommonFields(sessionID, session, userId) {
   const turn = session.currentTurn;
   return {
@@ -331,6 +355,10 @@ function buildUserInputMessages(systemPrompt, userPromptText) {
   return messages.length > 0 ? messages : undefined;
 }
 
+/**
+ * 把上一步 assistant 输出与工具结果回灌为下一次 llm.request 的增量上下文。
+ * 工具调用留在 assistant message，结果另放 tool message，保持调用和响应的角色语义。
+ */
 function buildInputMessagesDelta(lastOutputParts) {
   const messages = [];
   const assistantParts = [];
@@ -434,6 +462,10 @@ function recordUpstreamEnvOnce(sessionID) {
   }
 }
 
+/**
+ * `chat.message` 是新用户 turn 的边界：递增序号、创建 trace，并清空上个 turn 的临时 step 状态。
+ * 此处仅立即写 user 增量；模型 request 要等 `step-start`，因为那时模型/provider 才更完整。
+ */
 function handleChatMessage(inp, out, userId) {
   const sessionID = inp.sessionID;
   if (!sessionID) return;
@@ -526,6 +558,11 @@ function handleChatParams(inp, _out, sessionID) {
   }
 }
 
+/**
+ * 消费 OpenCode 的流式 part 状态机。
+ * step-start 发 request；reasoning/text 暂存到 pendingParts；工具 running/completed 分别发 call/result；
+ * step-finish 只暂存 token/cost，最终 response 等 message.updated 的 completed 时间再输出。
+ */
 function handleMessagePartUpdated(props, userId) {
   const sessionID = props.sessionID;
   const part = props.part;
@@ -538,6 +575,7 @@ function handleMessagePartUpdated(props, userId) {
   const partType = part.type;
 
   if (partType === "step-start") {
+    // 新 step 先清空输出缓冲，再分配递增 stepId；这不会重置 turn 级 traceId。
     session.pendingParts = [];
     turn.stepSeq += 1;
     turn.currentStepId = `${turn.turnId}:s${turn.stepSeq}`;
@@ -556,6 +594,7 @@ function handleMessagePartUpdated(props, userId) {
     record.time_unix_nano = msToNanos(session.stepStartTimeMs) || nowNanos();
 
     if (turn.stepSeq === 1) {
+      // 首步携带 system + user 全量输入；后续步只携带上一轮输出增量，减少重复日志体积。
       const inputMsgs = buildUserInputMessages(
         session.systemPrompt,
         turn.userPromptText
@@ -607,6 +646,7 @@ function handleMessagePartUpdated(props, userId) {
       : undefined;
 
     if (state?.status === "running" && callID) {
+      // 同一工具的 running part 可能多次更新；Set 保证 tool.call 只写一次，后续更新仅补全参数/时间。
       const existingPart = session.pendingParts.find(
         (pp) => pp.kind === "tool_call" && pp.callID === callID
       );
@@ -653,6 +693,7 @@ function handleMessagePartUpdated(props, userId) {
       callID &&
       !session.emittedToolCalls.has(`result:${callID}`)
     ) {
+      // result 使用独立前缀，因此 call 与 result 各允许输出一次。
       session.emittedToolCalls.add(`result:${callID}`);
 
       const resultPayload = state.output ?? state.error ?? "";
@@ -701,6 +742,10 @@ function handleMessagePartUpdated(props, userId) {
   }
 }
 
+/**
+ * assistant message 真正完成时汇总当前 step 的输出、token、成本和错误并写 llm.response。
+ * 未完成的流式 message 会提前返回；成功落盘后 pendingParts 转存为下一 step 的输入增量。
+ */
 function handleMessageUpdated(props, userId) {
   const info = props.info;
   if (!info || info.role !== "assistant") return;
@@ -771,11 +816,16 @@ function handleMessageUpdated(props, userId) {
 
   writeRecord(record);
 
+  // 使用数组副本保留已完成 step；随后清空 pending，避免下一 step 重复拼接同一输出。
   session.lastStepOutputParts = [...session.pendingParts];
   session.pendingParts = [];
   session.stepFinishData = null;
 }
 
+/**
+ * 处理专用 `tool.execute.before` 回调。它与 message.part.updated 可能报告同一工具，
+ * 所以共用 emittedToolCalls 去重；若 call 已发出，仍允许用这里更完整的 args 补 pending 状态。
+ */
 function handleToolExecuteBefore(inp, out, userId) {
   const sessionID = inp?.sessionID;
   if (!sessionID) return;
@@ -828,6 +878,7 @@ function handleToolExecuteBefore(inp, out, userId) {
   });
 }
 
+/** 与 before 配对输出结果和耗时；无有效结果时让更可靠的 part.state.output 路径继续处理。 */
 function handleToolExecuteAfter(inp, out, userId) {
   const sessionID = inp?.sessionID;
   if (!sessionID) return;
@@ -891,6 +942,7 @@ function handleToolExecuteAfter(inp, out, userId) {
 // ---------------------------------------------------------------------------
 
 function safe(fn) {
+  // OpenCode 接受 async Hook；await 同时捕获同步 throw 与 Promise rejection，错误只落诊断文件。
   return async (...args) => {
     try {
       await fn(...args);
@@ -907,6 +959,7 @@ function safe(fn) {
 export default {
   id: "loongsuite-pilot-opencode",
 
+  // server 回调执行一次并返回 Hook 表；userId/config 在该实例生命周期内固定，session 数据按 ID 隔离。
   server: async (input, _options) => {
     ensureDir(logDir());
 
@@ -924,6 +977,7 @@ export default {
         const type = event.type;
         const props = event.properties || {};
 
+        // event 是 EventV2 总线；只消费本插件理解的类型，未知事件保持无副作用。
         switch (type) {
           case "message.part.updated":
             handleMessagePartUpdated(props, userId);
@@ -933,6 +987,7 @@ export default {
             break;
           case "session.idle":
           case "session.error": {
+            // idle/error 都视为终态。未 flush part 只写诊断后丢弃，不能伪造成一次完整 response。
             if (props.sessionID) {
               const s = sessions.get(props.sessionID);
               if (s && s.pendingParts && s.pendingParts.length > 0) {

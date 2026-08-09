@@ -31,6 +31,7 @@ const ARTIFACT_DIR = process.env.E2E_ARTIFACT_DIR?.trim() || '/opt/artifacts';
 
 /** 生成 Docker install-smoke 使用的 Bash，安全引用安装器 URL、用户 ID 和可选 SLS 参数。 */
 function installSmokeScript(installerUrl, userId, env) {
+  // 值进入单引号 Bash 变量前替换内部单引号；SLS 参数由共享 helper 分别安全引用。
   const u = installerUrl.replace(/'/g, `'\\''`);
   const id = userId.replace(/'/g, `'\\''`);
   const slsFlags = buildRemoteInstallSlsCliQuotedArgs(env);
@@ -52,6 +53,7 @@ echo "install-smoke: loongsuite-pilot on PATH and data dir present"
  * Docker 适配的重启脚本：安装 Pilot、验证状态，再通过杀进程并重启服务模拟主机重启。
  */
 function dockerRebootAutostartScript(installerUrl, userId, env) {
+  // Docker 无法执行真实主机 reboot，本脚本只保留安装、marker 和杀进程阶段，随后由验证脚本检查恢复。
   const u = installerUrl.replace(/'/g, `'\\''`);
   const id = userId.replace(/'/g, `'\\''`);
   const slsFlags = buildRemoteInstallSlsCliQuotedArgs(env);
@@ -93,6 +95,7 @@ sleep 5
 
 /** 作为 run-docker-e2e.mjs 的命令入口，编排参数、I/O 和退出码；顶层错误由文件末尾统一处理。 */
 async function main() {
+  // Docker runner 通过环境变量选场景；它不解析位置参数，便于 Compose 配置原样复用。
   const env = process.env;
   const scenario = (env.E2E_SCENARIO ?? 'preflight').trim();
   const installerUrl = (env.E2E_INSTALLER_URL ?? DEFAULT_E2E_INSTALLER_URL).trim();
@@ -102,6 +105,7 @@ async function main() {
 
   console.log(`[e2e-docker] scenario=${scenario} profile=${profile} (Docker mode)`);
 
+  // 不同场景需要不同身份参数；缺失属于调用方式错误，因此使用退出码 2。
   if ((scenario === 'install-smoke' || scenario === 'reboot-autostart' || scenario === 'auto-upgrade') && !userId) {
     console.error('E2E_USER_ID is required for install-smoke, reboot-autostart, and auto-upgrade');
     process.exit(2);
@@ -114,6 +118,7 @@ async function main() {
 
   let script = '';
 
+  // 每个分支只负责生成 Bash 文本；真正的子进程、超时和 artifact 策略在 runLocalScript 中统一。
   if (scenario === 'preflight') {
     script = preflightScript();
   } else if (scenario === 'install-smoke') {
@@ -134,6 +139,7 @@ async function main() {
   } else if (scenario === 'auto-upgrade') {
     script = autoUpgradeScript(installerUrl, userId ?? '', env);
   } else if (scenario === 'version-matrix') {
+    // 矩阵按需读取；其他场景不会因 agent-matrix.json 异常而失败。
     const vmMatrix = loadAgentMatrix(env);
     script = versionMatrixScript(vmMatrix, env);
   } else {
@@ -144,6 +150,7 @@ async function main() {
 
   if (!script) throw new Error('Internal error: empty script');
 
+  // 安装、网络和服务副作用发生在这个 Bash 子进程中，不发生在脚本生成阶段。
   const r = await runLocalScript({
     script,
     artifactDir: ARTIFACT_DIR,
@@ -157,7 +164,7 @@ async function main() {
 
   console.log(`[e2e-docker] "${scenario}" completed successfully (exit 0).`);
 
-    // reboot-autostart 场景在模拟重启后继续执行“重启后”验证。
+  // reboot-autostart 场景在模拟重启后继续执行“重启后”验证。
   if (scenario === 'reboot-autostart') {
     console.log('[e2e-docker] Running post-reboot verification...');
     const verifyScript = postRebootVerificationScript();
@@ -176,6 +183,7 @@ async function main() {
 
   // install-smoke 的 Agent probe 阶段。
   if (scenario === 'install-smoke') {
+    // 安装 CLI、等待 Pilot 部署、运行 probe 三步分离，确保采集能力在会话产生前已经就绪。
     const probeBody = buildAgentProbeOnlyScript({ ...env, E2E_ENSURE_AGENT_CLIS: '0' });
     if (probeBody) {
     // 步骤 1：立即写入 Agent 配置，使 Pilot 在下一轮询发现；其中会创建 Codex 检测目录、
@@ -212,6 +220,7 @@ async function main() {
       console.log(`[e2e-docker] Waiting for pilot to deploy all agents: ${requiredAgents.join(', ')}...`);
       const requiredAgentsSh = requiredAgents.join(' ');
       const waitScript = [
+        // `-e` 保证脚本命令错误可见；循环超时分支目前只打印诊断，未显式返回失败。
         'set -euo pipefail',
         'LOG="$HOME/.loongsuite-pilot/logs/loongsuite-pilot-service.log"',
         'TIMEOUT=180',
@@ -267,6 +276,7 @@ async function main() {
 
     // 等待 Pilot 把已采集 Agent 活动 flush 到 JSONL/SLS。
       console.log('[e2e-docker] Waiting 60s for pilot to process agent activity logs...');
+      // 异步等待给 Input 轮询和 flusher 落盘留出时间，不阻塞 Node 事件循环线程。
       await new Promise(resolve => setTimeout(resolve, 60_000));
 
     // 输出诊断：检查 Pilot 状态和日志目录。
@@ -344,6 +354,7 @@ async function keepAliveIfRequested(code) {
 
   if (code === 0 && !keepAlive) return;
   if (code !== 0 && exitOnFailure && !keepAlive) {
+    // CI 可显式选择失败即退出；默认失败保活是为了本地进入容器排障。
     process.exit(code);
   }
 
@@ -351,7 +362,7 @@ async function keepAliveIfRequested(code) {
   console.log(`[e2e-docker] Test ${status} (exit ${code}). Container kept alive for debugging.`);
   console.log('[e2e-docker] Attach with: docker exec -it <container> bash');
   console.log('[e2e-docker] Set E2E_DOCKER_KEEP_ALIVE=0 to exit immediately on success.');
-    // setInterval 会让 Node.js 事件循环保持活跃；单独一个未完成 Promise 不具备该效果。
+  // setInterval 会让 Node.js 事件循环保持活跃；单独一个未完成 Promise 不具备该效果。
   await new Promise(() => { setInterval(() => {}, 1 << 30); });
 }
 

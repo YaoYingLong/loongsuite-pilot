@@ -30,6 +30,7 @@ const origStringify = JSON.stringify;
 let lastId = null;
 let systemPromptCaptured = false;
 
+/** 诊断写入也采用 fail-open；目录只在确有问题或截获数据时创建。 */
 function logDiag(msg) {
   try {
     fs.mkdirSync(INTERCEPT_DIR, { recursive: true });
@@ -38,6 +39,10 @@ function logDiag(msg) {
 }
 
 // 仅在即将导入已确认的宿主 runtime 前安装 JSON 包装；定位失败的 worker 完全不被修改。
+/**
+ * 包装进程全局 JSON.parse/stringify，以旁路观察加密前请求和解码后的响应。
+ * 包装器始终调用保存的原函数，并把所有采集异常吞掉；安装时机晚于宿主确认，避免影响错误应用。
+ */
 function installInterceptHooks() {
   try { fs.mkdirSync(INTERCEPT_DIR, { recursive: true }); } catch {}
 
@@ -93,6 +98,10 @@ const SDK_WORKER_REL = path.join(
 const RUNTIME_NAMES = ['qoder-worker-runtime.obf.mjs', 'qoder-worker-runtime.mjs'];
 
 // 资源根只从当前进程推导，始终指向实际宿主，不硬编码任何应用名。
+/**
+ * 从当前宿主进程动态推导可能的 Electron Resources 根目录。
+ * 返回候选而不做 I/O 校验，实际存在性和防递归检查集中在 findHostAppRuntime。
+ */
 function candidateResourceRoots() {
   const roots = [];
 
@@ -110,6 +119,10 @@ function candidateResourceRoots() {
 }
 
 // 定位宿主自己的 worker runtime；确定时返回绝对路径，否则返回 null。
+/**
+ * 在宿主候选根下寻找 SDK worker runtime，并通过 realpath 排除本包装器自身。
+ * 第一个存在且不同于自身的文件即返回；找不到时返回 null，调用方让 SDK 自行降级。
+ */
 function findHostAppRuntime() {
   let selfPath = '';
   try { selfPath = fs.realpathSync(fileURLToPath(import.meta.url)); } catch {}

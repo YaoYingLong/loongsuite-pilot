@@ -63,16 +63,21 @@ export async function writeJsonFile(
   data: unknown
 ): Promise<void> {
   const dir = nodePath.dirname(path);
+  // 先确保目标父目录存在；ensureDir 是 best-effort，失败会在真正 writeFile 时以异常体现。
   await ensureDir(dir);
+  // 两空格缩进便于人工排障，末尾换行符合项目状态文件约定。
   const text = `${JSON.stringify(data, null, 2)}\n`;
+  // PID + 毫秒时间戳降低同一目录并发写时临时文件重名概率。
   const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
   try {
+    // 临时文件完整写完后再 rename，读取者只会看到旧完整文件或新完整文件。
     await fsp.writeFile(tmp, text, 'utf8');
     await fsp.rename(tmp, path);
   } catch (err: unknown) {
     const code = (err as NodeJS.ErrnoException).code;
     // 父目录可能在 ensureDir 与 write/rename 之间被并发清理；重新创建后重试一次。
     if (code === 'ENOENT') {
+      // 先清掉可能存在的首轮临时文件，再用新名字重试，防止旧文件长期残留。
       await fsp.unlink(tmp).catch(() => {});
       await ensureDir(dir);
       const tmp2 = `${path}.${process.pid}.${Date.now()}.tmp`;
@@ -139,6 +144,7 @@ export async function cleanStaleTmpFiles(dir: string, maxAgeMs = 60_000): Promis
  */
 export async function appendLine(path: string, line: string): Promise<void> {
   try {
+    // 多次调用 appendFile 由操作系统追加；本工具没有跨进程锁或 fsync 保证。
     await ensureDir(nodePath.dirname(path));
     await fsp.appendFile(
       path,

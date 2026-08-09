@@ -150,6 +150,7 @@ function reapStaleIntercept(sessionId) {
   try { fs.rmdirSync(dir); } catch (_) {}
 }
 
+/** 同步消费 Hook stdin；JSON 无效时记录错误并返回空对象，不把异常传播给 Claude Code。 */
 function tryReadStdin() {
   try {
     return readStdinJson();
@@ -164,6 +165,7 @@ function tryReadStdin() {
   }
 }
 
+/** session_id 是 state/transcript/intercept 的隔离键；缺失时记录后跳过，避免污染共享 unknown 会话。 */
 function requireSessionId(event, stage = 'cmd') {
   const sid = event && event.session_id;
   if (typeof sid === 'string' && sid.length > 0) return sid;
@@ -252,6 +254,11 @@ function cmdSubagentStop() {
   saveState(sessionId, state);
 }
 
+/**
+ * Stop 入口先保存 transcript_path/cwd，再执行增量导出。
+ * exportSession 仅设置 `_next_transcript_offset`；只有整个导出成功后这里才提交正式 offset 并清空事件，
+ * 因而写盘异常不会造成“checkpoint 已前进但记录丢失”。
+ */
 async function cmdStop() {
   const event = tryReadStdin();
   if (isCursorCaller(event)) return;
@@ -292,6 +299,10 @@ async function cmdStop() {
 
 // ─── transcript 稳定性等待 ───
 
+/**
+ * 轮询文件大小，连续稳定后开始解析，以覆盖 Claude Hook 先触发而 transcript 稍后 flush 的竞态。
+ * 等待次数有上限，文件消失时直接结束；它不会长期阻塞宿主 Stop。
+ */
 async function waitForTranscriptStable(transcriptPath, minSize = 0) {
   let prevSize = -1;
   let stableCount = 0;
@@ -319,6 +330,10 @@ async function waitForTranscriptStable(transcriptPath, minSize = 0) {
 
 // ─── Stop 主导出流程 ───
 
+/**
+ * 增量解析主 transcript，合并 fetch preload 截获的精确 token/模型数据，并写标准 JSONL。
+ * 截获文件仅在对应 response_id 确认并入输出后删除；未匹配文件留给未来 turn 或陈旧清理器。
+ */
 async function exportSession(state, stopReason) {
   const runtimeConfig = loadHookRuntimeConfig(pilotDataDir());
   const sessionId = state.session_id || 'unknown';
@@ -417,6 +432,10 @@ async function exportSession(state, stopReason) {
 
 // ─── buildTurnRecords — 单 turn 的 JSONL 记录构造 (v2: tool_use_id 归属) ───
 
+/**
+ * 把一个 Claude turn 展开成有序的 user/STEP/LLM/TOOL 记录。
+ * `intercept` 只补充同 response_id 的网络侧数据；transcript 仍是消息、时间和工具归属的事实来源。
+ */
 function buildTurnRecords(turn, turnIndex, sessionId, prevHash, userId, turnStopReason, cwd, intercept) {
   const records = [];
   const turnId = `${sessionId}:t${turnIndex + 1}`;

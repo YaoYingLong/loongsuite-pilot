@@ -29,6 +29,7 @@ import { appendEvent, readAllEvents, rewriteJournal } from './cursor/event-journ
 import { assembleTurn } from './cursor/react-assembler.mjs';
 import { buildCursorRecordsFromTranscript } from './cursor/transcript-assembler.mjs';
 
+/** 使用部署时注入的数据目录；直接运行资产时回退用户主目录下的默认位置。 */
 function resolveDataDir() {
   const configured = process.env.LOONGSUITE_PILOT_DATA_DIR;
   if (configured) return configured;
@@ -42,6 +43,10 @@ function localDateString(date) {
   return `${year}-${month}-${day}`;
 }
 
+/**
+ * 写结构化错误并依次尝试 Pilot 数据目录和系统临时目录。
+ * 两处都失败时静默放弃；错误报告链路不能再次抛错导致 Cursor Hook 判定失败。
+ */
 async function appendErrorJsonl(dataDir, now, fields) {
   const day = localDateString(now);
   const record = sanitizeObject({
@@ -64,6 +69,10 @@ async function appendErrorJsonl(dataDir, now, fields) {
   }
 }
 
+/**
+ * 异步迭代 stdin 直到 EOF，再按 UTF-8 解码并移除可选 BOM。
+ * wrapper 每次只传一个完整 JSON，因此这里不做逐行协议；Promise 在宿主关闭管道后才完成。
+ */
 async function readStdin() {
   const chunks = [];
   for await (const chunk of process.stdin) {
@@ -98,6 +107,10 @@ function inferVariant(events) {
   return 'cursor';
 }
 
+/**
+ * 从 journal 快照删除已完成会话，只保留仍有 beforeSubmitPrompt 的未完成 turn。
+ * rewriteJournal 会在锁内合并读取快照后并发追加的新事件，调用方不能直接覆盖原文件。
+ */
 function compactJournal(allEvents, consumedConversationIds) {
   const pendingTurnConvIds = new Set();
   const remaining = [];
@@ -116,6 +129,10 @@ function applyPolicy(record, runtimeConfig) {
   return sanitizeObject(applyHookContentPolicy(record, runtimeConfig)) || {};
 }
 
+/**
+ * Cursor transcript 只暴露 Skill 文本痕迹时，补建标准 Read tool_call/tool.result 对。
+ * 合成记录使用同一 call ID，并以 LLM response 后递增的纳秒偏移保证稳定顺序；它不宣称真实耗时。
+ */
 function injectSkillRecords(records, skills, runtimeConfig = {}) {
   // Skill 与 step 的对齐只能尽力而为：把检测到的 Read 附到第一条 LLM response。
   // assembler 即使面对纯 thought/隐式工具 step 也会合成 response，因此不要附到 request。
@@ -203,6 +220,11 @@ function injectSkillRecords(records, skills, runtimeConfig = {}) {
   records.splice(targetLlmIdx + 1, 0, ...insertRecords);
 }
 
+/**
+ * 单次 Hook 子进程入口：解析一个 stdin 事件，普通事件入 journal，stop 事件执行组装与清理。
+ * 主函数通过 await 串起文件 I/O；任何阶段异常由末尾 catch 写日志，finally 风格的 stdout 约束
+ * 由各返回路径共同保证，使 Cursor 始终收到合法的空 JSON 响应。
+ */
 async function main() {
   const dataDir = resolveDataDir();
   const raw = await readStdin();

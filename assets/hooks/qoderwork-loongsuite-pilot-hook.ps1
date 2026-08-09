@@ -14,6 +14,7 @@ if (-not (Test-Path $Processor)) { exit 0 }
 
 $MIN_NODE_MAJOR = 18
 
+# 候选 Node 必须存在且主版本 >=18；catch 将不可执行/输出异常收敛为 false。
 function Test-NodeSuitable {
     param([string]$bin)
     if (-not (Test-Path $bin)) { return $false }
@@ -25,6 +26,7 @@ function Test-NodeSuitable {
     } catch { return $false }
 }
 
+# 按确定性优先级寻找 node.exe，不修改用户的 PATH、NVM_HOME 或 Pilot pin 文件。
 function Resolve-NodeBin {
     $pinFile = Join-Path $env:USERPROFILE ".loongsuite-pilot\node-bin"
     if (Test-Path $pinFile) {
@@ -99,6 +101,7 @@ try {
         $psi.RedirectStandardError = $false
         $psi.CreateNoWindow = $true
 
+        # ProcessStartInfo 允许使用 BaseStream 传递 stdin 字节，避免文本管道损坏非 ASCII JSON。
         $proc = [System.Diagnostics.Process]::Start($psi)
         $proc.StandardInput.BaseStream.Write($rawBytes, 0, $rawBytes.Length)
         $proc.StandardInput.Close()

@@ -36,6 +36,7 @@ import {
  * @returns {object[] | null} 标准记录；无法可靠解析时返回 null，通知调用方走回退 assembler。
  */
 export function buildCursorRecordsFromTranscript(transcriptPath, journalEvents, options = {}) {
+  // 任何前置证据缺失都返回 null，而不是空数组；调用方据此明确选择 journal 回退组装器。
   if (!transcriptPath || !fs.existsSync(transcriptPath)) return null;
 
   const turn = parseCursorTranscript(transcriptPath);
@@ -54,6 +55,7 @@ export function buildCursorRecordsFromTranscript(transcriptPath, journalEvents, 
   const traceId = deriveTraceId(turnId);
   const userId = resolveUserId({}, runtimeConfig);
 
+  // journal 事件按毫秒排序，为 transcript 中缺少 ID/时间的工具片段提供配对依据。
   const parentEvents = journalEvents
     .filter(e => e.conversation_id === parentConvId)
     .filter(e => e.hook_event !== 'sessionStart')
@@ -95,6 +97,7 @@ export function buildCursorRecordsFromTranscript(transcriptPath, journalEvents, 
   }
 
   // 每个对齐后的 step 依次构造 request、tool 对和 response。
+  // alignSteps 采用位置和事件顺序启发式；工具并行时存在文件头所述的待确认限制。
   const steps = alignSteps(turn.assistantEntries, parentEvents, turnId);
   const stopEvent = parentEvents.find(e => e.hook_event === 'stop');
   let prevToolResults = [];
