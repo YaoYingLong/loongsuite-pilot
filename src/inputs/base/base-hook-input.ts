@@ -4,6 +4,10 @@
  * Hook 脚本独立于 Collector 写文件；本类为最近三个日期文件维护 byte offset Map，以处理 Hook
  * 与 Collector 时区不同导致的跨日迟写。首轮通过旧 lastFile/lastOffset 迁移或 no-history
  * baseline 建立边界，逐行 JSON/转换错误被隔离，不阻断后续记录。
+ *
+ * 以 Claude 为例，Stop Hook 进程只负责 append `claude-code-YYYY-MM-DD.jsonl`；本类所在的常驻
+ * Collector 不会收到 Hook IPC。它由 BaseInput 的首轮和 interval 调用 `collect()`，返回新增事件后，
+ * BaseInput 才同步触发 `entries`。因此“日志写入”和“entries 事件”是跨进程、跨时间的两个阶段。
  */
 
 import * as fs from 'node:fs/promises';
@@ -34,7 +38,8 @@ export interface HookInputOptions extends InputOptions {
  * Hook writer 可能继承与 Collector 不同的时区；本地日期切换附近，它仍可能写“前一天”文件。
  * 因此不能只读 `${prefix}-${today}.jsonl`，必须维护最近文件窗口和逐文件 offset。
  *
- * 子类只需实现 transformRecord。
+ * 子类只需实现 transformRecord。实例生命周期和 `entries` 事件仍由 BaseInput 提供；本类本身不
+ * 调用 `emit()`，也不会直接访问 InputManager 或 Flusher。
  */
 export abstract class BaseHookInput extends BaseInput {
   readonly collectionMethod = CollectionMethod.HookJsonl;
@@ -62,6 +67,8 @@ export abstract class BaseHookInput extends BaseInput {
 
   /** 启动时尽力创建 Hook 日志目录。 */
   protected override async onStart(): Promise<void> {
+    // Input 已通过 Discovery 可用性检查后才会执行这里。递归创建保持幂等，也覆盖目录在检查后
+    // 被并发删除的情况；创建目录本身不会制造 JSONL 或触发 entries。
     await ensureDir(this.logDir);
   }
 
@@ -70,27 +77,42 @@ export abstract class BaseHookInput extends BaseInput {
    * coldStartKeepLastTurnOnly 开启时最后再执行批次级 turn 过滤。
    *
    * 多文件串行处理可保持日期顺序，也避免同时分配多个完整文件尾 Buffer。offset Map 在局部副本
-   * 上修改，最后一次性通过 `setState()` 合并；真正磁盘写入由 BaseInput.runCycleOnce 完成。
+   * 上修改，最后一次性通过 `setState()` 合并；StateStore checkpoint 的磁盘保存由
+   * BaseInput.runCycleOnce 完成（此处所说的保存不是 Hook JSONL 写入）。
    * 每个文件返回的 offset 无论其中是否存在坏行都会推进到本轮 stat 边界。
+   *
+   * @returns 当前候选文件中成功转换出的全部新事件。非空数组由 BaseInput.runCycleOnce 统一触发
+   * 一次 `entries`；空数组只保存可能变化的 offset，不会触发 InputManager 或 Flusher。
+   * @throws readdir/stat 的预期失败多已降级为空；未被 collectFile 隔离的意外错误交给 BaseInput
+   * 周期边界记录为 `collect-error`，后续 timer 周期仍可重试。
    */
   protected async collect(): Promise<AgentActivityEntry[]> {
+    // 日期使用 Collector 本地时区，仅用于补入“今天文件”；真正读取集合还包含按名称排序的最近
+    // 三份文件和 legacy lastFile，避免 Hook 与 Collector 跨时区时漏掉前一日迟写。
     const today = getTodayDateString();
+    // 一个 collect 周期只返回一个合并数组；entries 事件不会在 collectFile 的逐行循环中触发。
     const entries: AgentActivityEntry[] = [];
+    // StateStore.get() 返回该 Input 上轮保存的 lastFile/lastOffset 和逐文件 offset Map。
     const state = this.getState();
     // state.lastFile 缺失是旧状态判断冷启动的兼容信号。
     const isColdStart = !state.lastFile;
     const fileNames = await this.listHookLogFiles();
+    // 没有日文件时没有事件可返回，也不创建空文件；BaseInput 随后仍会调用 StateStore.save()。
     if (fileNames.length === 0) return entries;
 
     // 旧 offset Map 存在时复制后修改；否则根据文件和 legacy state 建立初值。
     const persistedOffsets = this.getPersistedOffsetMap(state);
     const shouldPersistOffsets = !persistedOffsets;
     const offsets: OffsetMap = persistedOffsets ? { ...persistedOffsets } : await this.seedOffsetMap(fileNames, state, today);
+    // candidateFileNames 已按日期文件名排序，保证前一天迟写先于今天新增内容进入同一批次。
     const candidateFileNames = this.getCandidateFileNames(fileNames, state.lastFile, today);
 
     for (const logFileName of candidateFileNames) {
+      // 每个文件从自己的 byte offset 读到本轮 stat.size；Hook 并发追加到 stat 边界之后的字节留到
+      // 下次周期。transformRecord 是 await 的，因此同一文件各行保持源顺序。
       const logFile = path.join(this.logDir, logFileName);
       const fileEntries = await this.collectFile(logFile, offsets[logFileName] ?? 0);
+      // 即使某些行 JSON/转换失败，collectFile 也会返回 stat.size；坏行不会让 offset 永久卡住。
       offsets[logFileName] = fileEntries.offset;
       entries.push(...fileEntries.entries);
     }
@@ -109,6 +131,7 @@ export abstract class BaseHookInput extends BaseInput {
       state.lastOffset !== (prunedOffsets[newestFileName] ?? 0) ||
       this.isOffsetMapChanged(persistedOffsets, prunedOffsets)
     )) {
+      // setState 只修改共享 StateStore 内存并置 dirty；BaseInput 在 emit(entries) 之后统一 save 到磁盘。
       this.setState({
         lastFile: newestFileName,
         lastOffset: prunedOffsets[newestFileName] ?? 0,
@@ -119,6 +142,8 @@ export abstract class BaseHookInput extends BaseInput {
       });
     }
 
+    // 对 ClaudeCodeLogInput，该开关保持 false：独立 Hook 可能在 Collector 停止期间写入尚未上报的
+    // 数据，启动后必须按 offset 补采，不能只保留最后一个 turn。
     // 可选冷启动保护在 offset 已推进到各文件尾后，仅返回最后 turn；后续从文件尾继续。
     if (this.coldStartKeepLastTurnOnly && isColdStart && entries.length > 0) {
       const turnIds = new Set(entries.map(e => (e['gen_ai.turn.id'] as string) || 'unknown'));
@@ -133,6 +158,7 @@ export abstract class BaseHookInput extends BaseInput {
       }
     }
 
+    // 这里返回后才进入 BaseInput.runCycleOnce() 的 `entries.length > 0` 判断；本类从不自行 emit。
     return entries;
   }
 
@@ -169,6 +195,7 @@ export abstract class BaseHookInput extends BaseInput {
     }
     if (stat.size <= offset) return { entries, offset: stat.size };
 
+    // 文件句柄只覆盖这一轮固定范围；读取结束即关闭，不长期 tail 文件。
     const handle = await fs.open(logFile, 'r');
     try {
       // 以本轮 stat.size 为读取边界；并发追加留到下一轮，避免 offset 越过未读数据。
@@ -182,6 +209,7 @@ export abstract class BaseHookInput extends BaseInput {
         // 单行 JSON 或 transform 异常只告警并跳过，其他行继续。
         try {
           const record = JSON.parse(line) as Record<string, unknown>;
+          // Claude 子类在这里调用 transformHookRecord；返回 null 代表该日志行不构成标准事件。
           const entry = await this.transformRecord(record);
           if (entry) entries.push(entry);
         } catch (err) {
@@ -313,6 +341,7 @@ export abstract class BaseHookInput extends BaseInput {
 
   /**
    * 将一行已解析 JSON 转为标准事件；返回 null 跳过无关事件。
+   * 该抽象方法只负责转换，不应直接触发 entries；批次事件由 BaseInput 在 collect 返回后统一发布。
    */
   protected abstract transformRecord(
     record: Record<string, unknown>,

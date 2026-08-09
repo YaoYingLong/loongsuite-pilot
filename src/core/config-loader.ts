@@ -6,6 +6,10 @@
  * `<dataDir>/configs/inner/data_config.json`，把兼容字段、单/多后端写法和字符串环境
  * 变量统一为强类型配置。读取失败时多数分支采用默认值；结构解析函数不执行网络或
  * 启动资源，OTLP/SLS 后端真正创建在 Orchestrator 中。
+ *
+ * 本项目采用 ES Module。`import type` 引入的名称只供 TypeScript 静态检查，编译后会被
+ * 完全删除；普通 import 则会成为运行时依赖。`node:os` 明确表示 Node.js 内置模块，带
+ * `.js` 的相对路径用于匹配 NodeNext 编译后的文件名，不代表源码目录中必须已有 `.js`。
  */
 
 import * as os from 'node:os';
@@ -342,6 +346,9 @@ function envInt(key: string, fallback: number): number {
  *   1. 环境变量：最高，方便安装脚本、容器和系统服务临时覆盖；
  *   2. 用户 config.json：默认位于 ~/.loongsuite-pilot/config.json；
  *   3. 代码内置默认值：保证首次安装没有配置文件也能启动并落本地 JSONL。
+ * 这是主干字段的通用规则；为兼容历史行为，少数字段有更细的例外，例如 SLS 数组模式
+ * 不套用旧单端点环境变量，分类 retention 值会优先于统一天数环境变量。具体规则由下方
+ * 各 `build*Config()` 函数集中实现，调用方不要在 Orchestrator 中再做第二次配置合并。
  *
  * 集团版还会额外读取 data_config.json。它不是用来覆盖用户配置，而是为 SLS/OTLP/CMS
  * 增加托管数据出口，因此用户出口和内置出口可以同时收到同一批采集数据。
@@ -370,6 +377,8 @@ export async function loadConfig(): Promise<AnalyticsConfig> {
 
   // 托管出口配置固定跟随最终 dataDir，而不跟随 config.json 所在目录。
   const innerDataConfigPath = resolveHome(`${dataDir}/configs/inner/data_config.json`);
+  // 第二个 await 仍按顺序执行：只有先得到最终 dataDir，才能确定托管配置的位置。两个 JSON
+  // 文件都采用 fail-open 读取，Promise 兑现为 null 时并不抛错，也不会阻断首次启动。
   const innerDataConfig = await readJsonFile<InnerDataConfig>(innerDataConfigPath);
 
   // 兼容早期 `user.id` 写法；都没有时使用主机名，确保事件至少有稳定的机器级标识。
@@ -379,6 +388,8 @@ export async function loadConfig(): Promise<AnalyticsConfig> {
   const serviceNamePrefix = env('LOONGSUITE_PILOT_SERVICE_NAME_PREFIX') ?? file?.serviceNamePrefix ?? 'loongsuite-pilot';
 
   // 从这里开始把“可选的原始配置”转换成字段齐全、可直接给 Orchestrator 使用的配置。
+  // 对象字面量中的各 build 函数都是同步纯计算（除日志告警外）；它们会按源码从上到下
+  // 求值完毕，最后一次性返回 AnalyticsConfig，不会在构建到一半时启动任何后台资源。
   return {
     // 总开关由环境变量覆盖文件配置；关闭时主入口在创建 Orchestrator 前正常返回。
     enabled: envBool('LOONGSUITE_PILOT_ENABLED', file?.enabled ?? true),
@@ -571,7 +582,8 @@ function buildListenersConfig(
   // 历史环境变量只修改三个默认 value。defaults 是函数内临时对象，因此不会跨调用污染。
   const result = { ...defaults };
 
-  // 用户只需写想覆盖的字段；其余字段继承该 Listener 默认值。
+  // 用户只需写想覆盖的字段；其余字段继承该 Listener 默认值。这里保留未知 ID 只是保留配置，
+  // 不会自动创建 Input；真正有哪些实现仍由 Orchestrator.registerAllInputs() 的显式注册决定。
   if (file?.listeners) {
     // Object.entries 允许保留未知 listener ID；这样外部扩展无需先修改本地默认表。
     for (const [key, val] of Object.entries(file.listeners)) {

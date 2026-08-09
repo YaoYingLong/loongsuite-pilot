@@ -3,6 +3,7 @@
  *
  * InputManager 在脱敏之前调用本模块。`captureMessageContent=false` 表示内容根本不应进入任何
  * 输出，因此这里创建新 entry 并删除敏感字段；随后 mask 只处理仍被允许保留的内容。
+ * 该开关只控制正文，不删除 session/turn、模型、token、Git 等用于统计和关联的元数据。
  */
 
 import type {
@@ -57,7 +58,8 @@ const AGENT_TYPE_TO_CONFIG_KEY: Record<string, string> = {
  *
  * @param entry 已归一化事件。
  * @param config `config.json -> agents` 的解析结果。
- * @returns 新的浅拷贝；关闭内容时还会复制并清理 attributes。
+ * @returns 新的浅拷贝；关闭内容时还会复制并清理 attributes。浅拷贝只隔离顶层赋值，未被清理
+ * 的嵌套对象仍可能与输入 entry 共享引用，下游应把标准事件视为只读。
  */
 export function applyAgentContentPolicy(
   entry: AgentActivityEntry,
@@ -65,7 +67,7 @@ export function applyAgentContentPolicy(
 ): AgentActivityEntry {
   // 策略解析只看 Agent 类型和配置，不读取内容本身，避免“先接触敏感值再决定”的额外处理。
   const agentConfig = resolveAgentConfig(entry, config);
-  // 即使内容允许也返回浅拷贝，防止后续处理意外修改 Input 持有的对象。
+  // 即使内容允许也返回浅拷贝，隔离后续顶层字段赋值；嵌套对象仍共享，不能原地修改。
   if (agentConfig.captureMessageContent) return { ...entry };
 
   const next: AgentActivityEntry = { ...entry };

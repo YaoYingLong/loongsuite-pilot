@@ -4,6 +4,11 @@
 // 由 npm 生成的命令包装器处理这一行。本文件同时承担两个角色：既是 loongsuite-pilot
 // 命令的可执行入口，也是供其他模块按需导入核心组件的包入口。Collector 服务由
 // scripts/collector-daemon.js 动态加载本文件。
+//
+// 本项目在 package.json 中声明了 `"type": "module"`，因此这里使用 ES Module 的
+// `import`/`export`，而不是 CommonJS 的 `require`/`module.exports`。源码虽然是 `.ts`，
+// 相对导入仍写 `.js`：TypeScript 的 NodeNext 模式会把它解析到对应 `.ts` 源文件，并让
+// 编译后的 `dist/*.js` 保留一个 Node.js 能直接找到的扩展名。
 import * as path from 'path';
 import { Orchestrator } from './core/orchestrator.js';
 import { loadConfig } from './core/config-loader.js';
@@ -31,6 +36,8 @@ async function main(): Promise<void> {
    */
   const argv = process.argv.slice(2);
 
+  // 短命令分流发生在 loadConfig() 与文件日志初始化之前：它们有自己的输出/退出约定，也不应
+  // 因用户配置文件损坏而无法执行。反过来，这里的异常只会到达最外层 catch，尚不会写入服务日志。
   // worker 子命令拥有独立的参数解析和退出码管理；返回 true 表示命令已处理完毕。
   if (await handleWorkerCli(argv)) {
     return;
@@ -81,6 +88,10 @@ async function main(): Promise<void> {
   // EventEmitter 风格的信号监听器不能 await Promise，因此用 void 明确丢弃返回值；SIGINT
   // 通常来自 Ctrl+C，SIGTERM 通常来自 kill、容器或服务管理器。当前闭包没有重入锁，短时间
   // 收到多个信号时可能并行调用 stop()，但最终 process.exit() 会结束进程（待确认）。
+  // 监听器特意在 await start() 之前注册，使漫长启动阶段也能响应服务停止；但 start() 完成前
+  // Orchestrator.isRunning 仍为 false，此时 stop() 会直接返回，随后进程退出。操作系统会关闭
+  // 本进程的 timer/文件监听句柄，但不会调用各模块的显式清理；已派生子进程是否继续存活取决于
+  // 它自己的创建方式，因此不能把这条路径等同于完整的逆序关闭。
   process.on('SIGINT', () => void shutdown());
   process.on('SIGTERM', () => void shutdown());
 
@@ -119,7 +130,9 @@ main().catch((err) => {
   process.exit(1);
 });
 
-// 以下导出用于将 loongsuite-pilot 作为库使用，不参与上面的进程启动编排。
+// 以下 export 声明只建立模块的公开 API，本身不调用这些类。需要注意：ES Module 被 import 时
+// 会先执行全部顶层代码，因此直接导入本入口仍会执行上面的 main()；只想复用某个组件的调用方
+// 应优先导入其具体模块，而不是把本文件误当成“无副作用”的 barrel 文件。
 
 // 核心编排、发现与准入控制能力。
 export { Orchestrator } from './core/orchestrator.js';

@@ -6,6 +6,13 @@
  * 调用 Flusher。不同 Input 可并行，同一 Input 的批次保持顺序。`stopInput()`/`stopAll()`
  * 会先停止源再排空队列，避免退出时丢失已经发出的事件。它发出的 `flushed` 只表示
  * Flusher 调用完成；`MultiFlusher` 内部的单个远端失败可能已被隔离。
+ *
+ * 主数据流的两个异步边界需要特别区分：
+ *
+ * 1. `BaseInput` 同步触发 `entries` 监听器，本类只把批次追加到 Promise 队列便立即返回；
+ * 2. `BaseInput` 随后可以保存 checkpoint，而队列才在事件循环的微任务阶段继续做关联、策略、
+ *    脱敏和网络输出。因此 checkpoint 与远端输出不是同一个事务，异常崩溃边界上仍可能重复或
+ *    漏发；正常停止则依靠先停生产者、再 drain 队列来尽量收束这一窗口。
  */
 
 
@@ -53,6 +60,9 @@ export interface InputCounter {
  *
  * 主要职责依次是：注册、启动和停止 Input；监听每个 Input 的 `entries` 事件；补充
  * `user.id` 等公共字段；执行关联、内容策略和脱敏；最终交给一个或多个 Flusher。
+ *
+ * 实例通常与 Orchestrator 同生命周期。当前没有 unregister API，注册时绑定的 EventEmitter
+ * listener 会一直保留到进程退出，所以同一进程内不要用新实例反复注册同一个长期存活的 Input。
  */
 export class InputManager extends EventEmitter {
   /** 已注册 Input 的唯一 ID 到实例映射；同一 ID 只接受第一次注册。 */
@@ -81,7 +91,10 @@ export class InputManager extends EventEmitter {
   /** 可选上游 Trace 关联器；关联失败采用 fail-open，不丢弃采集事件。 */
   private traceLinker: TraceLinker | null = null;
 
-  /** 注入唯一输出器；通常是具体 Flusher 或 MultiFlusher。 */
+  /**
+   * 注入唯一输出器；通常是具体 Flusher 或 MultiFlusher。
+   * Orchestrator 会在任何 Input 启动前调用；再次调用会替换后续批次的目标，不会关闭旧 Flusher。
+   */
   setFlusher(flusher: BaseFlusher): void {
     this.flusher = flusher;
   }
@@ -162,7 +175,11 @@ export class InputManager extends EventEmitter {
     logger.info('input registered', { id: input.id });
   }
 
-  /** 启动已注册 Input；未知 ID 只记录警告。 */
+  /**
+   * 启动已注册 Input；未知 ID 只记录警告。
+   * @throws BaseInput.start() 未吸收的初始化或自定义监听器异常原样交给 AgentDiscoveryService 处理；
+   * 普通 collect 异常由 BaseInput 转为 collect-error，不会从这里抛出。
+   */
   async startInput(id: string): Promise<void> {
     const input = this.inputs.get(id);
     if (!input) {
@@ -175,6 +192,7 @@ export class InputManager extends EventEmitter {
 
   /**
    * 停止源 Input 后等待该 Input 已发出的全部 entries 批次分发完毕。
+   * @throws Input.stop() 的资源关闭异常会直接传播；这种情况下本次调用不会继续 drain 队列。
    */
   async stopInput(id: string): Promise<void> {
     const input = this.inputs.get(id);
@@ -184,7 +202,11 @@ export class InputManager extends EventEmitter {
     logger.info('input stopped', { id });
   }
 
-  /** 顺序停止所有 running Input，再排空全部分发队列。 */
+  /**
+   * 顺序停止所有 running Input，再排空全部分发队列。
+   * 任一 Input.stop() 抛错会中断循环，后续 Input 和 drain 不会在本方法内继续执行；上层关闭编排
+   * 需要记录该异常。当前实现没有 `finally` 式的逐项尽力清理。
+   */
   async stopAll(): Promise<void> {
     // 先逐个停止生产者，防止 drain 期间 Input 继续产生新批次。这里按注册顺序 await，
     // 避免多个 Input 的文件句柄/数据库连接同时关闭时竞争本地资源。
@@ -262,6 +284,7 @@ export class InputManager extends EventEmitter {
       watchPaths: opts.watchPaths,
       isAvailable: opts.isAvailable,
       enabled: opts.enabled,
+      // 在中被调用
       start: () => this.startInput(input.id),
       stop: () => this.stopInput(input.id),
       pollIntervalMs: opts.pollIntervalMs ?? 300_000,
@@ -271,6 +294,10 @@ export class InputManager extends EventEmitter {
   /**
    * 单批标准处理主链：计数 -> userId -> upstream link -> 内容策略 -> 脱敏 -> 输出。
    * 本方法会原地补 user.id/Trace 字段；内容策略和 mask 返回供输出的新条目数组。
+   *
+   * @throws 正常 Flusher 失败会由 dispatchEntries 吞掉；若事件违反 JsonValue 契约，例如包含
+   * BigInt 或循环引用而使 JSON.stringify 失败，异常会交给 registerInput 建立的队尾 catch 记录，
+   * 当前整批不会进入后续策略和输出。
    */
   private async handleEntries(
     inputId: string,
@@ -328,7 +355,11 @@ export class InputManager extends EventEmitter {
     await this.dispatchEntries(inputId, maskedEntries, batchBytes);
   }
 
-  /** 记录 Input 已启动时间；已有时间时不覆盖。 */
+  /**
+   * 记录 Input 已启动时间；已有时间时不覆盖。
+   * 当前生产代码没有调用本方法，startTime 通常由首个非空批次设置；长期无数据的 Input 会保持
+   * 空字符串。是否由发现层在启动成功后补调，当前待确认。
+   */
   markInputStarted(id: string): void {
     const counter = this.counters.get(id);
     if (counter && !counter.startTime) {
@@ -342,6 +373,7 @@ export class InputManager extends EventEmitter {
    */
   private async dispatchEntries(inputId: string, entries: AgentActivityEntry[], batchBytes: number): Promise<void> {
     if (!this.flusher) {
+      // 该分支只记录日志/告警：不会增加 outFailed，也不会发出 flushed，因为没有发生发送尝试。
       logger.warn('no flusher set, dropping entries', { count: entries.length });
       this.alarmManager?.record(
         'DISPATCH_DROP_ALARM', '3',

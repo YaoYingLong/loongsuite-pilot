@@ -5,6 +5,11 @@
  * 文件 Input 保存字节 offset，SQLite Input 保存 row id，复杂采集器把专用状态放在
  * `extra`。`BaseInput` 在采集轮次和退出时调用 `save()`，最终原子写入
  * `<dataDir>/logs/input-state.json`。本类只有进程内 Map，不提供跨进程锁。
+ *
+ * “原子写文件”只保证读者不会看到半份 JSON，不代表 checkpoint 与事件输出构成事务。Input
+ * 通常先在 collect 中推进内存游标，再由 BaseInput 把事件入队并保存；checkpoint 文件损坏后从头
+ * 重读可能产生重复数据。只有源 Input 提供稳定 `event.id` 时下游才可能据此去重；EntryBuilder
+ * 临时生成的随机 UUID 无法把重读事件识别为同一条。
  */
 
 
@@ -53,7 +58,11 @@ export class StateStore {
    *
    * `readJsonFile()` 把文件不存在、无权限和 JSON 损坏统一降级为 null，因此这些情况都按空仓库
    * 启动。每个值只接受对象，避免数组/标量进入 InputState。加载结束把 dirty 清零，表示内存与
-   * 当前读取结果一致。
+   * 当前读取结果一致。该 fail-open 设计优先保证 Collector 能启动，代价是原状态不可读时各 Input
+   * 可能从默认 offset/rowid 0 重读并产生重复事件。
+   *
+   * 前置条件：只应在 Orchestrator 启动、任何 Input 修改状态之前调用；load 会先 clear Map，运行期
+   * 再调用会丢弃尚未保存的内存状态。
    *
    * @returns 读取与内存重建完成后兑现的 Promise；当前工具层读失败不会 reject。
    */
@@ -80,7 +89,9 @@ export class StateStore {
    * 可以重试。
    *
    * 本类没有 save Promise 串行门。多个 Input 共享实例并同时调用 save 时，可能各自构造不同
-   * 时刻的快照；当前依赖上层调用节奏降低竞争，严格并发写入语义待确认。
+   * 时刻的快照；更细地说，save 在 await 写盘期间若另一个 Input 调用 update 把 dirty 置为 true，
+   * 前一个 save 兑现后仍会无版本校验地把 dirty 清成 false。当前依赖上层调用节奏降低竞争，严格
+   * 并发写入和后续补写语义待确认。
    *
    * @throws 文件写入失败时透传异常，由 BaseInput 采集循环或 Orchestrator 关闭流程记录。
    */
@@ -152,7 +163,7 @@ export class StateStore {
     return this.get(inputId).lastOffset ?? 0;
   }
 
-/** 更新文件型 Input 的字节偏移；真正写盘延迟到 save()。 */
+  /** 更新文件型 Input 的字节偏移；真正写盘延迟到 save()。 */
   setOffset(inputId: string, offset: number): void {
     this.update(inputId, { lastOffset: offset });
   }
@@ -165,7 +176,7 @@ export class StateStore {
     return this.get(inputId).lastRowId ?? 0;
   }
 
-/** 更新 SQLite Input 的最大 row id；真正写盘延迟到 save()。 */
+  /** 更新 SQLite Input 的最大 row id；真正写盘延迟到 save()。 */
   setRowId(inputId: string, rowId: number): void {
     this.update(inputId, { lastRowId: rowId });
   }

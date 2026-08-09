@@ -4,6 +4,10 @@
  * 各 Input 可以传 canonical dotted keys，也可传历史别名；本模块负责时间、事件 ID、Provider、
  * 消息结构、工具状态和 Agent 扩展字段的最终收敛。日志型 Flusher 还通过本文件将语义值序列化
  * 为字符串宽表。这里不执行内容策略或脱敏，它们由 InputManager 在构建完成后统一处理。
+ *
+ * 主链位置是“具体 Input 的 extractor/builder -> 本模块 -> BaseInput.emit(entries) ->
+ * InputManager 内容策略与脱敏 -> Flusher”。因此本模块允许正文暂时存在于内存标准事件中；是否
+ * 允许正文继续进入输出链由后面的 Agent 策略决定，密钥替换则更晚但仍发生在所有输出器之前。
  */
 
 // uuid v4 只用于未提供确定性 event.id 的通用记录；Codex 等 builder 可提前传入稳定 ID。
@@ -111,6 +115,9 @@ export type StandardAgentActivityOptions = Partial<AgentActivityEntry> & {
  *
  * @param opts 旧 IDE 参数或标准 dotted 字段；旧结构会先转成 Agent 扩展字段再递归构建。
  * @returns 新的 AgentActivityEntry，不保留 legacy alias。
+ * @throws `LegacyAgentActivityOptions.extra` 或消息/工具等会经过 `toJsonValue()` 的字段若包含循环
+ * 引用，递归可能产生栈溢出；调用方应传入 JSON 类数据。常规缺字段和未知事件名不会抛错，而是
+ * 使用约定默认值。
  */
 export function buildAgentActivityEntry(
   opts: LegacyAgentActivityOptions | StandardAgentActivityOptions,
@@ -420,6 +427,7 @@ export function timestampToUnixNanos(ts: number | string | undefined): string {
  * 无效值与缺失值回退当前时间；纳秒除以 1,000,000 并向下取整。
  */
 export function unixNanosToMillis(value: string | number | undefined): number {
+  // 纳秒通常超过 Number.MAX_SAFE_INTEGER；源端能提供字符串时应保留字符串到这里再转换。
   if (typeof value === 'number' && Number.isFinite(value)) {
     return value >= 1e16 ? Math.floor(value / 1_000_000) : normalizeTimestampToMillis(value);
   }
@@ -635,6 +643,7 @@ function toJsonObject(value: Record<string, unknown>): { [key: string]: JsonValu
  *
  * 普通对象递归复制、数组逐项转换并过滤 undefined，因此返回值不与输入共享对象容器。
  * 本函数不检测循环引用；循环对象会递归溢出，调用方应只传 JSON 类数据。
+ * number 会原样保留，包括 NaN/Infinity；标准 Input 应在更早的解析阶段排除这些非 JSON 数值。
  */
 export function toJsonValue(value: unknown): JsonValue | undefined {
   if (value === undefined) return undefined;

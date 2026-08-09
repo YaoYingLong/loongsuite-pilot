@@ -9,17 +9,24 @@
 
 
 
+// Promise 版 fs 负责包目录、临时文件和 staging/backup 的异步操作。
 import * as fs from 'node:fs/promises';
+// 下载使用写入流避免把整个远端包放入内存；Dirent 用于只检查一级解压目录。
 import { createWriteStream, type Dirent } from 'node:fs';
+// SHA-256 标识包内容，randomUUID 防止并发部署的 backup 目录重名。
 import * as crypto from 'node:crypto';
+// 所有包、脚本、日志路径通过 Node.js path 跨平台拼接。
 import * as path from 'node:path';
+// 安装、卸载和解压依赖外部 `bash`/`tar`，spawn 让 Collector 不阻塞事件循环。
 import { spawn } from 'node:child_process';
+// 类型导入编译后移除；DeployResult 是公开方法隔离异常后的结构化结果。
 import type {
   AgentDefinition,
   DeployResult,
   DeployStrategy,
   DeployedAgentRecord,
 } from '../types/index.js';
+// fs-utils 提供容错存在性检查及递归建目录，避免 ENOENT 影响主流程。
 import { directoryExists, ensureDir, fileExists } from '../utils/fs-utils.js';
 import { detectAgent } from './detect-utils.js';
 import { createLogger } from '../utils/logger.js';
@@ -27,6 +34,7 @@ import { WorkerManifestSupervisor } from './worker-manifest-supervisor.js';
 
 const logger = createLogger('PluginProbeStrategy');
 
+/** install/uninstall 最长运行 120 秒，超时会向子进程发送 SIGKILL。 */
 const SCRIPT_TIMEOUT_MS = 120_000;
 const REMOTE_CHECK_INTERVAL_MS = 4 * 60 * 60 * 1000; // 每 4 小时重新检查远端包。
 
@@ -47,8 +55,11 @@ export interface PluginProbeDeployOptions {
  * DeploymentManager 会按声明调用 `stopWorker()`，释放由本策略监管的 Worker 进程。
  */
 export class PluginProbeStrategy implements DeployStrategy {
+  /** 持久数据根，用于 `.tmp` 下载、日志目录及脚本环境变量。 */
   private readonly dataDir: string;
+  /** 当前版本包根，用于查找 Pilot 提供的 Agent 专用 wrapper。 */
   private readonly pilotDir: string;
+  /** 解析 worker.manifest.json，并持有 PID/进程组启停细节。 */
   private readonly workerSupervisor: WorkerManifestSupervisor;
 
   /**
@@ -110,6 +121,7 @@ export class PluginProbeStrategy implements DeployStrategy {
       return false;
     }
 
+    // 本地文件直接读取；到期的纯远端源会完整下载一次。无法求 hash 按保守策略重部署。
     const currentHash = await this.computeSourceHash(config.source.tarball, config.source.url ?? config.source.remoteUrl);
     if (!currentHash) return true;
 
@@ -148,6 +160,7 @@ export class PluginProbeStrategy implements DeployStrategy {
       const existingUninstallScript = existingRoot ? path.join(existingRoot, 'scripts', 'uninstall.sh') : '';
       if (existingUninstallScript && await fileExists(existingUninstallScript)) {
         logger.info('running uninstall script before update', { agentId: def.id });
+        // 更新前卸载是 best-effort：返回 false 也继续交换包，避免旧卸载器故障永久阻塞升级。
         await this.runScript(existingUninstallScript, existingRoot!, def.id);
       }
 
@@ -163,6 +176,7 @@ export class PluginProbeStrategy implements DeployStrategy {
       if (installScript) {
         const ok = await this.runScript(installScript, installCwd, def.id);
         if (!ok) {
+          // 此时目录交换已经完成；当前事务不会因 install.sh 失败自动恢复旧包（待确认）。
           return { success: false, agentId: def.id, deployMode: 'plugin-probe', error: 'install script failed' };
         }
       } else {
@@ -402,7 +416,8 @@ export class PluginProbeStrategy implements DeployStrategy {
    * @param scriptPath 包装脚本或包内 install/uninstall 脚本。
    * @param cwd 脚本使用的包根，相对路径在此解析。
    * @returns 只在退出码为 0 时兑现 `true`；Promise 本身不 reject。
-   * @remarks stdout 由管道消费但未记录，stderr 最多截取 500 字符进入失败日志。
+   * @remarks stderr 会在内存中累计并最多截取 500 字符写日志；stdout 虽建立 pipe，但当前没有
+   * listener 消费，大量 stdout 是否可能使脚本因管道背压阻塞仍待确认。
    */
   private runScript(scriptPath: string, cwd: string, agentId: string): Promise<boolean> {
     return new Promise(resolve => {
@@ -425,6 +440,7 @@ export class PluginProbeStrategy implements DeployStrategy {
 
       let stderr = '';
       child.stderr?.on('data', (chunk: Buffer) => {
+        // `data` 监听使 stderr 流进入 flowing 模式；这里只保留文本供非零退出时诊断。
         stderr += chunk.toString();
       });
 
@@ -588,7 +604,8 @@ export class PluginProbeStrategy implements DeployStrategy {
   /**
    * spawn 系统 `tar` 执行 `-xzf <tarball> -C <destDir>`。
    * @returns tar 退出 0 时兑现 `true`；spawn error 或非零退出时兑现 `false`，不 reject。
-   * @remarks 目标目录由上层事先创建；stdout/stderr 建立管道但当前不收集内容。
+   * @remarks 目标目录由上层事先创建；stdout/stderr 建立 pipe 但当前没有 listener 消费，
+   * 大包解压若工具输出很多内容是否会受背压影响仍待确认。
    */
   private async extractTar(tarball: string, destDir: string): Promise<boolean> {
     return new Promise(resolve => {
@@ -617,7 +634,9 @@ export class PluginProbeStrategy implements DeployStrategy {
    * 当前调用未设置显式网络超时或重定向处理。
    * @param url 只根据是否以 `https` 开头选择 Node.js http/https 客户端。
    * @param destFile 直接覆盖写入的目标文件，父目录必须已存在。
-   * @returns 文件流 finish 并关闭后为 `true`；其他结果为 `false`。
+   * @returns 文件流发出 finish 时请求 close 并立即兑现 `true`；当前不等待 close 回调完成。
+   * @remarks 当前只监听 HTTP 请求错误，没有给目标文件流注册 error listener；磁盘写入失败的
+   * Promise/进程语义仍待确认。实现也不处理 3xx 重定向和显式网络超时。
    */
   private async downloadToFile(url: string, destFile: string): Promise<boolean> {
     try {
@@ -626,12 +645,15 @@ export class PluginProbeStrategy implements DeployStrategy {
       const protocol = url.startsWith('https') ? https : http;
 
       await new Promise<void>((resolve, reject) => {
+        // createWriteStream 默认覆盖目标文件；调用方为每次下载选择隔离的临时路径。
         const file = createWriteStream(destFile);
         protocol.get(url, response => {
           if (response.statusCode !== 200) {
+            // 非 200 不进入文件管道；错误由外层 catch 记录并返回 false。
             reject(new Error(`HTTP ${response.statusCode}`));
             return;
           }
+          // pipe 自动按背压把响应字节写入文件，不需要手工监听每个 data chunk。
           response.pipe(file);
           file.on('finish', () => { file.close(); resolve(); });
         }).on('error', reject);

@@ -1,30 +1,26 @@
 /**
- * plugin-migration.ts — 清理老 Claude/Codex plugin 残留。
+ * Claude/Codex 历史 OTel 插件残留的启动期迁移器。
  *
- * 在 DeploymentManager.deployAll() 入口最先运行（阶段 0）。Q15 决策：每次启动扫描，
- * 不写 marker 文件；若 cache 目录不存在则通过一次同步存在性检查快速跳过。
+ * `DeploymentManager.deployAll()` 在加载并部署当前 `agents.d` 声明之前首先调用
+ * `runPluginMigration()`。本模块没有长期实例、timer 或网络请求；它以用户 HOME 为输入，
+ * 修改旧 Hook 配置、shell rc、OTel 配置和 cache 目录，并返回逐步骤报告供日志与测试检查。
+ * 每个步骤都在自己的错误边界内记录 `logger.warn` 后继续，迁移失败不会阻断其他 Agent
+ * 的当前版本部署，这就是这里所说的 fail-open。
  *
- * 完全 fail-open:任何一步失败 logger.warn + 继续,不阻断 deployAll。
+ * 两条迁移都把相应的旧 cache 目录作为执行门槛：cache 不存在时整条链快速跳过，即使
+ * settings/rc 中仍有孤立旧配置也不会清理（当前兼容行为，维护时不要误认为它会全盘扫描）。
  *
- * Claude 清理(R10):
- *   1. ~/.cache/opentelemetry.instrumentation.claude/ 存在 → 进入清理
- *   2. parse ~/.claude/settings.json,删 hooks.* 中含 "otel-claude-hook" 或
- *      "/.cache/opentelemetry.instrumentation.claude" 的 command
- *   3. rm ~/.claude/otel-config.json
- *   4. 扫 ~/.bashrc / ~/.zshrc / ~/.bash_profile,删 # BEGIN otel-claude-hook ... # END 段
- *   5. rm -rf ~/.cache/opentelemetry.instrumentation.claude/
+ * Claude 迁移顺序：
+ * 1. 从 `~/.claude/settings.json` 的扁平或嵌套 hooks 中删除旧插件命令；
+ * 2. 删除 `~/.claude/otel-config.json`；
+ * 3. 从 `.bashrc`、`.zshrc`、`.bash_profile` 删除旧 marker 区块；
+ * 4. 最后递归删除 `~/.cache/opentelemetry.instrumentation.claude/`。
  *
- * Codex 清理(R11):
- *   1. ~/.cache/opentelemetry.instrumentation.codex/ 存在 → 进入清理
- *   2. parse ~/.codex/hooks.json,删含 otel-codex-hook 的条目
- *   3. 改 ~/.codex/config.toml:
- *      - 清 # OpenTelemetry instrumentation hooks marker 段(legacy [[hooks.X]] 段;
- *        支持两种历史 shape:含 command 的 / 仅 type 的空段)
- *      - 删 codex_hooks = true(legacy alias);[features] 段空了一并删
- *      - **不在这里删 BEGIN/END trust block** — 留给 hook-strategy 用同名 marker 自然替换,
- *        避免一次 write 一次 read 来回操作
- *   4. rm ~/.codex/otel-config.json
- *   5. rm -rf ~/.cache/opentelemetry.instrumentation.codex/
+ * Codex 迁移顺序：
+ * 1. 从 `~/.codex/hooks.json` 删除旧 Hook；
+ * 2. 清理 `config.toml` 的历史 `[[hooks.X]]` 区段和 `codex_hooks` feature alias；
+ * 3. 保留 BEGIN/END trust block，交给当前 `HookStrategy` 用同名 marker 幂等替换；
+ * 4. 删除旧 OTel 配置，最后递归删除 Codex cache 目录。
  */
 
 // 同步 fs 只用于低成本存在性门控；真正的读写/删除使用 Promise API，避免长操作阻塞事件循环。

@@ -9,15 +9,21 @@
  * 交错触发，因此条目的 start/stop 回调仍应具备幂等性。
  */
 
+// `node:fs` 提供目录级 `watch()` 和可关闭的 `FSWatcher` 句柄；本模块不直接读写 Agent 数据。
 import * as fs from 'node:fs';
+// 继承 EventEmitter 后，上层可旁听 started/stopped，而无需把诊断逻辑塞进生命周期回调。
 import { EventEmitter } from 'node:events';
+// `import type` 只参与 TypeScript 检查，编译后的 JavaScript 不会加载 types 模块。
 import type { AgentDetectionEntry, EntryState } from '../types/index.js';
+// 每个模块使用独立 logger 名称，便于从 Collector 日志定位发现阶段。
 import { createLogger } from '../utils/logger.js';
 
 const logger = createLogger('AgentDiscoveryService');
 
-const DEFAULT_POLL_MS = 300_000; // 默认每 5 分钟轮询一次。
+/** 未单独指定时，条目轮询和全局兜底刷新都采用 5 分钟。 */
+const DEFAULT_POLL_MS = 300_000;
 // 测试、网络盘或 fs.watch 不可靠的部署可强制绕过 watcher，直接使用每条目轮询。
+// 常量在模块首次 import 时读取环境变量；进程运行中再修改 env 不会改变既有选择。
 const FORCE_POLLING = process.env.LOONGSUITE_PILOT_FORCE_POLLING === 'true';
 
 interface EntryRuntime {
@@ -37,6 +43,10 @@ interface EntryRuntime {
  * 优先使用 `fs.watch` 监听候选路径，失败时回退到定时轮询。每个条目独立遵循
  * `idle -> starting -> running -> stopping -> idle` 状态机，避免重复启停同一个 Input
  * 或部署修复任务。
+ *
+ * 生命周期由 `Orchestrator.start()/stop()` 拥有。服务会发出 `agent:started` 和
+ * `agent:stopped` 诊断事件，但真正的数据流仍由 entry.start() 启动的 Input 进入
+ * InputManager；EventEmitter 事件本身不携带采集数据。
  */
 export class AgentDiscoveryService extends EventEmitter {
   /** ID 到条目运行态映射，Map 保留构造参数顺序，决定 refresh/stop 的处理顺序。 */
@@ -48,6 +58,7 @@ export class AgentDiscoveryService extends EventEmitter {
   constructor(entries: AgentDetectionEntry[]) {
     super();
     // 构造阶段只登记状态，不访问文件系统，也不启动 Input；实际副作用全部留到 start()。
+    // ID 是 Map 主键：若调用方误传重复 ID，后出现的条目会覆盖前者，但仍占据原键的位置。
     for (const entry of entries) {
       this.runtimes.set(entry.id, {
         entry,
@@ -61,6 +72,9 @@ export class AgentDiscoveryService extends EventEmitter {
   /**
    * 为每个条目建立 watcher，立即串行刷新一次，再创建全局轮询 timer。
    * 首轮条目异常通常已在 processEntry 内隔离。
+   *
+   * @returns 首轮所有条目完成可用性检查和启停尝试后兑现。
+   * @remarks 全局 interval 没有 `unref()`，会维持 Node.js 事件循环；正常退出必须调用 stop()。
    */
   async start(): Promise<void> {
     // 先尽力建立低延迟监听；路径不存在的条目会在 setupWatcher() 内自动改用轮询。
@@ -80,6 +94,7 @@ export class AgentDiscoveryService extends EventEmitter {
   /**
    * 关闭全部 timer/watcher，并顺序停止处于 running/starting 的条目。
    * @returns 所有 stop 回调完成后兑现。
+   * @remarks `stopEntry()` 会隔离单条目的停止异常，因此一次失败不会中断后续条目清理。
    */
   async stop(): Promise<void> {
     // 先切断所有未来调度源，再停止条目，避免关闭过程中由 timer/watch 再次启动 Input。
@@ -105,7 +120,11 @@ export class AgentDiscoveryService extends EventEmitter {
     }
   }
 
-  /** 按注册顺序重新计算所有条目可用性；串行处理避免集中修改多个 Agent 配置。 */
+  /**
+   * 按注册顺序重新计算所有条目可用性；串行处理避免集中修改多个 Agent 配置。
+   * @param trigger 仅写入 debug 日志，常见值为 startup、poll、manual，不影响判断规则。
+   * @returns 本轮所有 `processEntry()` 完成后兑现；条目级错误已在内部隔离。
+   */
   async refresh(trigger: string = 'manual'): Promise<void> {
     logger.debug('refresh triggered', { trigger });
     for (const rt of this.runtimes.values()) {
@@ -113,7 +132,10 @@ export class AgentDiscoveryService extends EventEmitter {
     }
   }
 
-  /** 返回每个条目状态的普通对象快照。 */
+  /**
+   * 返回每个条目状态的普通对象快照。
+   * @returns 新建的 `id -> EntryState` 对象；修改返回值不会改变内部状态机。
+   */
   getStates(): Record<string, EntryState> {
     const out: Record<string, EntryState> = {};
     for (const [id, rt] of this.runtimes) {
@@ -125,6 +147,8 @@ export class AgentDiscoveryService extends EventEmitter {
   /**
    * 执行 enabled/isAvailable 判断并驱动状态转换。runOnActive 条目即使已 running 也会
    * 再调用 start，用于活跃时刷新部署；异常被记录并将状态退回 idle。
+   * @param rt 单个条目的声明、状态及 watcher/timer 句柄。
+   * @returns 本次检查及可能的 start/stop 完成后兑现。
    */
   private async processEntry(rt: EntryRuntime): Promise<void> {
     const { entry } = rt;
@@ -148,6 +172,7 @@ export class AgentDiscoveryService extends EventEmitter {
         // 幂等（待确认是否需要为每个 runtime 增加 in-flight Promise）。
         rt.state = 'starting';
         logger.info('starting agent', { id: entry.id });
+        // 调用具体的BaseInput的start方法
         await entry.start();
         rt.state = 'running';
         this.emit('agent:started', entry.id);
@@ -164,7 +189,10 @@ export class AgentDiscoveryService extends EventEmitter {
     }
   }
 
-  /** 调用条目 stop；即使 stop 抛错也恢复 idle 并发出 agent:stopped。 */
+  /**
+   * 调用条目 stop；即使 stop 抛错也恢复 idle 并发出 agent:stopped。
+   * @param rt 将被原地更新为 stopping，最终恢复 idle 的条目运行态。
+   */
   private async stopEntry(rt: EntryRuntime): Promise<void> {
     rt.state = 'stopping';
     try {
@@ -179,6 +207,8 @@ export class AgentDiscoveryService extends EventEmitter {
   /**
    * 尝试监听首个可用 watchPath；监听错误后关闭 watcher 并切换为 polling。
    * `persistent:false` 表示 watcher 本身不能阻止 Node 进程退出。
+   * @param rt 要安装监听器的条目运行态；方法会原地写入 watcher 或 pollTimer。
+   * @remarks 只保留第一个成功创建的 watcher；其余候选路径不会同时监听，全局轮询负责兜底。
    */
   private setupWatcher(rt: EntryRuntime): void {
     if (FORCE_POLLING) {
@@ -188,6 +218,7 @@ export class AgentDiscoveryService extends EventEmitter {
 
     for (const watchPath of rt.entry.watchPaths) {
       try {
+        // 对 watchPath 目录 / 文件创建文件系统监听（inotify / FSEvents），当路径下发生新增、修改、删除、重命名时，触发回调函数。
         const watcher = fs.watch(watchPath, { persistent: false }, () => {
           // fs.watch 回调不能被文件系统等待；processEntry 自行捕获异常。多个文件事件可能
           // 在前一次异步检查完成前到达，状态字段只提供生命周期门禁，不提供 Promise 锁。
@@ -208,7 +239,11 @@ export class AgentDiscoveryService extends EventEmitter {
     this.setupPolling(rt);
   }
 
-  /** 为条目创建兜底 interval；已有 timer 时保持幂等。 */
+  /**
+   * 为条目创建兜底 interval；已有 timer 时保持幂等。
+   * @param rt watcher 不可用或运行期失效的条目运行态。
+   * @remarks 该 interval 也未 `unref()`，会由 stop() 明确清理。
+   */
   private setupPolling(rt: EntryRuntime): void {
     if (rt.pollTimer) return;
     const interval = rt.entry.pollIntervalMs || DEFAULT_POLL_MS;
