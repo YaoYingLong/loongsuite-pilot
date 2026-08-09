@@ -3,6 +3,8 @@
  *
  * InputManager 在内容采集策略之后、所有 Flusher 之前调用本模块。它只递归扫描字段白名单，
  * 采用 copy-on-write：没有命中时返回原对象，命中后才复制改变的容器，降低常见路径开销。
+ * 内容策略负责“某类正文能否保留”，masker 负责“允许保留的正文中哪些密钥片段要替换”；两者
+ * 不能互换顺序，也不能由某个单独 Flusher 各自执行，否则多目标输出可能得到不同安全结果。
  */
 
 import type { AgentActivityEntry, MaskConfig } from '../types/index.js';
@@ -23,7 +25,7 @@ type JsonSafeValue =
 /** 防御畸形或恶意深层对象，超过 32 层后保留原值并停止递归。 */
 const MAX_MASK_JSON_DEPTH = 32;
 
-  /**
+/**
    * 对一条标准事件中的敏感内容字段应用已启用规则。
    *
    * 扫描顺序是顶层字段白名单 -> JSON 容器递归 -> 单字符串规则匹配。字段名本身和白名单外的
@@ -54,6 +56,7 @@ export function maskAgentActivityEntry(
   for (const [field, value] of Object.entries(entry)) {
     // 精确白名单阻止元数据被正则误修改。
     if (!shouldMaskField(field)) continue;
+    // 顶层扩展值契约是 JsonValue | undefined；断言只帮助递归函数定型，undefined 运行时会原样落回。
     const maskedValue = maskJsonSafeValue(value as JsonSafeValue, rules, options);
     if (maskedValue !== value) {
       maskedEntry ??= { ...entry };

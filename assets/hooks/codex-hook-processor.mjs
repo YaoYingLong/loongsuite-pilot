@@ -37,6 +37,7 @@ function pilotDataDir() {
 
 function tryReadStdin() {
   try {
+    // 文件描述符 0 = stdin（标准输入） 等价读取终端 / 管道传入的数据；
     const input = fs.readFileSync(0, 'utf8').trim();
     if (!input) return {};
     const value = JSON.parse(input);
@@ -69,6 +70,7 @@ function writeWakeupMarker(input) {
   // 首个 turn 从环境变量读取 TRACEPARENT，按 session 只写一次上游关联记录。
   recordUpstreamContextOnce({ agentId: AGENT_ID, sessionId, dataDir: pilotDataDir() });
 
+  // .loongsuite-pilot/state/codex/transcript-wakeups
   const directory = path.join(pilotDataDir(), 'state', 'codex', 'transcript-wakeups');
   const marker = path.join(directory, `${safePathPart(sessionId)}.json`);
   const temporary = path.join(directory, `.${safePathPart(sessionId)}.${process.pid}.${crypto.randomUUID()}.tmp`);

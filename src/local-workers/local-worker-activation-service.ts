@@ -3,16 +3,22 @@
  *
  * Orchestrator 启动后，本类监听 local-workers 目录并每 5 秒兜底扫描 instance.json。
  * 对 enabled 实例，它从 AgentDefinition.localWorkerRuntime 派生实例专用 plugin-probe
- * 定义，按配置指纹决定部署/重启 Worker；禁用或删除实例时停止对应进程。fs.watch
+ * 定义，按配置指纹决定部署/重启 Worker；实例禁用时停止对应进程。删除命令只允许移除
+ * 已禁用且进程已退出的实例，因此删除后的目录不会再出现在本服务扫描结果中。fs.watch
  * 回调只请求异步 refresh，Promise 锁避免并发重入；单实例失败写 supervisor 状态并
  * 隔离，不阻断其他 Worker。
  */
 
 
+// SHA-256 将实例配置与本地 Runtime 包内容收敛成可比较指纹。
 import * as crypto from 'node:crypto';
+// fs.watch 提供低延迟目录变化提示；FSWatcher 类型用于保存并在 stop() 关闭句柄。
 import { watch, type FSWatcher } from 'node:fs';
+// path 只拼 supervisor-status 路径，实例目录规则集中在 instance-store 中。
 import * as path from 'node:path';
+// 类型导入在编译后移除；真实 instance.json 由 instance-store 负责读取和校验。
 import type { AgentDefinition } from '../types/index.js';
+// 复用正式 plugin-probe 部署路径，保证 Local Worker 与普通 Worker 使用同样的包/manifest 语义。
 import { PluginProbeStrategy } from '../deployment/plugin-probe-strategy.js';
 import { createLogger } from '../utils/logger.js';
 import { ensureDir, writeJsonFile } from '../utils/fs-utils.js';
@@ -29,11 +35,15 @@ import {
 
 const logger = createLogger('LocalWorkerActivationService');
 
+/** watcher 丢事件时每 5 秒重新读取全部实例的期望状态。 */
 const DEFAULT_SCAN_INTERVAL_MS = 5000;
 
 export interface LocalWorkerActivationServiceOptions {
+  /** 实例声明、凭据、bundle、状态和日志所在的数据根。 */
   dataDir: string;
+  /** 当前版本包根，用于 PluginProbeStrategy 查找 wrapper 脚本。 */
   pilotDir: string;
+  /** DeploymentManager 已加载的声明快照，用于按 runtime 找 plugin-probe 模板。 */
   definitions: AgentDefinition[];
 }
 
@@ -49,14 +59,21 @@ export interface LocalWorkerActivationServiceOptions {
  * 必要时先停旧进程再启动，使实际状态最终回到声明值。
  */
 export class LocalWorkerActivationService {
+  /** 所有 Local Worker 实例数据的共同根路径。 */
   private readonly dataDir: string;
+  /** 当前 Pilot 版本目录；实例包本身写在 dataDir 下而非这里。 */
   private readonly pilotDir: string;
+  /** 启动时的声明数组引用，服务运行中不会重新加载 agents.d.local。 */
   private readonly definitions: AgentDefinition[];
+  /** 复用的插件部署/Worker Supervisor 入口。 */
   private readonly strategy: PluginProbeStrategy;
   /** 已成功部署实例的配置指纹，用于跳过无变化且仍存活的 Worker。 */
   private readonly activeFingerprints = new Map<string, string>();
+  /** 最终一致性轮询句柄；设置 unref 后不会单独阻止进程退出。 */
   private timer: ReturnType<typeof setInterval> | null = null;
+  /** local-workers 根目录 watcher；persistent:false，同样不会单独维持进程。 */
   private watcher: FSWatcher | null = null;
+  /** 合并 watch/poll 触发的轻量互斥标记，不保存或等待正在运行的 Promise。 */
   private refreshing = false;
 
   /**
@@ -79,6 +96,7 @@ export class LocalWorkerActivationService {
    *
    * @returns 首次扫描完成且 watcher/timer 已建立后兑现。
    * @throws 根目录创建或首轮收敛的未捕获异常向 Orchestrator 传播；`fs.watch` 不可用只告警。
+   * @remarks 当前没有重复启动保护，生命周期约定是同一实例只调用一次 start()。
    */
   async start(): Promise<void> {
     const root = localWorkerRoot(this.dataDir);
@@ -113,6 +131,8 @@ export class LocalWorkerActivationService {
    * 避免同时发大量进程组信号。单个 `stopInstance()` 将错误转成告警，因此其他实例仍会继续清理。
    *
    * @returns watcher 已关闭、timer 已清理且所有已知实例都完成停止尝试后兑现。
+   * @remarks 本类只用布尔值标记 refresh，没有保存 in-flight Promise；stop 与已经开始的 refresh
+   * 竞争时，后者是否可能在清理后再次拉起 Worker 仍待确认。
    */
   async stop(): Promise<void> {
     if (this.timer) {
@@ -128,6 +148,7 @@ export class LocalWorkerActivationService {
     // instance.json 保持不变，下次 Collector 启动会按期望状态重新拉起。
     const instances = await listLocalWorkerInstances(this.dataDir);
     for (const instance of instances) {
+      // stopInstance 不检查 enabled，因为 Collector 退出必须停止 enabled=true 的常驻进程。
       await this.stopInstance(instance);
     }
     this.activeFingerprints.clear();
@@ -144,6 +165,7 @@ export class LocalWorkerActivationService {
     if (this.refreshing) return;
     this.refreshing = true;
     try {
+      // 每轮都从磁盘重读，而不是复用旧对象，才能看到 CLI 原子替换 instance.json 后的新期望值。
       const instances = await listLocalWorkerInstances(this.dataDir);
       // 串行保证包获取、安装脚本与进程组操作不在本服务内并发抢占系统资源。
       for (const instance of instances) {
@@ -165,6 +187,7 @@ export class LocalWorkerActivationService {
     if (!instance.enabled) {
       // disconnect 写入 enabled=false 后会进入此分支，实际停止动作在这里完成。
       await this.stopInstance(instance);
+      // 删除缓存后，若用户随后 reconnect=true，下一轮一定会重新核对并部署。
       this.activeFingerprints.delete(instance.id);
       return;
     }
@@ -199,6 +222,7 @@ export class LocalWorkerActivationService {
       return;
     }
 
+    // 只有包安装/Worker 启动路径返回 success 才缓存；下一轮还会额外检查 PID 活性。
     this.activeFingerprints.set(instance.id, fingerprint);
   }
 
@@ -293,6 +317,7 @@ export class LocalWorkerActivationService {
    */
   private async fingerprint(instance: LocalWorkerInstance, template: AgentDefinition): Promise<string> {
     const source = template.pluginProbe?.source;
+    // 纯远端包不在每 5 秒扫描中下载求 hash，否则会造成持续网络流量。
     const sourceHash = source?.tarball
       ? await this.strategy.computeSourceHash(source.tarball, undefined)
       : undefined;

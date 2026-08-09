@@ -9,7 +9,9 @@
  */
 
 
+// Node.js `path` 用于规范 settings/trust 文件绝对路径，不负责实际文件读写。
 import * as path from 'node:path';
+// 类型导入会在编译后擦除；AgentDefinition 的模式专属字段仍需在运行时检查。
 import type {
   AgentDefinition,
   AgentHookConfig,
@@ -17,8 +19,11 @@ import type {
   DeployStrategy,
   DeployedAgentRecord,
 } from '../types/index.js';
+// HookManager 封装 flat/nested settings JSON 的保留式读改写，避免本策略覆盖第三方 Hook。
 import { HookManager, type HookDefinition } from '../hooks/hook-manager.js';
+// JSON 工具负责容错读取、原子写入、HOME 展开和父目录创建。
 import { readJsonFile, writeJsonFile, resolveHome, ensureDir } from '../utils/fs-utils.js';
+// detectAgent 是所有部署 Strategy 共用的“路径优先、命令兜底”安装探测入口。
 import { detectAgent } from './detect-utils.js';
 import { createLogger } from '../utils/logger.js';
 import {
@@ -92,6 +97,7 @@ function formatHookCommand(
  * `needsDeploy()` 和 `deploy()`，修复被 Agent 升级或用户工具覆盖的项。
  */
 export class HookStrategy implements DeployStrategy {
+  /** settings JSON 的具体读写器；本策略负责把 AgentDefinition 翻译成其输入契约。 */
   private readonly hookManager: HookManager;
 
   /**
@@ -107,6 +113,7 @@ export class HookStrategy implements DeployStrategy {
    * @returns detection path/command 任一命中时为 `true`；只读文件系统/PATH，不修改 settings。
    */
   async detect(def: AgentDefinition): Promise<boolean> {
+    // 复用统一探测顺序和 fail-open 语义，避免不同 Strategy 对同一声明得出不同安装结论。
     return detectAgent(def.detection);
   }
 
@@ -172,6 +179,7 @@ export class HookStrategy implements DeployStrategy {
     }
 
     try {
+      // 在任何数组读改写前补齐基础文件结构；后续 HookManager 可以据此执行幂等检查。
       await this.ensureSettingsFile(hookConfig.settingsPath);
 
       // Kiro CLI: settingsPath 是整个 Agent 定义 JSON，需要顶层 name + tools +
@@ -193,6 +201,7 @@ export class HookStrategy implements DeployStrategy {
         }
       }
       if (hookConfig.trustToml && retiredHookDefs.length > 0) {
+        // Hook JSON 旧事件已经移除，对应 trust key 也要同步删掉，避免残留授权继续存在。
         const trust = hookConfig.trustToml;
         removeTrustBlock(
           resolveHome(trust.configPath),
@@ -214,6 +223,7 @@ export class HookStrategy implements DeployStrategy {
         }
       }
 
+      // 每个事件独立形成 HookDefinition，任何一个关键写入失败都会让本次部署返回失败。
       const hookDefs = this.buildHookDefinitions(def);
       for (const hookDef of hookDefs) {
         // 先检查再写入，使周期 Watchdog 修复在配置正常时不会不必要地改变文件 mtime。
@@ -256,10 +266,10 @@ export class HookStrategy implements DeployStrategy {
   }
 
   /**
-   * 写 Codex trust hash + 立即自洽性校验(Q8)。
-   * 校验失败仅记 logger.error,不阻塞 deploy(让 hook-watchdog 活性检查兜底重试)。
+   * 写 Codex trust hash，并立即回读做自洽性校验。
+   * 校验失败只记录 logger.error，不阻塞 deploy，由 hook-watchdog 的后续活性检查兜底重试。
    *
-   * 注:command 字符串必须与 HookManager.installHook 写入 hooks.json 时一致,否则 hash 对不上。
+   * 注意：command 字符串必须与 HookManager.installHook 写入 hooks.json 时一致，否则 hash 对不上。
    * HookManager nested format 写入的 command 就是原始 def.hook.hookCommand + 末尾空格 + subcommand
    * (subcommand 在我们 buildHookDefinitions 里没拼,因为 mjs handler 是单入口、subcommand 当 argv)。
    * 这里 trust hash 算的是 `bash <hookCommand> <subcommand>` — 与实际 hooks.json 中条目对齐。
@@ -278,15 +288,15 @@ export class HookStrategy implements DeployStrategy {
     const hooksJsonAbsPath = path.resolve(resolveHome(def.hook!.settingsPath));
     const hookCommand = resolveHome(def.hook!.hookCommand);
 
-    // 构建 event → 实际写入 hooks.json 的完整 command(与 buildHookDefinitions 一致)
+    // 构建 event -> 实际写入 hooks.json 的完整 command；唯一格式化函数保证安装值与 hash 输入一致。
     const eventToCmd: Record<string, string> = {};
     for (const ev of def.hook!.events) {
       eventToCmd[ev] = formatHookCommand(hookCommand, ev, def.hook!.eventSubcommand);
     }
 
-    // 回读 hooks.json,算出每个 event 中 pilot hook 的实际 group index。
-    // 当其他第三方 hook(如 r2c)排在前面时,pilot 的 hook 会被 push 到后面的位置。
-    // trust hash 的 key 必须用实际 index,否则 codex 端校验失败(静默 Untrusted)。
+    // 回读 hooks.json，算出每个 event 中 Pilot Hook 的实际 group index。
+    // 当其他第三方 Hook 排在前面时，Pilot 条目会位于后续位置；trust key 必须使用真实下标，
+    // 否则 Codex 会把命令视为 Untrusted。
     const eventToGroupIndex = await this.resolveGroupIndices(def);
 
     writeTrustedHashes({
@@ -349,7 +359,7 @@ export class HookStrategy implements DeployStrategy {
   }
 
   /**
-   * 回读 hooks.json,找到 pilot hook command 在每个 event 数组中的实际 group index。
+   * 回读 hooks.json，找到 Pilot Hook command 在每个 event 数组中的实际 group index。
    * 支持 nested format({hooks:[{command}]}) 和 flat format({command})两种结构。
    * @returns event -> group index 的部分 Map；读取失败或事件未命中时省略对应 key，trust writer 回退为 0。
    * @remarks index 是 trust state key 的一部分；第三方 Hook 位于 Pilot 前面时，不能假设 Pilot 永远是第 0 组。
@@ -401,6 +411,7 @@ export class HookStrategy implements DeployStrategy {
     const hookConfig = def.hook;
     if (!hookConfig) return [];
 
+    // map 保持声明中的事件顺序；DeploymentManager/HookManager 随后会按该顺序检查和安装。
     return hookConfig.events.map(event => ({
       agentId: def.id,
       settingsPath: hookConfig.settingsPath,
@@ -421,6 +432,7 @@ export class HookStrategy implements DeployStrategy {
   private buildRetiredHookDefinitions(def: AgentDefinition): HookDefinition[] {
     const hookConfig = def.hook;
     if (!hookConfig?.retiredEvents?.length) return [];
+    // Set 同时用于当前事件快速查找和 retiredEvents 去重，避免同一 settings 数组重复卸载。
     const currentEvents = new Set(hookConfig.events);
     return [...new Set(hookConfig.retiredEvents)]
       .filter(event => !currentEvents.has(event))
@@ -596,6 +608,8 @@ export class HookStrategy implements DeployStrategy {
     const isHooksJson = settingsPath.endsWith('hooks.json');
     const needsVersion = isHooksJson && settingsPath.includes('.cursor');
 
+    // readJsonFile 将“文件缺失、不可读、JSON 无效”统一为 null；对于 hooks.json，这些情况
+    // 都会进入初始化分支并写入基础结构，现有坏 JSON 是否应先备份仍待确认。
     const existing = await readJsonFile<Record<string, unknown>>(settingsPath);
     if (!existing) {
       if (isHooksJson) {

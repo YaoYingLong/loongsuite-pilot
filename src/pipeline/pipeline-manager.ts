@@ -6,18 +6,25 @@
  * 是最终兜底；相同配置通过稳定 JSON hash 避免无意义重建。
  */
 
+// 回调版 fs 只用于长生命周期目录 watcher；句柄由 stop() 显式关闭。
 import * as fs from 'node:fs';
+// Promise 版 fs 配合 async/await 完成扫描、读取和兼容目录迁移。
 import * as fsPromises from 'node:fs/promises';
+// path 用于把配置文件名拼成绝对路径；configName 自身另有白名单防止路径穿越。
 import * as path from 'node:path';
+// 类型导入编译后擦除，磁盘 JSON 仍必须经过 validateConfig 的运行时校验。
 import type { PipelineConfig, PipelineManagerOptions, PipelineToggle, Pipeline } from './types.js';
+// 两种具体 Pipeline 都实现 start/stop，并可选实现睡眠唤醒恢复钩子。
 import { FilePipeline } from './input/file/file-pipeline.js';
 import { QoderApiPipeline } from './input/qoder-api/qoder-api-pipeline.js';
+// SleepDetector 只在 macOS 启动，用于补偿系统睡眠造成的 reader/watcher 时间跳跃。
 import { SleepDetector, type WakeEvent } from './sleep-detector.js';
 import { createLogger } from '../utils/logger.js';
 import { ensureDir } from '../utils/fs-utils.js';
 
 const logger = createLogger('PipelineManager');
 
+/** 即使 fs.watch 没有事件，也至少每 60 秒让磁盘配置与运行实例收敛一次。 */
 const RESCAN_INTERVAL_MS = 60_000;
 /** configName 同时用于状态文件和 topic，只允许安全文件名字符。 */
 const VALID_CONFIG_NAME = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
@@ -30,16 +37,27 @@ const VALID_CONFIG_NAME = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/;
  * start 的实例，两者共同决定新增、重建和删除。
  */
 export class PipelineManager {
+  /** 用户放置 Pipeline JSON 的动态配置目录。 */
   private readonly configDir: string;
+  /** 各 Pipeline 保存 checkpoint/读取偏移的持久目录。 */
   private readonly stateDir: string;
+  /** 独立 Pipeline 失败记录目录，不与主 Input 输出失败日志混用。 */
   private readonly failedLogDir: string;
+  /** 运行数据根，继续传给具体 Pipeline 构造参数。 */
   private readonly dataDir: string;
+  /** file/qoderApi 类型子开关；总开关在 Orchestrator 是否创建本类时已经应用。 */
   private readonly pipelineConfig: PipelineToggle;
+  /** 仅保存 `start()` 已成功的实例，键是经校验的 configName。 */
   private readonly pipelines: Map<string, Pipeline> = new Map();
+  /** configName 到稳定序列化文本；用于判断同名配置内容是否真正变化。 */
   private readonly configHashes: Map<string, string> = new Map();
+  /** 配置目录 watcher；创建失败时保持 null 并依赖 rescanTimer。 */
   private watcher: fs.FSWatcher | null = null;
+  /** 60 秒兜底扫描句柄；未 unref，因此 Orchestrator 必须在退出时调用 stop()。 */
   private rescanTimer: ReturnType<typeof setInterval> | null = null;
+  /** Manager 私有的睡眠探测器，不与其他子系统共享 listener。 */
   private readonly sleepDetector = new SleepDetector();
+  /** start/stop 和扫描循环共同读取的生命周期门禁。 */
   private running = false;
   /** rescanInProgress/Queued 把 watcher、timer、wake 的并发请求合并成串行扫描。 */
   private rescanInProgress = false;
@@ -64,6 +82,10 @@ export class PipelineManager {
    * 首轮 `await fullRescan()` 保证 start 返回前当前合法配置已经尝试创建。`fs.watch` 回调只发起
    * 重扫，配置文件内容始终由 `scanConfigDir()` 重新完整读取，避免依赖不可靠的事件类型。
    * watcher 创建或运行失败不会让 start reject，而是保留 60 秒 timer 作为降级路径。
+   *
+   * @returns 首轮扫描完成、watcher/timer（以及 macOS SleepDetector）安装后兑现。
+   * @throws 目录创建或首轮扫描的未隔离异常向 Orchestrator 传播。running 已先置 true，失败后
+   * 再调用 start 会直接返回，是否应在异常路径恢复为 false 仍待确认。
    */
   async start(): Promise<void> {
     if (this.running) return;
@@ -78,6 +100,7 @@ export class PipelineManager {
     await this.fullRescan();
 
     try {
+      // watcher 默认 persistent=true，会维持事件循环；这是常驻 Collector 的预期行为。
       this.watcher = fs.watch(this.configDir, (_event, filename) => {
         // 只对 JSON 文件提示触发；完整 rescan 会重新读取整个目录处理删除/改名。
         if (filename && filename.endsWith('.json')) {
@@ -119,6 +142,10 @@ export class PipelineManager {
    *
    * 每个 `pipeline.stop()` 单独 catch，确保一个实例关闭失败不阻止其他实例释放资源；
    * `Promise.all` 等所有关闭任务 settle 后才清 Map。方法不抛单实例停止错误，只通过日志暴露。
+   *
+   * @returns 本轮快照中的全部 Pipeline 完成停止尝试后兑现。
+   * @remarks 当前不保存正在执行的 fullRescan Promise；若 stop 与 createPipeline 的 await 重叠，
+   * 新实例是否可能在 Map 清理后登记仍待确认。
    */
   async stop(): Promise<void> {
     if (!this.running) return;
@@ -159,6 +186,7 @@ export class PipelineManager {
    * 保留升级前文件 checkpoint。迁移失败只告警，随后仍创建新目录继续启动。
    */
   private async migrateStateDir(): Promise<void> {
+    // 正则只替换目录末尾的 pipeline，避免误改父路径中恰好同名的片段。
     const oldDir = this.stateDir.replace(/[/\\]pipeline$/, '/file-collection');
     if (oldDir === this.stateDir) return;
 
@@ -183,6 +211,7 @@ export class PipelineManager {
    * 一次性迁移旧 `logs/file-collection-failed` 到 `logs/pipeline-failed`，避免升级后诊断孤立。
    */
   private async migrateFailedLogDir(): Promise<void> {
+    // 与状态迁移相同，仅在传入目录使用当前标准后缀时才能推导旧目录。
     const oldDir = this.failedLogDir.replace(/[/\\]pipeline-failed$/, '/file-collection-failed');
     if (oldDir === this.failedLogDir) return;
 
@@ -311,6 +340,7 @@ export class PipelineManager {
       return [];
     }
 
+    // 目录项不显式排序；若多个文件声明同一 configName，本轮最后处理的有效文件决定最终实例。
     const configs: PipelineConfig[] = [];
     for (const entry of entries) {
       if (!entry.endsWith('.json')) continue;
@@ -395,6 +425,7 @@ export class PipelineManager {
    * 仍无该名称会再次尝试。
    */
   private async createPipeline(config: PipelineConfig): Promise<void> {
+    // 当前 Schema 是数组，但一条 config 只实例化 inputs[0]；validateConfig 已确保它存在。
     const inputType = config.inputs[0].Type;
 
     // 总开关由 Orchestrator 决定是否创建 Manager，这里再执行类型子开关。
@@ -409,6 +440,7 @@ export class PipelineManager {
 
     try {
       let pipeline: Pipeline;
+      // 两种实现共享同一组选项；具体 Input/Flusher 细节在各 Pipeline 构造函数中创建。
       const opts = {
         config,
         stateDir: this.stateDir,
@@ -471,6 +503,7 @@ export class PipelineManager {
  * 语义。该值不是密码学 hash，只用于同一进程内比较配置内容是否改变。
  */
 function stableStringify(obj: unknown): string {
+  // JSON.stringify 会递归调用 replacer；每次遇到普通对象都复制为按 key 排序的新对象。
   return JSON.stringify(obj, (_key, value) => {
     if (value && typeof value === 'object' && !Array.isArray(value)) {
       return Object.keys(value).sort().reduce<Record<string, unknown>>((sorted, k) => {

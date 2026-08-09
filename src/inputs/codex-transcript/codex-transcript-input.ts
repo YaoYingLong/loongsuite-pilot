@@ -175,6 +175,7 @@ export class CodexTranscriptInput extends BaseInput {
    */
   protected override async collect(): Promise<AgentActivityEntry[]> {
     let emittedCount = 0;
+    // 通过discoverSessionFiles遍历递归发现的 sessionDir 下所有 `rollout-*.jsonl`，排序后返回文件列表
     for (const filePath of await this.discoverSessionFiles()) {
       emittedCount += await this.processFile(filePath);
     }
@@ -218,75 +219,150 @@ export class CodexTranscriptInput extends BaseInput {
   }
 
   /**
-   * 从一个 rollout 文件的 checkpoint 继续扫描、恢复 turn、发出事件并更新状态。
+   * 从一个 Codex `rollout-*.jsonl` 文件的 checkpoint 继续增量扫描，并把可以确认提交的
+   * turn/step 转成标准事件。
    *
-   * 每周期限制 terminal 数和扫描字节，避免一个大文件饿死其他 Agent。inode 改变时视为文件替换并
-   * 重新 baseline；pending terminal 必须优先恢复，恢复失败会阻塞该文件后续字节以保证不漏数据。
+   * 本方法由 `collect()` 对每个已发现 transcript 顺序调用。它不是简单的“从 offset 读到 EOF”，
+   * 而是同时维护两套位置：
    *
-   * @returns 本文件本周期实际发出的事件数。
+   * - `checkpoint.scanOffset`：物理扫描游标，表示 JSONL 完整行已经检查到哪个字节；
+   * - `checkpoint.activeTurn.startOffset`：语义恢复起点，表示当前 turn 还有哪些源记录尚未成功构建。
+   *
+   * 非 terminal turn 可能已经物理扫描到文件尾，但最后一个 response/tool wave 尚未闭合；此时
+   * `scanOffset` 可以前进，而 `activeTurn.startOffset` 只前进到 Extractor 确认已提交的边界。下一轮
+   * 会把保留的语义后缀与新增字节一起重建，所以不能把这两个 offset 合并使用。
+   *
+   * 单文件单周期的处理顺序如下：
+   *
+   * 1. `stat` 当前文件并核对 inode；文件被替换/轮转时重新 baseline，不沿用旧文件 offset；
+   * 2. 优先调用 `recoverPendingTerminal()`，重试上轮已经看到 terminal、但未能解析的固定字节范围；
+   * 3. 从 `scanOffset` 开始，只扫描换行结尾的完整 JSONL 记录，并记录最新 session meta、turn 起点
+   *    以及与当前 active turn 匹配的 `task_complete`/`turn_aborted`；
+   * 4. 先检查文件级和全局 terminal ID 去重；未处理过的范围交给 `recoverTurnSegment()` 执行
+   *    Extractor -> Builder -> 事件 ID 过滤，并更新 active turn 的事件级增量进度；
+   * 5. 通过 `emitEntryBatches()` 按 256 条/约 1 MiB 主动触发 `entries`，再提交语义消费边界、
+   *    active/pending 状态、terminal 去重表和物理扫描游标；
+   * 6. 把文件 checkpoint 与全局去重状态更新到共享 `StateStore` 内存，实际 JSON 落盘由
+   *    `BaseInput.runCycleOnce()` 在整个 `collect()` 返回后统一调用 `StateStore.save()` 完成。
+   *
+   * 每周期最多处理 100 个 terminal，且通常最多扫描 16 MiB，避免单个超大 transcript 长时间
+   * 占用事件循环并饿死其他文件。单条 JSONL 超过 16 MiB 时会额外读到第一条完整换行，确保游标
+   * 不会永远停在同一个位置。
+   *
+   * 注意：`emitEntryBatches()` 的 EventEmitter 调用只会同步执行 InputManager 的“加入 Promise
+   * 队列”监听器，不等待内容策略、脱敏或 Flusher 网络发送完成。因此返回值表示本周期已交给
+   * `entries` 处理链的事件数，不等于远端已经成功持久化的数量。
+   *
+   * @param filePath `discoverSessionFiles()` 返回的 rollout JSONL 绝对路径。
+   * @returns 本文件在当前周期直接触发 `entries` 的事件总数；无新增数据、重复 turn 或文件消失时为 0。
+   * @throws 初始 `stat` 失败会按文件暂时消失返回 0；其后的文件打开/读取、恢复构建或同步事件
+   * 监听器异常会向 `BaseInput.runCycleOnce()` 传播，由采集周期统一记录为 `collect-error`。
    */
   private async processFile(filePath: string): Promise<number> {
+    // discoverSessionFiles() 与真正处理之间存在时间窗口，文件可能被 Codex 轮转或删除。这里重新
+    // stat 固定本周期使用的 inode 和 EOF 快照；普通缺失/权限错误按“本轮无数据”处理，下一轮重试。
     let stat;
     try {
       stat = await fs.stat(filePath);
     } catch {
       return 0;
     }
+    // 以 Input ID 和绝对文件路径组合 StateStore key，避免不同 transcript 共享 offset。
+    // readCheckpoint() 会验证磁盘恢复出的最小结构；非法状态返回 null，走新文件初始化分支。
     const key = this.stateKey(filePath);
     let checkpoint = this.readCheckpoint(key);
+    // 该标记只控制是否把本文件 checkpoint 更新到 StateStore 内存；真正写 JSON 文件发生在
+    // BaseInput 的周期末尾。没有任何状态变化时跳过 update，可减少无意义的 dirty/save。
     let checkpointChanged = false;
     if (!checkpoint) {
+      // onStart() 已经为启动前存在的历史文件建立 baseline；运行期间新出现的文件会在这里从 0
+      // 开始，才能完整采集新 session。直接单测调用 processFile() 也采用同一“新文件”语义。
       checkpoint = {
+        // `ino` 是 Node fs.Stats 暴露的文件身份字段，用来区分“同一路径继续追加”和“原文件已
+        // 被替换”。它在类 Unix 系统对应 inode；本类只比较相等性，不依赖其具体编码方式。
         inode: stat.ino,
+        // 新运行期文件尚未消费任何字节，因此物理扫描从文件头开始。
         scanOffset: 0,
+        // 扫描到 turn_context/task_started 后才创建 activeTurn。
         activeTurn: null,
+        // 只有已看到 terminal 但语义恢复失败时才创建 pendingTerminal。
         pendingTerminal: null,
+        // session_meta 可能很大，只保存其行首 offset，需要构建时再按位置读取。
         latestSessionMetaOffset: null,
+        // 文件级有界去重表；跨文件去重另存在 CodexTranscriptGlobalState 中。
         emittedTerminalTurnIds: [],
       };
       checkpointChanged = true;
     } else if (checkpoint.inode !== stat.ino) {
+      // 路径相同但 inode 改变，说明文件已被替换/轮转。旧 scanOffset 对新文件没有意义；baseline
+      // 会跳过替换文件当前已有历史、保留末尾 active turn，并收集其中已闭合 terminal 供全局去重。
       await this.baselineFile(filePath, key);
+      // baselineFile 可能新增全局 terminal ID；这里先把它们同步到 StateStore 内存再结束本文件。
       this.saveGlobalProcessedTerminalTurnIds();
       return 0;
     }
+    // 当前替换检测只比较 inode；若某个平台在同一 inode 上原地截断文件，使 stat.size 小于旧
+    // scanOffset，本轮 while 不会进入，需等文件重新增长越过旧 offset（该恢复边界待确认）。
 
+    // emittedCount 统计本方法直接 emit 的 entry 数，不代表 Flusher 已成功；另两个计数只用于限制
+    // 当前文件本周期的工作量，不会持久化到 checkpoint。processedTerminalCount 也包含“去重跳过”
+    // 和“成功处理但没有可观察事件”的 terminal，因为它限制的是状态机工作量而非输出条数。
     let emittedCount = 0;
     let processedTerminalCount = 0;
     let scannedBytes = 0;
 
+    // terminal 行在上轮已经被物理消费，但语义恢复失败时，scanOffset 已位于 terminal 之后。
+    // 因此必须在扫描新字节前，按 pendingTerminal.terminalEndOffset 回读固定范围；否则会漏掉该 turn。
     const hadPendingTerminal = checkpoint.pendingTerminal !== null;
     const pendingResult = await this.recoverPendingTerminal(filePath, checkpoint);
+    // 只要进入过 pending 恢复，helper 就可能更新 retryCount、清理损坏状态或完成 turn，必须保存变更。
     checkpointChanged ||= hadPendingTerminal;
+    // pending 恢复成功时可能已经通过 emitEntryBatches() 发出事件，并算作本周期处理的一个 terminal。
     emittedCount += pendingResult.emittedCount;
     processedTerminalCount += pendingResult.processedTerminalCount;
     if (pendingResult.blocked) {
+      // 仍不可解析时保存更新后的诊断和重试次数，但保持 activeTurn/pendingTerminal，且不读取后续
+      // turn。这样坏的 terminal 会显式阻塞本文件，而不是推进游标后静默丢失。
       if (checkpointChanged) this.saveCheckpoint(key, checkpoint);
       this.saveGlobalProcessedTerminalTurnIds();
       return emittedCount;
     }
 
+    // stat.size 是方法入口处固定的 EOF 快照：本轮执行期间继续追加的字节留到下一周期。循环还受
+    // terminal 数和扫描字节双重预算限制；成功处理 terminal 后可继续扫描同文件的下一个 turn。
     while (
       checkpoint.scanOffset < stat.size
       && processedTerminalCount < MAX_TERMINALS_PER_FILE_CYCLE
       && scannedBytes < MAX_SCAN_BYTES_PER_FILE_CYCLE
     ) {
+      // scanStartOffset 是本段物理起点；scanEndOffset 不超过入口 EOF，也不超过本周期剩余字节预算。
       const scanStartOffset = checkpoint.scanOffset;
       const scanEndOffset = Math.min(
         stat.size,
         scanStartOffset + (MAX_SCAN_BYTES_PER_FILE_CYCLE - scannedBytes),
       );
+      // 两个变量只描述“本扫描段是否遇到当前 active turn 的终态以及终态行末位置”。每处理完
+      // 一个 terminal 后循环重新置空，下一段可以继续寻找后续 turn。
       let terminalTurnId: string | null = null;
       let terminalEndOffset: number | null = null;
-      /** 只识别 session meta、turn 起点和 terminal；返回 false 让扫描器停在 terminal 后。 */
+      /**
+       * 轻量扫描回调只识别状态机边界，不在逐行阶段构建业务事件。返回 false 会让
+       * scanJsonLines() 精确停在当前 terminal 换行之后，后续 turn 留给下一次 while 迭代。
+       */
       const processScannedLine = (line: JsonLine): void | false => {
+        // JSON 行本身已由 scanJsonLines 解析成对象；payload 仍可能缺失或不是对象，此类行只消费
+        // 物理字节，不参与 Codex turn 状态机。
         const payload = asRecord(line.record.payload);
         if (!payload) return;
         if (line.record.type === 'session_meta') {
+          // 只保存行首位置；recoverTurnSegment() 需要 provider/base instructions/tool definitions 时
+          // 再调用 readJsonLineAt() 回读，避免把大块 meta 重复塞进 checkpoint。
           checkpoint.latestSessionMetaOffset = line.startOffset;
           return;
         }
 
+        // turn_context 或 task_started 建立 active turn。遇到新的 turnId 时创建新的语义状态；同一
+        // turn 后续的 turn_context 则只补充 model/cwd/developer instructions。
         const turnId = turnIdForStart(line.record, payload);
         if (turnId) {
           if (!checkpoint.activeTurn || checkpoint.activeTurn.turnId !== turnId) {
@@ -296,63 +372,85 @@ export class CodexTranscriptInput extends BaseInput {
           return;
         }
 
+        // 只接受属于当前 activeTurn 的 task_complete/turn_aborted。其他 turn 的孤立 terminal 不会
+        // 错误关闭当前 turn，但其物理行仍会被扫描器消费。
         const terminal = terminalTurnIdFor(line.record, payload);
         if (!terminal || checkpoint.activeTurn?.turnId !== terminal) return;
         terminalTurnId = terminal;
         terminalEndOffset = line.endOffset;
         return false;
       };
+      // scanJsonLines() 按最多 1 MiB 的块读取，只把换行结尾的合法 JSON 对象交给回调；EOF 半行
+      // 不推进 nextOffset，已换行但 JSON 损坏的行则被忽略并消费，防止永久卡住。
       let scan = await scanJsonLines(filePath, scanStartOffset, scanEndOffset, processScannedLine);
 
       // 单条 JSONL 可能超过本周期字节预算。若预算范围内连一条完整换行都没有，就额外读到文件
       // 当前末尾并消费一条完整记录，否则 scanOffset 会永远停在同一位置。
       if (scan.nextOffset === scanStartOffset && scanEndOffset < stat.size) {
+        // 第二次扫描把上界临时扩到入口 EOF；回调包装器在第一条可解析对象后返回 false，所以
+        // 不会借机处理整个文件。其前面的空行或已换行坏 JSON 仍可能被扫描器正常消费。
         scan = await scanJsonLines(filePath, scanStartOffset, stat.size, line => {
           processScannedLine(line);
           return false;
         });
       }
+      // 没有完整换行就不能安全推进 offset；保留当前位置，等待 Codex 写完该 JSONL 行后再重试。
       if (scan.nextOffset === scanStartOffset) break;
       // 只要消费过完整行，就需要保存 checkpoint，即使这些行最终没有生成业务事件。
       checkpointChanged = true;
 
       // 遇到 terminal 时严格停在 terminal 行末；否则推进到本次扫描到的最后一个完整换行。
       const nextScanOffset = terminalEndOffset ?? scan.nextOffset;
+      // 预算按实际推进的物理字节计算。遇到 terminal 时只计算到 terminal 行末，不包含后续 turn。
       scannedBytes += nextScanOffset - scanStartOffset;
+      // blocked 只表示当前 terminal 已落盘但无法恢复；循环尾会停止继续读取本文件。
       let blocked = false;
 
+      // 只有已经识别 active turn，且当前扫描边界位于其语义起点之后时，才有可恢复的记录范围。
       if (checkpoint.activeTurn && nextScanOffset > checkpoint.activeTurn.startOffset) {
         // 单文件列表命中表示本 transcript 已处理过该 terminal，可直接清理活跃状态。
         if (terminalTurnId && checkpoint.emittedTerminalTurnIds.includes(terminalTurnId)) {
+          // 文件级已处理：不重建、不 emit，只清理可能残留的活跃状态并计入本周期 terminal 预算。
           checkpoint.activeTurn = null;
           checkpoint.pendingTerminal = null;
           processedTerminalCount++;
         // 同一个 turn 可能因文件复制出现在另一 transcript；全局列表防止跨文件重复输出。
         } else if (terminalTurnId && this.isGloballyProcessedTerminalTurn(terminalTurnId)) {
+          // fork/复制 transcript 可能再次包含同一 turn。全局命中时把 ID 补进本文件列表，后续扫描
+          // 可直接走更便宜的文件级判断，同时不重复上报事件。
           this.rememberProcessedTerminalTurnId(checkpoint, terminalTurnId);
           checkpoint.activeTurn = null;
           checkpoint.pendingTerminal = null;
           processedTerminalCount++;
         } else {
           // 对 active turn 的可见字节做语义恢复；活跃 turn 只提交闭合 step，terminal 提交整个 turn。
+          // helper 会重读 [activeTurn.startOffset, nextScanOffset)，执行 Extractor、Builder 和事件 ID
+          // 去重，并返回真正可发送的新 entries 以及语义上已消费到的边界。
           const recovered = await this.recoverTurnSegment(
             filePath,
             checkpoint,
             nextScanOffset,
             terminalTurnId !== null,
           );
+          // 这里才把 Codex 标准事件直接分批触发到 InputManager。emit 是同步的，但生产监听器只把
+          // 异步 handleEntries/sendBatch 接到每 Input Promise 队尾，所以本方法不会等待 Flusher。
+          // recovered.entries 为空时 emitEntryBatches() 不触发事件，也不会把空数组传给 sendBatch。
           emittedCount += this.emitEntryBatches(recovered.entries);
           // 只有成功解析并实际消费了源范围才移动 turn 起点；失败时保留原范围供下次完整重试。
           if (
             recovered.kind !== 'unparseable'
             && recovered.consumedEndOffset > checkpoint.activeTurn.startOffset
           ) {
+            // 非 terminal 增量解析可能只确认前几个闭合 step，因此这里使用 Extractor 返回的
+            // consumedEndOffset，而不是盲目使用物理 nextScanOffset，保留未闭合后缀供下轮重建。
             checkpoint.activeTurn.startOffset = recovered.consumedEndOffset;
           }
 
           // terminal 已读到后必须得到“成功处理”或“持久化 pending”之一，不能静默越过。
           if (terminalTurnId && checkpoint.activeTurn.turnId === terminalTurnId) {
             if (recovered.kind === 'unparseable') {
+              // terminal 已经物理消费，不能简单回退 scanOffset；单独保存 terminalEndOffset，下一轮
+              // recoverPendingTerminal() 会在扫描新 turn 前精确回读此范围。
               checkpoint.pendingTerminal = newPendingTerminal(
                 terminalTurnId,
                 nextScanOffset,
@@ -368,6 +466,7 @@ export class CodexTranscriptInput extends BaseInput {
               blocked = true;
             } else {
               // 成功处理后同时更新文件级和全局去重表，再释放 active/pending 状态。
+              // “成功”表示解析/构建并已 emit 到处理队列，不代表所有远端 Flusher 已确认持久化。
               this.rememberProcessedTerminalTurnId(checkpoint, terminalTurnId);
               this.rememberGlobalProcessedTerminalTurnId(terminalTurnId);
               checkpoint.activeTurn = null;
@@ -378,14 +477,20 @@ export class CodexTranscriptInput extends BaseInput {
         }
       }
 
+      // 没有 activeTurn（或范围尚未越过其语义起点）时，本段只更新 meta/物理游标，不会构建事件。
+      // 这会消费 turn 状态机之外的普通日志行，避免它们在后续周期被反复扫描。
       // scanOffset 描述物理文件扫描位置；activeTurn.startOffset 描述语义恢复起点，两者不能混用。
+      // 即使 terminal 恢复失败，也要记住终态行已经被看见；pendingTerminal 保存了显式回读边界。
       checkpoint.scanOffset = nextScanOffset;
       // 没有 terminal 时通常说明文件尾仍在写当前 turn，留到下一周期；pending 失败也必须停止后续扫描。
       if (blocked || terminalTurnId === null) break;
     }
 
+    // saveCheckpoint()/saveGlobalProcessedTerminalTurnIds() 仅调用 StateStore.update() 修改共享内存并
+    // 标记 dirty；外层 BaseInput 会在本次 collect() 的所有文件处理完后统一 await StateStore.save()。
     if (checkpointChanged) this.saveCheckpoint(key, checkpoint);
     this.saveGlobalProcessedTerminalTurnIds();
+    // 返回的是直接 emit 的条数，collect() 用它记录调试日志后仍返回 []，避免 BaseInput 重复 emit。
     return emittedCount;
   }
 

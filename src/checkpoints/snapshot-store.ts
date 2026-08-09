@@ -5,6 +5,10 @@
  * IDE 历史快照等 Input 在发现数据时先标记 pending，成功后标记 processed，
  * 再由 `flush()` 将内存 Map 原子写入 JSON。保留期外的去重记录会被清理。
  * 它与保存线性字节偏移或 row id 的 `StateStore` 分工互补。
+ *
+ * pending 也会持久化并跨重启参与去重，但不会推进 highWatermark。这避免同一对象反复并发处理，
+ * 同时意味着转换失败的对象没有立即重试通道，只能等待 retention 清理；这是当前状态机的重要
+ * 恢复限制，不应把 pending 理解为仅存在于一次函数调用内的临时锁。
  */
 
 import { createLogger, type BoundLogger } from '../utils/logger.js';
@@ -63,9 +67,9 @@ export class SnapshotStore {
   private dirty = false;
 
 /**
- * @param filePath 快照状态 JSON 的绝对路径。
- * @param retentionMs 去重条目保留毫秒数，默认 7 天；也决定建议查询窗口下限。
- */
+   * @param filePath 快照状态 JSON 的绝对路径。
+   * @param retentionMs 去重条目保留毫秒数，默认 7 天；也决定建议查询窗口下限。
+   */
   constructor(
     filePath: string,
     retentionMs: number = 7 * 24 * 60 * 60 * 1000
@@ -80,6 +84,8 @@ export class SnapshotStore {
    *
    * 磁盘中的 `highWatermark` 不直接信任，而是从合法 processed 条目重新推导，避免文件被手工
    * 修改或旧版本写入不一致值。数值字段用 `Number(...) || 0` 兼容字符串数字和缺失值。
+   * `readJsonFile` 无法区分首次缺文件与损坏/无权限，三者都恢复为空仓库；后两者可能使历史
+   * 快照再次被扫描，最终是否重复还取决于源端及 event.id 去重。
    *
    * @returns 恢复完成后兑现的 Promise；首次运行缺少文件时得到空仓库。
    */
@@ -146,6 +152,7 @@ export class SnapshotStore {
   /**
    * 登记待处理对象并记录本地 seenAt；只修改内存并设置 dirty。
    * 调用方应在耗时转换前调用，以阻止同一轮扫描中重复业务 key 被并发/重复处理。
+   * 本方法不会自行检查 key 是否已存在；若绕过 shouldProcess 直接调用，会覆盖原 processed 状态。
    */
   markPending(key: string, timestamp: number): void {
     const now = Date.now();
@@ -190,7 +197,7 @@ export class SnapshotStore {
     return Math.max(this.highWatermark, floor);
   }
 
-/** 当前内存中 pending 与 processed 条目总数。 */
+  /** 当前内存中 pending 与 processed 条目总数。 */
   get size(): number {
     return this.entries.size;
   }

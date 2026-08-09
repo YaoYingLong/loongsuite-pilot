@@ -7,10 +7,13 @@
  * 写入错误会作为 rejected Promise 交给调用者处理。
  */
 
+// 类型导入在编译后会被擦除；磁盘 JSON 的真实值仍必须由运行时代码自行防御。
 import type { AgentControlConfig, AgentControlMode } from '../types/index.js';
+// fs-utils 统一处理 HOME 展开和 JSON 原子写入，避免各模块自行拼临时文件。
 import { readJsonFile, writeJsonFile, resolveHome } from '../utils/fs-utils.js';
 import { createLogger } from '../utils/logger.js';
 
+/** 独立使用本类时采用的默认准入文件；Orchestrator 通常会显式传入 dataDir 下的路径。 */
 const DEFAULT_AGENT_CONTROL_PATH = '~/.loongsuite-pilot/agent-control.json';
 const logger = createLogger('AgentControlManager');
 
@@ -53,7 +56,11 @@ export class AgentControlManager {
     });
   }
 
-  /** 将当前完整配置原子写盘；写入异常通过 rejected Promise 交给调用方。 */
+  /**
+   * 将当前完整配置原子写盘；不会自动重新加载或通知 AgentDiscoveryService。
+   * @returns 临时文件写入并 rename 为正式文件后兑现。
+   * @throws 目录创建、写文件或 rename 失败时原样向调用者传播。
+   */
   async save(): Promise<void> {
     await writeJsonFile(this.filePath, this.config);
   }
@@ -63,6 +70,8 @@ export class AgentControlManager {
    *
    * @param agentId 稳定 Agent ID，例如 qoder、cursor。
    * @param defaultWhenAuto auto 模式时由上层配置/默认值给出的结果。
+   * @returns on 为 true、off 为 false、auto 为 `defaultWhenAuto`。
+   * @remarks 该方法只读内存快照，不执行 Agent 路径探测，也不读取 config.json。
    */
   resolveEnabled(agentId: string, defaultWhenAuto = true): boolean {
     const mode = this.getMode(agentId);
@@ -71,17 +80,27 @@ export class AgentControlManager {
     return defaultWhenAuto;
   }
 
-  /** 返回显式模式；未配置 Agent 一律视为 auto。该方法不读磁盘。 */
+  /**
+   * 返回显式模式；未配置 Agent 一律视为 auto。该方法不读磁盘。
+   * @returns 当前进程内的三态值；磁盘非法字符串在运行时可能穿透类型断言（待确认）。
+   */
   getMode(agentId: string): AgentControlMode {
     return this.config.tools[agentId] ?? 'auto';
   }
 
-  /** 只修改内存中的模式；需要调用 save() 才会持久化，也不会自动触发发现服务刷新。 */
+  /**
+   * 只修改内存中的模式；需要调用 save() 才会持久化，也不会自动触发发现服务刷新。
+   * @param agentId 要覆盖的稳定 Agent ID。
+   * @param mode 新的 on/off/auto 模式。
+   */
   setMode(agentId: string, mode: AgentControlMode): void {
     this.config.tools[agentId] = mode;
   }
 
-  /** 返回 tools 映射的浅拷贝，避免调用方增删键时直接改内部状态。值是字符串，无深拷贝需求。 */
+  /**
+   * 返回 tools 映射的浅拷贝，避免调用方增删键时直接改内部状态。值是字符串，无深拷贝需求。
+   * @returns 当前全部显式配置；未出现的隐式 auto Agent 不会被补入。
+   */
   getAllModes(): Record<string, AgentControlMode> {
     return { ...this.config.tools };
   }

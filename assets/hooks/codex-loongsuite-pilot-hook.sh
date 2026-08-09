@@ -37,11 +37,13 @@ log_error() {
     >> "$file" 2>/dev/null || true
 }
 
+# 判断：当前脚本的标准输入是否来自终端键盘
 if [[ -t 0 ]]; then
   printf '%s\n' "$EMPTY_RESULT"
   exit 0
 fi
 
+# 如果$SCRIPT_DIR/codex-hook-processor.mjs脚本不存在直接输入异常日志
 if [[ ! -f "$PROCESSOR" ]]; then
   echo "[codex-hook] processor not found: $PROCESSOR" >&2
   log_error "missing_processor" "hook processor not found: $PROCESSOR"

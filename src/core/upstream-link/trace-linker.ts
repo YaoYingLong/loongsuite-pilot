@@ -6,6 +6,10 @@
  * 只有根用户事件写 parent_span_id。结果按 session/turn 缓存供后续分批事件复用。
  * 关联文件可能比事件稍晚落盘，因此 turn 级匹配可短暂重试；任何失败都不阻断原始
  * 事件输出。
+ *
+ * 顺序前置条件：同一个 turn 的 `other` 用户事件应先于其 request/response/tool 事件进入本类。
+ * 若后续事件先到，它们会因尚无缓存而原样通过，之后不会被追溯修改；若 `other` 在重试后仍未
+ * 命中，则写入负缓存，关联文件再晚到也不会在该 turn 的后续批次中重新查询。
  */
 
 import type { AgentActivityEntry, JsonValue } from '../../types/index.js';
@@ -98,7 +102,10 @@ export class TraceLinker {
     this.retryDelayMs = opts.retryDelayMs ?? 100;
   }
 
-  /** 顺序处理批次事件；单条失败记录警告后继续，并原地修改命中的 entry。 */
+  /**
+   * 顺序处理批次事件；单条失败记录警告后继续，并原地修改命中的 entry。
+   * @returns 全部条目尝试完成后兑现；单条 Store/解析异常已在循环内隔离，通常不会 reject。
+   */
   async stamp(entries: AgentActivityEntry[]): Promise<void> {
     // 顺序 await 很重要：同批的根 `other` 必须先填缓存，随后 request/response/tool 才能复用。
     for (const entry of entries) {
@@ -156,7 +163,10 @@ export class TraceLinker {
     this.apply(entry, state);
   }
 
-  /** turn 级文本匹配优先重试，最后仅对 session 首轮消费 session 级上下文。 */
+  /**
+   * turn 级文本匹配优先重试，最后仅对 session 首轮消费 session 级上下文。
+   * @returns 合法候选 traceparent 原文或 null；格式合法性由调用方 parseTraceparent 再校验。
+   */
   private async resolveWithRetry(sessionId: string, text: string, isFirstTurn: boolean): Promise<string | null> {
     // session 没有关联文件，说明 adapter/env 未写入记录；立即返回，避免在常见路径上
     // 无意义消耗 `retries * retryDelayMs` 的重试时间。
@@ -179,6 +189,7 @@ export class TraceLinker {
 
   /**
    * 丢弃截止时间前未访问的 session/turn 缓存，并同步清 Store，避免常驻 Map 无界增长。
+   * @param cutoffMs 绝对 Unix 毫秒时间；不是“保留多久”的 duration。
    */
   pruneIdle(cutoffMs: number): void {
     for (const [sessionId, last] of this.sessionLastAccess) {

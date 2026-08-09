@@ -7,6 +7,10 @@
  * `stop()` 按依赖逆序停止资源、排空 Input Promise 队列、flush/shutdown 输出并保存
  * 状态；SIGINT/SIGTERM 由主入口转交到这里。部署和多数可选后台服务采用 best-effort，
  * 核心目录/状态初始化失败则向上抛出，触发启动崩溃 breadcrumb。
+ *
+ * 本文件使用 ES Module：普通 import 会在模块初始化时加载运行时代码，`import type` 只为
+ * TypeScript 提供类型并在编译时删除。相对路径写 `.js` 是 NodeNext 约定，编译器会在源码期
+ * 对应到 `.ts`，发布后则直接对应 `dist` 中的 `.js`。
  */
 
 
@@ -192,6 +196,8 @@ export class Orchestrator extends EventEmitter {
     }
 
     logger.info('starting orchestrator');
+    // 本方法中的 await 让有依赖关系的阶段严格串行：每一步 Promise 兑现后才进入下一步；
+    // 这只暂停当前 start()，不会阻塞 Node.js 事件循环，所以信号、文件 I/O 回调仍可执行。
     // emit 同步调用监听器；监听器异常会直接中断 start()，外部监听器不应在此抛错。
     this.emit('starting');
 
@@ -226,6 +232,9 @@ export class Orchestrator extends EventEmitter {
     this.alarmManager = new AlarmManager({ ip: resolveLocalIp(), version, userId: this.config.userId });
 
     this.inputManager = new InputManager();
+    // 这些 setter 完成依赖注入：InputManager 不自行读取磁盘配置，也不自行创建 Flusher。
+    // 因而所有 Input 都共享同一 userId/内容策略/脱敏/告警规则，主链不会因具体 Agent 不同
+    // 而绕过输出前的统一处理。此时尚未注册 Input，也不会产生事件。
     this.inputManager.setFlusher(this.flusher);
     this.inputManager.setConfiguredUserId(this.config.userId);
     this.inputManager.setAgentsConfig(this.config.agents);
@@ -263,6 +272,8 @@ export class Orchestrator extends EventEmitter {
       definitions: this.deploymentManager.getDefinitions(),
     });
     await this.localWorkerActivationService.start();
+    // 从此处开始可能已有长期存活的 watcher/子进程；若后续必需阶段抛错，start() 不做事务回滚，
+    // 主入口会记录启动失败并退出整个进程，由进程退出完成最后的句柄回收。
 
     // 6. 注册具体 Input 并构造发现条目。
     // 此阶段创建实例并绑定 entries 处理链，但不直接启动采集；Discovery 会根据路径、配置和准入
@@ -275,6 +286,8 @@ export class Orchestrator extends EventEmitter {
     // 8. 启动 Input 与部署条目共用的 AgentDiscoveryService。事件监听器是诊断/告警旁路，
     // 真正的数据批次仍由 Input -> InputManager 的 `entries` 事件流动。
     this.agentDiscoveryService = new AgentDiscoveryService([...detectionEntries, ...deployDetectionEntries]);
+    // EventEmitter.on 只登记同步回调，不会立即运行。回调会在 Discovery 后续 emit 对应事件时，
+    // 于同一事件循环调用栈中执行；它们是生命周期旁路，不改变 Input entries 的数据去向。
     this.agentDiscoveryService.on('agent:started', (id: string) => {
       logger.info('agent detected and started', { id });
     });
@@ -288,6 +301,7 @@ export class Orchestrator extends EventEmitter {
         { input_name: id },
       );
     });
+    // 为每个条目建立 watcher，立即串行刷新一次，再创建全局轮询 timer。
     await this.agentDiscoveryService.start();
 
     // 9. 启动本地日志保留服务。
@@ -366,6 +380,9 @@ export class Orchestrator extends EventEmitter {
       }
     }
 
+    // isRunning 是“完整启动成功”的提交标志，而不是“start 正在执行”标志。放在末尾可防止
+    // stop() 和生命周期事件把半初始化对象视为健康实例，但也意味着启动中收到关闭信号时
+    // stop() 会跳过；上面的 getter 本身没有运行态保护，调用方仍必须遵守 start 后调用的约定。
     this.isRunning = true;
     // 只有所有关键启动 await 完成后才对外发布 started；emit 仍是同步调用。
     this.emit('started');
@@ -389,6 +406,10 @@ export class Orchestrator extends EventEmitter {
   async stop(): Promise<void> {
     if (!this.isRunning) return;
     logger.info('stopping orchestrator');
+
+    // 当前实现没有单独的 stopping Promise/互斥锁，并且直到末尾才把 isRunning 置为 false；
+    // 因此调用方应保证 stop() 只并发触发一次。主入口的两个信号监听器目前也没有去重，属于
+    // 需要上层避免的生命周期边界，而不能把这项检查理解成完整的并发幂等保护。
 
     // 先停止独立生产者和监控/UI，防止关闭数据主链时继续产生事件或读取半更新快照。
     await this.pipelineManager?.stop();
@@ -414,6 +435,8 @@ export class Orchestrator extends EventEmitter {
     // Input 通常在采集过程中也会更新状态；最终 save 固化最后 offset，供下次启动恢复。
     await this.stateStore?.save();
 
+    // 所有持久化步骤成功后才提交 stopped 状态；上方任一 await 抛错时会保留 true，且后续步骤
+    // 不会继续执行。赋值后的 emit 仍是同步调用，外部 stopped 监听器也不应抛出异常。
     this.isRunning = false;
     this.emit('stopped');
     logger.info('orchestrator stopped');
@@ -729,6 +752,13 @@ export class Orchestrator extends EventEmitter {
    */
   private async registerAllInputs(): Promise<AgentDetectionEntry[]> {
     // `entries` 只描述发现生命周期；Input 实例本身同时注册到 InputManager 监听数据事件。
+    // 每个注册块都遵循同一模式：
+    // 1. new Input 并注入共享 StateStore；
+    // 2. registerInput() 绑定 `entries` 事件到统一处理链，但不调用 start()；
+    // 3. buildDetectionEntry() 把 watchPaths、可用性和启用门禁包装成 Discovery 条目。
+    // `enabled`/`isAvailable` 都是函数而非启动时快照，Discovery 每轮刷新会重新调用它们，所以
+    // 路径可用性以及进程内 setMode() 后的准入状态可在后续刷新中触发 Input 启停。磁盘上的
+    // config.json/agent-control.json 并不会被本类自动重载，单独编辑文件要重启才会进入新快照。
     const entries: AgentDetectionEntry[] = [];
     const listenerCfg = this.config.listeners;
 
@@ -1056,13 +1086,16 @@ export class Orchestrator extends EventEmitter {
       }),
     );
 
-    // Claude Code OTel 插件 JSONL。
+    // Claude Code Hook JSONL：Stop Hook processor 先把 transcript 转成按日标准记录；本 Input 再按
+    // byte offset 轮询这些文件。Hook 与 Collector 之间没有直接函数调用或进程内事件。
     const claudeCodeLogDir = this.resolveClaudeCodeLogDir();
     const claudeCodeLogInput = new ClaudeCodeLogInput({
       stateStore: this.stateStore,
       logDir: claudeCodeLogDir,
     });
-    // 注册后只建立统一 entries 处理链；Claude 日志目录命中时才由 Discovery 启动轮询。
+    // 注册后只建立统一 entries 处理链，不会立即读取文件。Claude 日志目录命中时，Discovery
+    // 调用 BaseInput.start()：先立即 collect 一轮，再按 listener 的 pollInterval 周期采集；
+    // BaseHookInput.collect() 返回非空数组时由 BaseInput.runCycleOnce() 触发 entries。
     this.inputManager.registerInput(claudeCodeLogInput);
     entries.push(
       this.inputManager.buildDetectionEntry(claudeCodeLogInput, {
@@ -1231,7 +1264,14 @@ export class Orchestrator extends EventEmitter {
     return entries;
   }
 
-  /** 从 Claude OTel 配置读取 log_dir，失败或缺失时回退到 Pilot 日志目录。 */
+  /**
+   * 兼容读取旧 Claude OTel 配置中的 `log_dir`，失败或缺失时回退到当前 Pilot 日志目录。
+   *
+   * 当前 `claude-code-hook-processor.mjs` 固定写入 `<dataDir>/logs/claude-code`，不会读取这个
+   * 历史配置；`plugin-migration` 通常会删除旧配置，但只有旧 Claude cache 目录存在时才执行
+   * 那条迁移。因此若用户只残留 `otel-config.json`、cache 已被手工删除，本方法可能让 Input
+   * 监听到与新 Hook 写入位置不同的目录。这个兼容分支是否仍应保留，当前待确认。
+   */
   private resolveClaudeCodeLogDir(): string {
     try {
       const configPath = path.join(os.homedir(), '.claude', 'otel-config.json');

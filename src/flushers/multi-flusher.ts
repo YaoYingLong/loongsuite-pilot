@@ -3,6 +3,7 @@
  *
  * Orchestrator 配置出两个以上后端时使用本类。每个下游 Promise 通过 allSettled 隔离：一个
  * 后端失败会记录日志，但不会阻止其他后端，也通常不会向 InputManager 重新抛出该失败。
+ * 这里不做重试、持久化或回滚；这些能力由 SLS/HTTP/OTLP 等具体 Flusher 自己决定。
  */
 
 import { BaseFlusher } from './base-flusher.js';
@@ -42,6 +43,8 @@ export class MultiFlusher extends BaseFlusher {
    * 并行发送单条事件，等待所有通道 settle，再逐个记录 reject。
    * `Promise.allSettled` 结果与输入 Promise 保持索引对应，便于准确输出失败 Flusher 名称；即使全部
    * 通道失败，本方法也正常兑现。
+   * @throws 若某个自定义 Flusher 违反 BaseFlusher 契约，在返回 Promise 之前同步抛错，map 会提前
+   * 中断并使本方法 reject；项目内置 async Flusher 的同步异常都会自动变成 Promise rejection。
    */
   async send(entry: AgentActivityEntry): Promise<void> {
     // allSettled 保留与 flushers 相同的索引顺序，便于标出失败通道名。
@@ -59,7 +62,10 @@ export class MultiFlusher extends BaseFlusher {
     }
   }
 
-  /** 并行发送整个批次，失败隔离语义与 send 相同。 */
+  /**
+   * 并行发送整个批次，失败隔离语义与 send 相同；所有通道共享同一 entries 数组引用。
+   * @returns 所有合规下游 Promise 均 settled 后兑现，即便一个或全部下游 rejected。
+   */
   async sendBatch(entries: AgentActivityEntry[]): Promise<void> {
     const results = await Promise.allSettled(
       this.flushers.map(r => r.sendBatch(entries)),
@@ -91,7 +97,10 @@ export class MultiFlusher extends BaseFlusher {
     await Promise.allSettled(this.flushers.map(r => r.shutdown()));
   }
 
-  /** 把非标准 payload 原样扇出，默认忽略每个下游失败。 */
+  /**
+   * 把非标准 payload 原样扇出；与 send/sendBatch 不同，本方法不会逐端点记录 rejection，失败诊断
+   * 完全依赖具体 Flusher。所有合规下游失败仍会被 allSettled 吞掉。
+   */
   override async sendRaw(topic: string, payload: Record<string, unknown>): Promise<void> {
     await Promise.allSettled(
       this.flushers.map(r => r.sendRaw(topic, payload)),

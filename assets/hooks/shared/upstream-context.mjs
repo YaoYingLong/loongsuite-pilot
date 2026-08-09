@@ -42,6 +42,7 @@ function isValidTraceparent(tp) {
 export function recordUpstreamContextOnce({ agentId, sessionId, dataDir }) {
   try {
     if (!sessionId || !dataDir) return;
+    // 环境变量的TRACEPARENT是codex自动写入到子环境中的
     const tp = (process.env.TRACEPARENT || '').trim();
     if (!isValidTraceparent(tp)) return;
 
@@ -52,6 +53,7 @@ export function recordUpstreamContextOnce({ agentId, sessionId, dataDir }) {
     const lock = path.join(dir, `${base}.env.lock`);
     // `wx` 对应 O_CREAT|O_EXCL：只有独占创建锁文件成功的进程才写；EEXIST 表示已经记录过。
     try {
+      // wx表示可写排他创建，文件不存在 → 创建文件，返回文件描述符 fd，然后拿到打开成功的文件句柄，立刻同步关闭该文件
       fs.closeSync(fs.openSync(lock, 'wx'));
     } catch (err) {
       if (err && err.code === 'EEXIST') return; // 并发或重复 Hook 的正常路径，不是错误。
@@ -59,6 +61,7 @@ export function recordUpstreamContextOnce({ agentId, sessionId, dataDir }) {
     }
 
     const record = { type: 'session', sessionId, traceparent: tp, ts: new Date().toISOString() };
+    // 同步追加写入，文件不存在 → 自动新建，文件已存在 → 在文件末尾追加内容，不会覆盖原有数据；
     fs.appendFileSync(path.join(dir, `${base}.jsonl`), JSON.stringify(record) + '\n', 'utf-8');
   } catch (err) {
     // fail-open：关联标记写入失败绝不能影响宿主 Agent。
