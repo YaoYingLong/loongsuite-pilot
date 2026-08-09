@@ -1,4 +1,4 @@
-# Claude Code 在 Windows 上的轻量 Hook wrapper。
+﻿# Claude Code 在 Windows 上的轻量 Hook wrapper。
 #
 # `agents.d/claude-code.json` 声明 Stop/SubagentStart/SubagentStop；HookStrategy 将每类事件转换成
 # kebab-case 参数，并把下列命令注册到 `~/.claude/settings.json`：
