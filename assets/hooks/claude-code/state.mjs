@@ -128,6 +128,8 @@ export function loadState(sessionId) {
  *
  * 先写临时文件可避免另一个 Hook 进程读到半段 JSON；临时文件包含 `process.pid`，用于降低不同
  * Hook 进程互相覆盖临时文件的概率。rename 与目标文件位于同一目录，因此不会跨文件系统移动。
+ * 这里没有跨进程锁：若同一 session 的两个 Hook 同时“读取旧快照 -> 各自修改 -> 保存”，最后完成
+ * rename 的快照会覆盖前一个快照，原子替换只防半写 JSON，并不能防止这种更新丢失；并发行为待确认。
  *
  * @param {string} sessionId 决定目标文件名的 session ID。
  * @param {object} state 要序列化的完整状态对象；本函数不会克隆或修改它。
